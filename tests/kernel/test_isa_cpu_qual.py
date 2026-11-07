@@ -41,6 +41,7 @@ import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
+from mojobpf.toolchain import admit_tools  # noqa: E402
 
 SUITE_ID = "kernel-isa-cpu"
 FIX_DIR = os.path.join(REPO_ROOT, "tests", "fixtures", "isa", "cpu")
@@ -238,7 +239,19 @@ def _run_guest(argv, stage, timeout):
 
 def guest_run():
     """Build both objects, boot one guest, return parsed case results."""
-    for tool in ("mojo", "llc", "clang", "vng"):
+    admitted, diagnostics = admit_tools(
+        lockfile_path=os.path.join(REPO_ROOT, "toolchains.lock.json"),
+        names=("mojo", "llc"),
+    )
+    if sorted(admitted) != ["llc", "mojo"]:
+        raise EnvironmentFailure(
+            "pinned mojo/llc admission failed: %s"
+            % "; ".join("%s %s" % (item.code, item.explanation)
+                        for item in diagnostics)
+        )
+    print("pinned tools admitted: mojo=%s llc=%s"
+          % (admitted["mojo"].version, admitted["llc"].version))
+    for tool in ("clang", "vng"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
     lower_tool()

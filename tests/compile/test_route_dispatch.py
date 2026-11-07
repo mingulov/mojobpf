@@ -357,6 +357,38 @@ def test_author_spec_classifier():
     }, spec
 
 
+def test_cpu_policy_coherent_across_routes():
+    # The parsed adapter pair and the native author each emit the
+    # required cpu/features keys explicitly (independent spec
+    # authors). Both must agree with each other and with the single
+    # SUPPORTED_PROFILES policy cpu; any drift fails here, never
+    # silently.
+    from mojobpf import capabilities, native_adapter
+    service = load_module("adapter_service_cpu_policy", SERVICE)
+    root = tempfile.mkdtemp(prefix="cpu-policy-")
+    manifest = _write_manifest(root, CLASSIFIER_MANIFEST)
+    spec, refusal = service._author_spec(
+        "classifier", "xdp_entry", manifest, "linux-bpfel-v3",
+    )
+    assert refusal is None
+    native_doc = {
+        "schema_version": 1,
+        "project": {"name": "consumer"},
+        "artifact": {"name": "consumer",
+                     "source_license": "Apache-2.0 WITH LLVM-exception",
+                     "kernel_license": "Apache-2.0 WITH LLVM-exception"},
+        "target": {"profile": "linux-bpfel-v3", "core": False},
+        "programs": [{"source": "kernel.mojo", "entry": "independent_entry",
+                      "program_type": "xdp", "section": "xdp"}],
+        "maps": [],
+    }
+    native_spec = json.loads(native_adapter.derive_native_spec(
+        native_adapter.canonical_json(native_doc), "linux-bpfel-v3"))
+    policy_cpu = capabilities.SUPPORTED_PROFILES["linux-bpfel-v3"].cpu
+    assert spec["cpu"] == native_spec["cpu"] == policy_cpu
+    assert spec["features"] == native_spec["features"] == ""
+
+
 def test_author_spec_missing_entry_refuses():
     service = load_module("adapter_service_spec_b", SERVICE)
     root = tempfile.mkdtemp(prefix="spec-noentry-")
