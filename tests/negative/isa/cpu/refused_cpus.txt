@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # Refused-CPU corpus index for F-ISA/cpu/v3-target.
 #
 # The vectors live in compiler/tests/test_isa_cpu.py (RED-first, frozen
@@ -13,12 +14,15 @@ cpu=v1 | test_cpu_other_than_v3_refused | exit 2, MBPF202 names cpu
 cpu=v2 | test_cpu_other_than_v3_refused | exit 2, MBPF202 names cpu
 cpu=v4 | test_cpu_other_than_v3_refused | exit 2, MBPF202 names cpu
 cpu=generic | test_cpu_other_than_v3_refused | exit 2, MBPF202 names cpu
+cpu=probe | test_cpu_other_than_v3_refused | exit 2, MBPF202 names cpu
 cpu=v5 | test_cpu_other_than_v3_refused | exit 2, MBPF202 names cpu
 cpu=(empty) | test_cpu_other_than_v3_refused | exit 2, MBPF202 names cpu
 cpu=v3 features=+foo | test_cpu_bogus_features_refused | exit 2, MBPF202 names cpu
 cpu=v3 features=+alu32,+v4 | test_cpu_bogus_features_refused | exit 2, MBPF202 names cpu
 cpu=v3 features=alu32 | test_cpu_bogus_features_refused | exit 2, MBPF202 names cpu
-cpu key absent | test_cpu_missing_key_refused | exit 2 (required-key rule)
+cpu key absent | test_cpu_missing_key_refused[cpu] | exit 2 (required-key rule)
+features key absent | test_cpu_missing_key_refused[features] | exit 2 (required-key rule)
+input triple bpfeb | test_cpu_bpfeb_triple_refused | exit 4, MBPF319 (target)
 
 # Oracle construct probes (llc 22.1.8, recorded before implementation;
 # the leaf asserts the parsed layer agrees with the oracle):

@@ -7,7 +7,6 @@ keys; refusal is MBPF202/adapter.request naming the cpu contract.
 """
 import json
 import struct
-import sys
 
 import pytest
 
@@ -135,7 +134,8 @@ def test_cpu_v3_alu32_admitted_reports_flag(tmp_path):
                                          "-mattr=+alu32"]
 
 
-@pytest.mark.parametrize("cpu", ["v1", "v2", "v4", "generic", "v5", ""])
+@pytest.mark.parametrize("cpu", ["v1", "v2", "v4", "generic", "probe",
+                               "v5", ""])
 def test_cpu_other_than_v3_refused(tmp_path, cpu):
     result, _ = check_cpu(tmp_path, MINIMAL_IR, cpu)
     assert result.returncode == 2
@@ -149,9 +149,10 @@ def test_cpu_bogus_features_refused(tmp_path, features):
     assert "MBPF202" in result.stderr and "cpu" in result.stderr
 
 
-def test_cpu_missing_key_refused(tmp_path):
+@pytest.mark.parametrize("key", ["cpu", "features"])
+def test_cpu_missing_key_refused(tmp_path, key):
     request = spec()
-    del request["cpu"]
+    del request[key]
     request_path = tmp_path / "spec.json"
     request_path.write_text(json.dumps(request))
     source = tmp_path / "input.ll"
@@ -161,6 +162,13 @@ def test_cpu_missing_key_refused(tmp_path):
                   "--input", source, "--spec", request_path,
                   "--report", report_path])
     assert result.returncode == 2
+
+
+def test_cpu_bpfeb_triple_refused(tmp_path):
+    text = module().replace("x86_64-unknown-linux-gnu", "bpfeb")
+    result, _ = check_cpu(tmp_path, text, "v3")
+    assert result.returncode == 4
+    assert "MBPF319" in result.stderr
 
 
 def test_cpu_mojo_fixture_admitted(tmp_path):
@@ -193,13 +201,27 @@ def _jmp32_words(text):
             if word & 0x07 == 0x06]
 
 
-def test_fixture_v3_selects_jmp32_byte_exact(tmp_path):
+def _lower_fixture(tmp_path, name, features=""):
+    """Emit the genuine fixture through the parsed lowering."""
     captured = capture(tmp_path, FIX / "v3_minimal.mojo", "llvm")
-    adapted = tmp_path / "v3.bpf.ll"
-    proc = run([sys.executable,
-                str(ROOT / "compiler" / "mojo_ir_adapter.py"),
-                "--input", str(captured), "--output", str(adapted)])
+    request = spec()
+    request["features"] = features
+    request_path = tmp_path / (name + ".spec.json")
+    request_path.write_text(json.dumps(request))
+    adapted = tmp_path / (name + ".bpf.ll")
+    report_path = tmp_path / (name + ".report.json")
+    proc = run([lower_tool(), "--mode", "lower",
+                "--input", captured, "--spec", request_path,
+                "--report", report_path, "--output", adapted,
+                "--emit", "llvm"])
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    report = json.loads(report_path.read_text())
+    assert report["ok"] is True
+    return adapted, report
+
+
+def test_fixture_v3_selects_jmp32_byte_exact(tmp_path):
+    adapted, _ = _lower_fixture(tmp_path, "v3")
     first = tmp_path / "v1.o"
     third = tmp_path / "v3.o"
     assert llc(["-march=bpfel", "-mcpu=v1", "-filetype=obj",
@@ -211,3 +233,18 @@ def test_fixture_v3_selects_jmp32_byte_exact(tmp_path):
     assert _jmp32_words(v1_text) == []
     # Byte-exact v3-only construct: if w1 s> 10 goto +1 (the gate).
     assert _jmp32_words(v3_text) == [0x0000000A00010166]
+
+
+def test_fixture_alu32_form_byte_exact(tmp_path):
+    adapted, report = _lower_fixture(tmp_path, "v3alu", "+alu32")
+    flags = report["target_facts"]["isa_cpu"]["resolved_llc_flags"]
+    assert flags == ["-mtriple=bpfel", "-mcpu=v3", "-mattr=+alu32"]
+    flagged = tmp_path / "v3alu.o"
+    assert llc([*flags, "-filetype=obj",
+                adapted, "-o", flagged]).returncode == 0
+    plain, _ = _lower_fixture(tmp_path, "v3plain")
+    third = tmp_path / "v3.o"
+    assert llc(["-march=bpfel", "-mcpu=v3", "-filetype=obj",
+                plain, "-o", third]).returncode == 0
+    assert _xdp_text(flagged) == _xdp_text(third)
+    assert _jmp32_words(_xdp_text(flagged)) == [0x0000000A00010166]

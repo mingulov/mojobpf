@@ -40,8 +40,15 @@ The specification must contain exactly these fields. The entry name is
 supplied by the caller, rather than recognized as an algorithm identity.
 
 ```json
-{"schema_version":1,"model_id":"mojo-1.1.0-x86_64-bpfel-v3-minimal-v1","profile_id":"linux-bpfel-v3","entry":"xdp_entry","program_type":"xdp","section":"xdp","kernel_license":"Apache-2.0 WITH LLVM-exception","map":null}
+{"schema_version":1,"model_id":"mojo-1.1.0-x86_64-bpfel-v3-minimal-v1","profile_id":"linux-bpfel-v3","entry":"xdp_entry","program_type":"xdp","section":"xdp","kernel_license":"Apache-2.0 WITH LLVM-exception","cpu":"v3","features":"","map":null}
 ```
+
+`cpu` names the requested BPF CPU explicitly (`v3` is the only
+admitted value) and `features` names the requested sub-features
+(`""` or `"+alu32"`); both keys are required and any other value is
+refused with `MBPF202`. The report's `target_facts.isa_cpu` carries
+the requested values, the resolved CPU and flags, and the `alu32`
+flag.
 
 For the one-entry array, `map` is exactly
 `{"symbol":"mojobpf_map0","type":2,"key_bits":32,"value_bits":64,"max_entries":1,"flags":0}`.

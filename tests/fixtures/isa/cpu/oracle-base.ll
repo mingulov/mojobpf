@@ -1,3 +1,4 @@
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 ; Fixed oracle corpus for F-ISA/cpu/v3-target (hand-written, stable).
 target datalayout = "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
 target triple = "bpfel"
@@ -23,4 +24,3 @@ define i64 @shift64(i64 %v, i64 %n) {
   %s = ashr i64 %v, %n
   ret i64 %s
 }
-

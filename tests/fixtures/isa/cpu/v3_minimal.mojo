@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # Minimal v3 CPU-qualification fixture: 32-bit compare/branch on a
-# packet byte plus 64-bit arithmetic, no maps. check-target must
-# admit it under cpu=v3 and report the resolved isa_cpu facts.
+# packet byte plus 64-bit arithmetic, no maps. The parsed lowering
+# must admit it under cpu=v3 and report the resolved isa_cpu facts.
 # On the zero packet the gate stays shut and one execution observes
 # XDP_PASS (2).
 

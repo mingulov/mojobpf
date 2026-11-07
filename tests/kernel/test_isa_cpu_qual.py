@@ -4,13 +4,16 @@
 Builds ``tests/fixtures/isa/cpu/v3_minimal.mojo`` (32-bit
 compare/branch plus 64-bit arithmetic, expecting XDP_PASS) and its
 single-constant mutant (gate 17, expecting XDP_DROP) through the
-genuine pipeline (``mojo build --emit llvm`` -> parsed adapter ->
-``check-target`` admission, whose resolved llc flags feed the
-backend -> ``llc -mtriple=bpfel``). Boots one guest per lane and
-test-runs both objects plus a stale-object leg (base object against
-the mutant expectation, which must fail at RUNTIME), with an
-independent packet oracle, a single-constant source mutation, and
-guest-side hash re-verification of every staged byte.
+genuine parsed pipeline (``mojo build --emit llvm`` ->
+``mojobpf-lower --mode lower`` emission, whose report's resolved
+llc flags feed the backend -> ``llc -mtriple=bpfel``). Boots one
+guest per lane and test-runs both objects plus a stock-C control
+and a stale-object leg (base object against the mutant
+expectation, which must fail at RUNTIME), with an independent
+packet oracle, a single-constant source mutation, and guest-side
+hash re-verification of every staged byte. The executed base
+object's bytes are decoded host-side to prove the v3-only
+construct is present.
 
 Standalone: ``python3 tests/kernel/test_isa_cpu_qual.py`` (exit 0 on
 proof, exit 2 on environment failure; MOJOBPF_VNG_RELEASE selects
@@ -22,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -43,13 +47,16 @@ FIX_DIR = os.path.join(REPO_ROOT, "tests", "fixtures", "isa", "cpu")
 BASE_SOURCE = os.path.join(FIX_DIR, "v3_minimal.mojo")
 MUTATED_SOURCE = os.path.join(FIX_DIR, "v3_minimal_mutated.mojo")
 PACKET = os.path.join(FIX_DIR, "pkt_zero60.bin")
-ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 HARNESS = os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py")
 C_SOURCE = os.path.join(REPO_ROOT, "tests", "reference_c",
                         "isa_cpu_ref.bpf.c")
 
 XDP_DROP = 1
 XDP_PASS = 2
+
+# Byte-exact v3-only construct (shared pin with
+# compiler/tests/test_isa_cpu.py): if w1 s> 10 goto +1, the gate.
+V3_GATE_WORD = 0x0000000A00010166
 
 # (tag, object key, expected action, want harness exit)
 CASES = (
@@ -91,7 +98,7 @@ def lower_tool():
     return found
 
 
-def check_spec():
+def lower_spec():
     return {"schema_version": 1,
             "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
             "profile_id": "linux-bpfel-v3", "entry": "xdp_entry",
@@ -116,32 +123,28 @@ def build_object(source, workdir, name):
         raise AssertionError(
             "frontend diagnostics for %s:\n%s" % (source, proc.stderr)
         )
-    proc = run_step(
-        [sys.executable, ADAPTER, "--input", raw_path,
-         "--output", adapted_path]
-    )
+    spec_path = os.path.join(workdir, name + ".spec.json")
+    report_path = os.path.join(workdir, name + ".report.json")
+    with open(spec_path, "w", encoding="utf-8") as handle:
+        json.dump(lower_spec(), handle)
+    proc = run_step([lower_tool(), "--mode", "lower",
+                     "--input", raw_path, "--spec", spec_path,
+                     "--report", report_path, "--output", adapted_path,
+                     "--emit", "llvm"])
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
         raise AssertionError(
-            "adapter failed for %s (exit %d):\n%s\n%s"
+            "parsed lowering failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
-    spec_path = os.path.join(workdir, name + ".spec.json")
-    report_path = os.path.join(workdir, name + ".check.json")
-    with open(spec_path, "w", encoding="utf-8") as handle:
-        json.dump(check_spec(), handle)
-    proc = run_step([lower_tool(), "--mode", "check-target",
-                     "--input", raw_path, "--spec", spec_path,
-                     "--report", report_path])
-    if proc.returncode != 0 or not os.path.isfile(report_path):
+    if not os.path.isfile(report_path):
         raise AssertionError(
-            "check-target refused %s (exit %d):\n%s\n%s"
-            % (source, proc.returncode, proc.stdout, proc.stderr)
+            "parsed lowering wrote no report for %s" % source
         )
     with open(report_path, encoding="utf-8") as handle:
         report = json.load(handle)
     if report.get("ok") is not True:
         raise AssertionError(
-            "check-target report not ok for %s:\n%s"
+            "parsed lowering report not ok for %s:\n%s"
             % (source, json.dumps(report)[:2000])
         )
     flags = (report.get("target_facts", {}).get("isa_cpu", {})
@@ -240,7 +243,7 @@ def guest_run():
             raise EnvironmentFailure("%s not found on PATH" % tool)
     lower_tool()
     for path in (BASE_SOURCE, MUTATED_SOURCE, C_SOURCE, PACKET,
-                 ADAPTER, HARNESS):
+                 HARNESS):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     stage = guest_proc.owned_stage(prefix="mojo-isa-cpu-", dir="/tmp")
@@ -358,6 +361,42 @@ def test_fixture_bytes():
     assert len(frame) == 60, "packet fixture has %d bytes" % len(frame)
     assert frame == bytes(60), "packet fixture must be zero bytes"
     assert executed()["packet"] == frame
+
+
+def _staged_xdp_words(stage, name):
+    with open(os.path.join(stage, name), "rb") as handle:
+        data = handle.read()
+    assert data[:4] == b"\x7fELF" and len(data) >= 64
+    (e_shoff,) = struct.unpack_from("<Q", data, 40)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", data, 58)
+    assert e_shentsize == 64 and 0 < e_shnum <= 256
+    rows = [struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + index * 64)
+            for index in range(e_shnum)]
+    base = rows[e_shstrndx][4]
+    for row in rows:
+        end = data.index(b"\x00", base + row[0])
+        if data[base + row[0]:end] == b"xdp":
+            text = data[row[4]:row[4] + row[5]]
+            assert len(text) % 8 == 0
+            return [word for (word,) in struct.iter_unpack("<Q", text)]
+    raise AssertionError("xdp section missing in staged %s" % name)
+
+
+def test_cpu_guest_object_selects_v3():
+    stage = executed()["stage"]
+    base_words = _staged_xdp_words(stage, "base.bpf.o")
+    mut_words = _staged_xdp_words(stage, "mutated.bpf.o")
+    base_jmp32 = [word for word in base_words if word & 0x07 == 0x06]
+    mut_jmp32 = [word for word in mut_words if word & 0x07 == 0x06]
+    assert base_jmp32 == [V3_GATE_WORD], (
+        "executed base object must carry the byte-exact v3 gate, "
+        "got %r" % ([hex(word) for word in base_jmp32],)
+    )
+    assert mut_jmp32 == [V3_GATE_WORD], (
+        "executed mutant must keep v3 selection, got %r"
+        % ([hex(word) for word in mut_jmp32],)
+    )
+    assert mut_words != base_words, "mutant bytes must differ"
 
 
 def test_cpu_base_returns_pass():
@@ -484,6 +523,12 @@ CASE_INPUTS = {
         "sources": [C_SOURCE],
         "objects": [("stage", "c_ref.bpf.o")],
         "corpus": [PACKET],
+    },
+    "test_cpu_guest_object_selects_v3": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "mutated.bpf.o")],
+        "corpus": [],
     },
     "test_cpu_mutation_changes_action": {
         "sources": [MUTATED_SOURCE],

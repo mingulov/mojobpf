@@ -1070,6 +1070,8 @@ def _validate_native_report_fields(report_raw, spec_bytes, input_digest, output_
     want_flags = ["-mtriple=bpfel", "-mcpu=v3"] + (["-mattr=+alu32"] if isa["alu32"] else [])
     if isa["resolved_llc_flags"] != want_flags:
         raise NativeAdapterError("native isa cpu flags do not match the resolution")
+    if isa["requested_cpu"] != spec["cpu"] or isa["requested_features"] != spec["features"]:
+        raise NativeAdapterError("native isa cpu facts do not match captured specification")
     if facts["target_triple"] != "bpfel-unknown-none" or facts["target_cpu"] != "v3" or facts["optimization_pipeline"] != "none" or facts["little_endian"] is not True or facts["producer_authenticated"] is not False:
         raise NativeAdapterError("incomplete/unsupported native target facts")
     for name in ("pointer_bits", "index_bits", "pointer_alignment_bits"):

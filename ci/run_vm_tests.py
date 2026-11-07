@@ -138,6 +138,7 @@ SUITE_CASES = {
     ).split(),
     "kernel-isa-cpu": (
         "test_cpu_base_returns_pass test_cpu_c_control_matches_base  "
+        "test_cpu_guest_object_selects_v3  "
         "test_cpu_mutation_changes_action  "
         "test_cpu_stale_object_fails test_fixture_bytes  "
         "test_guest_provenance"

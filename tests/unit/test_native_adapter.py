@@ -510,6 +510,23 @@ def test_native_report_requires_complete_typed_facts(real_bundle, tmp_path, chan
         module.read_native_outputs(request["output_dir"], (tmp_path / "out" / "native-spec.json").read_bytes(), str(raw))
 
 
+def test_native_isa_cpu_facts_must_match_captured_spec(real_bundle, tmp_path):
+    module = native_module()
+    service, record = real_bundle
+    raw, request, _response, _completed = serve_native(tmp_path, service, record)
+    report_path = tmp_path / "out" / "native-report.json"
+    report = json.loads(report_path.read_bytes())
+    isa = report["target_facts"]["isa_cpu"]
+    isa["requested_features"] = "+alu32"
+    isa["alu32"] = True
+    isa["resolved_llc_flags"] = ["-mtriple=bpfel", "-mcpu=v3",
+                                 "-mattr=+alu32"]
+    report_path.write_bytes(canonical(report))
+    with pytest.raises(module.NativeAdapterError,
+                       match="do not match captured specification"):
+        module.read_native_outputs(request["output_dir"], (tmp_path / "out" / "native-spec.json").read_bytes(), str(raw))
+
+
 @pytest.mark.parametrize("field,value", [("size", 32.0), ("alignment", 8.0),
                                         ("producer_authenticated", 0), ("source_lines", 0)])
 def test_native_map_metadata_refuses_equal_but_wrong_types(real_bundle, tmp_path, field, value):
