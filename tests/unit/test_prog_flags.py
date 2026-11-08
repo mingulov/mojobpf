@@ -247,9 +247,10 @@ def test_shell_load_sites_carry_no_flags():
             for token in LOAD_FLAG_TOKENS:
                 if token.lower() in lowered:
                     hits.append((rel, number, token, line.strip()))
-    # 111 at the R2 exit + 9 per-CPU-hash legs (audited: plain
-    # `prog load <obj> <pin> type xdp`, no flag tokens).
-    assert sites == 120, (
+    # 111 at the R2 exit + 8 per-CPU-hash legs (audited: plain
+    # `prog load <obj> <pin> type xdp`, no flag tokens; the 8
+    # case functions in tests/kernel/test_percpu_hash_maps.py).
+    assert sites == 119, (
         "load-site inventory drifted (%d); audit the new "
         "sites for flag tokens, then re-pin" % sites)
     assert hits == [], hits

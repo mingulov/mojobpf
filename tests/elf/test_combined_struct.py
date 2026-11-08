@@ -441,9 +441,12 @@ def test_two_entry_btf_differs_by_one_word():
     # The emitter generalizes to any declared count now (3 and 4
     # entries are proven shapes), so the fail-loud boundary moved
     # to unrepresentable values: a zero count and a foreign type.
+    # Type 5 (BPF_MAP_TYPE_PERCPU_HASH) is admitted since the
+    # per-CPU-hash leaf, so the foreign-type probe uses 3
+    # (BPF_MAP_TYPE_PROG_ARRAY, real but unsupported).
     block3 = adapter.btf_block(entries=3)
     assert ".long 3" in block3.replace("\\22", '"')
-    for bad in ({"entries": 0}, {"map_type": 5}):
+    for bad in ({"entries": 0}, {"map_type": 3}):
         try:
             adapter.btf_block(**bad)
         except adapter.AdapterError as exc:

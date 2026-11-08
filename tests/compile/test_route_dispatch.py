@@ -227,6 +227,7 @@ def _stub_adapter(mode, qualified, entry="xdp_entry"):
     audit.scan = lambda text: types.SimpleNamespace(
         entry=scan(text).entry, mode=mode, entries=1,
         percpu=False, hashkind=False, lrukind=False,
+        pcpuhashkind=False,
     )
     return types.SimpleNamespace(
         AdapterError=_StubAdapterError,
@@ -1234,6 +1235,7 @@ def _stub_map_adapter(qualified, entry="xdp_entry", entries=1,
     audit.scan = lambda text: types.SimpleNamespace(
         entry=scan(text).entry, mode="map", entries=entries,
         percpu=tagged, hashkind=mixed, lrukind=False,
+        pcpuhashkind=False,
     )
     return types.SimpleNamespace(
         AdapterError=_StubAdapterError,
