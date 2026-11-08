@@ -46010,12 +46010,14 @@
       "compiler_surface": "section-convention",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_elf_sections.py"
+      ],
       "family": "object-elf",
       "helpers_or_kfuncs": [],
       "id": "elf:data-sections",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],

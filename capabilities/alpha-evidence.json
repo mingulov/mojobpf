@@ -285,6 +285,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "elf:data-sections": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_elf_sections.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "elf:license-declaration": {
       "evidence_level": "tested",
       "evidence_refs": [
