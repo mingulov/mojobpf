@@ -704,6 +704,20 @@ SUITE_DENIALS = {
             "test_endian_mutation_aborts", "RUNTIME"
         ),
     },
+    "kernel-isa-legacy": {
+        "test_legacy_abs_refused": (
+            "test_legacy_guest_objects_carry_legacy", "VERIFY"
+        ),
+        "test_legacy_ind_refused": (
+            "test_legacy_guest_objects_carry_legacy", "VERIFY"
+        ),
+        "test_legacy_len_refused": (
+            "test_legacy_guest_objects_carry_legacy", "VERIFY"
+        ),
+        "test_legacy_msh_refused": (
+            "test_legacy_guest_objects_carry_legacy", "VERIFY"
+        ),
+    },
     "kernel-map": {
         "test_oob_rejected_by_verifier": (
             "test_map_roundtrip_42", "VERIFY"

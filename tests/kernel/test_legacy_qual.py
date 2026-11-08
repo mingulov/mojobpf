@@ -397,7 +397,20 @@ def test_guest_provenance():
         )
 
 
-CASE_DENIALS = {}
+CASE_DENIALS = {
+    "test_legacy_abs_refused": (
+        "test_legacy_guest_objects_carry_legacy", "VERIFY"
+    ),
+    "test_legacy_ind_refused": (
+        "test_legacy_guest_objects_carry_legacy", "VERIFY"
+    ),
+    "test_legacy_len_refused": (
+        "test_legacy_guest_objects_carry_legacy", "VERIFY"
+    ),
+    "test_legacy_msh_refused": (
+        "test_legacy_guest_objects_carry_legacy", "VERIFY"
+    ),
+}
 
 CASE_INPUTS = {
     "test_legacy_abs_refused": {
