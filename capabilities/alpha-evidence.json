@@ -590,6 +590,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_EXIT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_exit_return.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_FETCH": {
       "evidence_level": "tested",
       "evidence_refs": [
