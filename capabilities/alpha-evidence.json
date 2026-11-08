@@ -18,6 +18,24 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "btf:FUNC": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_func_btf.py",
+        "matrix:v6.12-tcg/kernel-core-layouts",
+        "matrix:v6.6-tcg/kernel-core-layouts"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:FUNC_PROTO": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_func_btf.py",
+        "matrix:v6.12-tcg/kernel-core-layouts",
+        "matrix:v6.6-tcg/kernel-core-layouts"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "btf:INT": {
       "evidence_level": "tested",
       "evidence_refs": [
