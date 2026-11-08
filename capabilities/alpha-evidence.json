@@ -919,6 +919,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_PSEUDO_FUNC": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_pseudo_func.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_PSEUDO_MAP_FD": {
       "evidence_level": "tested",
       "evidence_refs": [
