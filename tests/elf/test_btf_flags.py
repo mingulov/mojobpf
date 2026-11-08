@@ -19,6 +19,10 @@ src/compiler only — tests/ hold a recorded kernel
 helper-table pin (inventory fixture) and tools/
 holds the family-mapping table, both observation,
 not toolchain surface.
+
+Lane note: this suite builds through the production
+route, so it lives in tests/elf (compiler lane);
+the guarded unit lane refuses compiler execution.
 """
 import json
 import os
@@ -98,6 +102,13 @@ def test_btf_flags_uapi_bits():
         assert int(match.group(1)) == bit, (name, match.group(1))
 
 
+DESCRIPTOR_PATHS = (
+    os.path.join("compiler", "admission.json"),
+    os.path.join("src", "mojobpf", "resources", "adapter",
+                 "admission.json"),
+)
+
+
 def test_registry_admits_no_flag_helpers():
     for helper_id, name in sorted(FLAG_HELPERS.items()):
         assert helpers_module.lookup_helper(helper_id) is None, (
@@ -105,19 +116,41 @@ def test_registry_admits_no_flag_helpers():
     profiles = capabilities_module.SUPPORTED_PROFILE_IDS
     assert profiles, "profile walk must stay populated"
     for profile_id in profiles:
-        admitted = helpers_module.profile_helper_ids(profile_id)
+        # Truthful admission view (descriptor-backed,
+        # inheritance included) — not the
+        # introducing-only legacy spelling.
+        admitted = capabilities_module.helpers_for_profile(
+            profile_id)
         for helper_id in FLAG_HELPERS:
             assert helper_id not in admitted, (
                 profile_id, helper_id, admitted)
+    for rel in DESCRIPTOR_PATHS:
+        with open(os.path.join(REPO_ROOT, rel),
+                  encoding="utf-8") as handle:
+            descriptor = json.load(handle)
+        seen = set()
+        for profile_id, entry in sorted(
+                descriptor["profiles"].items()):
+            seen.add(profile_id)
+            for helper_id in FLAG_HELPERS:
+                assert helper_id not in entry["helper_ids"], (
+                    rel, profile_id, helper_id)
+        assert seen == set(profiles), (rel, seen)
 
 
 WALK_ROOTS = ["src", "compiler", "tests", "ci"]
 WALK_EXTENSIONS = (".py", ".txt", ".mojo", ".cpp", ".h", ".c")
 WALK_ALLOWED = {
-    os.path.join("tests", "unit", "test_btf_flags.py"),
+    os.path.join("tests", "elf", "test_btf_flags.py"),
     os.path.join("tests", "negative", "btf", "flags",
                  "btf_flags.txt"),
 }
+HELPER_NEEDLES = [
+    "bpf_snprintf_btf",
+    "snprintf_btf",
+    "bpf_seq_printf_btf",
+    "seq_printf_btf",
+]
 HELPER_WALK_ROOTS = ["src", "compiler"]
 
 
@@ -145,9 +178,13 @@ def _flag_patterns():
 
 
 def _helper_patterns():
+    # Both spellings: the unprefixed needle alone
+    # cannot match inside `bpf_`-prefixed names (no
+    # word boundary after `_`), so the prefixed forms
+    # are pinned explicitly.
     return [
         re.compile(r"\b%s\b" % re.escape(needle))
-        for needle in ["snprintf_btf", "seq_printf_btf"]
+        for needle in HELPER_NEEDLES
     ]
 
 
@@ -164,24 +201,31 @@ def test_no_flag_helper_surface_in_tree():
     hits = []
     for rel, text in _walk_files(HELPER_WALK_ROOTS):
         for needle, pattern in zip(
-                ["snprintf_btf", "seq_printf_btf"],
-                _helper_patterns()):
+                HELPER_NEEDLES, _helper_patterns()):
             if pattern.search(text):
                 hits.append((rel, needle))
     assert hits == [], hits
 
 
 def test_matcher_catches_snprintf_call():
-    # Retained mutation: a snprintf-shaped call site must
+    # Retained mutation: snprintf-shaped call sites must
     # match even though no such site exists in the tree.
-    call = "emit_call(149, [dst, fmt, btf_ptr]); /* snprintf_btf */"
-    matched = [
-        needle for needle, pattern in zip(
-            ["snprintf_btf", "seq_printf_btf"],
-            _helper_patterns())
-        if pattern.search(call)
-    ]
-    assert matched == ["snprintf_btf"], matched
+    # Real call shapes carry the `bpf_` prefix.
+    for call, want in (
+            ("r = bpf_snprintf_btf(dst, s, p, d, f);",
+             ["bpf_snprintf_btf"]),
+            ("r = bpf_seq_printf_btf(m, d, f);",
+             ["bpf_seq_printf_btf"]),
+            ("emit_call(149, [dst, fmt]);// snprintf_btf",
+             ["snprintf_btf"]),
+            ("emit_call(150, [m]);// seq_printf_btf",
+             ["seq_printf_btf"])):
+        matched = [
+            needle for needle, pattern in zip(
+                HELPER_NEEDLES, _helper_patterns())
+            if pattern.search(call)
+        ]
+        assert matched == want, (call, matched)
     flagged = "flags = BTF_F_ZERO | BTF_F_COMPACT;"
     matched_flags = [
         needle for needle, pattern in zip(

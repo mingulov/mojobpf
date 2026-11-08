@@ -7,7 +7,7 @@
 # emitted anywhere in our toolchain, so the flags have
 # no carrier. The UAPI pins, the registry exclusion,
 # the tree surface proof, and the emission proof live
-# in tests/unit/test_btf_flags.py. This file indexes
+# in tests/elf/test_btf_flags.py. This file indexes
 # the vectors so reviewers can audit coverage without
 # reading the test body.
 #
