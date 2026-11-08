@@ -351,6 +351,34 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "flag:BTF_F_COMPACT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_btf_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BTF_F_NONAME": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_btf_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BTF_F_PTR_RAW": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_btf_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BTF_F_ZERO": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_btf_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "helper:get_current_pid_tgid": {
       "evidence_level": "tested",
       "evidence_refs": [
