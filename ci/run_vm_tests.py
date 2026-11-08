@@ -104,6 +104,7 @@ SUITES = (
     ("kernel-isa-jcc", "tests/kernel/test_jcc_qual.py", 1500),
     ("kernel-isa-atomic", "tests/kernel/test_atomic_qual.py", 1500),
     ("kernel-isa-endian", "tests/kernel/test_endian_qual.py", 1500),
+    ("kernel-isa-legacy", "tests/kernel/test_legacy_qual.py", 1500),
     ("kernel-map", "tests/kernel/test_map_roundtrip.py", 1500),
     ("kernel-packet", "tests/kernel/test_packet_sdk.py", 1500),
     ("kernel-parse", "tests/kernel/test_parse_checksum_sdk.py", 1500),
@@ -232,6 +233,14 @@ SUITE_CASES = {
         "test_endian_guest_objects_admit_endian  "
         "test_endian_mutation_aborts  "
         "test_endian_stale_object_fails test_fixture_bytes  "
+        "test_guest_provenance"
+    ).split(),
+    "kernel-isa-legacy": (
+        "test_legacy_abs_refused  "
+        "test_legacy_ind_refused  "
+        "test_legacy_len_refused  "
+        "test_legacy_msh_refused  "
+        "test_legacy_guest_objects_carry_legacy  "
         "test_guest_provenance"
     ).split(),
     "kernel-map": (

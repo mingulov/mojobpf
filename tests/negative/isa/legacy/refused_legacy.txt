@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-legacy-shape corpus index for F-ISA/legacy/refusal.
+#
+# Legacy cBPF loads have no lowering rule and no llc selection
+# path on the v3 XDP profile; both lanes' XDP verifiers reject
+# hand-assembled legacy words. The UAPI modes and the
+# llc absence guard live in compiler/tests/test_isa_legacy.py;
+# the four kernel rejections are pinned live by
+# tests/kernel/test_legacy_qual.py (fail-open: a future
+# accepting kernel turns those legs RED by design). This file
+# indexes them so reviewers can audit coverage without reading
+# the test bodies.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+LD_ABS word 0x20 | test_legacy_abs_refused | exit 4, verifier: BPF_LD_[ABS|IND] instructions not allowed for this program type
+LD_IND word 0x800006040 | test_legacy_ind_refused | exit 4, verifier: BPF_LD_[ABS|IND] instructions not allowed for this program type
+LD_LEN word 0x80 | test_legacy_len_refused | exit 4, verifier: unknown opcode 80
+LDX_MSH word 0xB1 | test_legacy_msh_refused | exit 4, verifier: BPF_LDX uses reserved fields
+UAPI modes + absence guard | test_legacy_uapi_modes, test_legacy_recognizer, test_legacy_absent_all_corpora | modes pinned, zero legacy words in every committed corpus
+probe words | test_legacy_probe_words_flagged | exact words + recognizer flags
