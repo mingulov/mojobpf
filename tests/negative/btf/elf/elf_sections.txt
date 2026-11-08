@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# ELF data-section index for F-BTF/elf/data-sections.
+#
+# libbpf 1.7.0 collects maps, rodata, kconfig, ksyms
+# and BTF payload sections by fixed ELF section names;
+# our production objects use exactly those standard
+# names. The spelling pins, the emitter section sets,
+# and the inspect-gate agreement live in
+# tests/elf/test_elf_sections.py. This file indexes the
+# vectors so reviewers can audit coverage without
+# reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BTF_ELF_SEC .BTF | test_libbpf_section_spellings | pinned spelling
+BTF_EXT_ELF_SEC .BTF.ext | test_libbpf_section_spellings | pinned spelling
+MAPS_ELF_SEC .maps | test_libbpf_section_spellings | pinned spelling
+RODATA_SEC .rodata | test_libbpf_section_spellings | pinned spelling
+KCONFIG_SEC .kconfig | test_libbpf_section_spellings | pinned spelling
+KSYMS_SEC .ksyms | test_libbpf_section_spellings | pinned spelling
+map production build | test_map_build_section_set | .maps + .BTF, no .BTF.ext/.rodata/.kconfig/.ksyms
+core production build | test_core_build_section_set | .maps + .BTF + .BTF.ext, no .rodata/.kconfig/.ksyms
+inspect gates | test_inspect_gates_agree | .maps/.BTF presence notes on both builds

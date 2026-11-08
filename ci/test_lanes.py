@@ -93,6 +93,7 @@ OWNERS = {
         'tests/differential/test_scalars.py',
         'tests/elf/test_artifact_contract.py',
         'tests/elf/test_combined_struct.py',
+        'tests/elf/test_elf_sections.py',
         'tests/elf/test_enum_btf.py',
         'tests/elf/test_event_struct.py',
         'tests/elf/test_float_btf.py',
