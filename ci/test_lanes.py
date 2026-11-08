@@ -125,6 +125,7 @@ OWNERS = {
         'tests/unit/test_native_adapter.py',
         'tests/unit/test_nm_crosscheck.py',
         'tests/unit/test_portability_locks.py',
+        'tests/unit/test_prog_flags.py',
         'tests/unit/test_subset_kernel_build.py',
         'tests/unit/test_toolchain.py',
         'tests/unit/test_verify.py',
