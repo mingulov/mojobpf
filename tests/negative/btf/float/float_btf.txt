@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Float-shape index for F-BTF/float/refusal.
+#
+# FLOAT (kind 16) is neither emitted nor decoded
+# (MBPF402 with the exact "unexpected BTF kind 16"
+# message). The kind pin, the rejection, and the
+# emitter absence live in tests/elf/test_float_btf.py.
+# This file indexes the vectors so reviewers can
+# audit coverage without reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BTF_KIND_FLOAT 16 | test_float_uapi_kind | pinned vs installed btf.h
+FLOAT record 'f' size 4 | test_float_rejected | MBPF402 unexpected BTF kind 16
+map + core production builds | test_routes_emit_no_float | no kind 16 in either .BTF
+bpftool cross-check | test_bpftool_cross_check_has_no_float | no FLOAT lines
