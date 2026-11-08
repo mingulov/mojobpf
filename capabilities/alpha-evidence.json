@@ -9,6 +9,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "btf:CONST": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_modifier_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "btf:DATASEC": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -54,6 +61,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "btf:RESTRICT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_modifier_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "btf:STRUCT": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -63,12 +77,26 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "btf:TYPEDEF": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_modifier_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "btf:VAR": {
       "evidence_level": "tested",
       "evidence_refs": [
         "host:tests/elf/test_map_btf.py",
         "matrix:v6.12-tcg/kernel-map",
         "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:VOLATILE": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_modifier_btf.py"
       ],
       "implementation_state": "IMPLEMENTED"
     },
