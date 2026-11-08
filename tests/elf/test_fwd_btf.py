@@ -1,0 +1,314 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""BTF fwd/attrs: FWD, DECL_TAG and TYPE_TAG refused.
+
+FWD (kind 7), DECL_TAG (17) and TYPE_TAG (18) are
+neither emitted nor decoded (MBPF402 "unexpected BTF
+kind N" — correct fail-closed behavior for a reader
+whose contract is our own objects). This suite pins
+the UAPI kind numbers, the three rejections with
+exact messages on well-formed named fixtures, and
+the emitter absence for all three on the production
+map + core routes (build_project, parsed route
+asserted), cross-checked with bpftool.
+
+Requires a working Mojo compiler, LLVM ``llc`` and ``bpftool``
+on PATH for the pipeline tests. A missing tool is reported
+as an environment failure; a failing build step is a proof
+failure. Neither ever passes.
+
+Runnable directly (``python3 tests/elf/test_fwd_btf.py``) or
+under any ``test_``-style runner. Standard library only.
+"""
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import (  # noqa: E402
+    BuildRequest,
+    build_project,
+)
+from mojobpf.elf_reader import (  # noqa: E402
+    ElfError,
+    parse_elf,
+    section_bytes,
+)
+from mojobpf.inspect import _parse_btf_types  # noqa: E402
+
+ROUNDTRIP_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "map_roundtrip.mojo"
+)
+CORE_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "core", "core_read.mojo"
+)
+SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
+LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
+PIXI_BIN = os.path.join(REPO_ROOT, ".pixi", "envs", "default", "bin")
+UAPI_HEADER = "/usr/include/linux/btf.h"
+
+BASE_PROFILE = "linux-bpfel-v3"
+CORE_PROFILE = "linux-bpfel-v3-core"
+
+FWD_KINDS = {
+    "BTF_KIND_FWD": 7,
+    "BTF_KIND_DECL_TAG": 17,
+    "BTF_KIND_TYPE_TAG": 18,
+}
+
+
+class EnvironmentFailure(Exception):
+    """The toolchain needed by this test is missing or broken."""
+
+
+def run_step(argv, timeout=600):
+    return subprocess.run(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def check_tools(*tools):
+    for tool in tools:
+        found = shutil.which(tool) or os.path.join(PIXI_BIN, tool)
+        if not (shutil.which(tool) or os.path.isfile(found)):
+            raise EnvironmentFailure("%s not found" % tool)
+
+
+def manifest_text(profile, core, source, value_type, max_entries):
+    return (
+        "schema_version = 1\n"
+        "\n"
+        "[project]\n"
+        'name = "fwd-proof"\n'
+        "\n"
+        "[target]\n"
+        'profile = "%s"\n' % profile
+        + "core = %s\n" % ("true" if core else "false")
+        + "\n"
+        "[artifact]\n"
+        'name = "fwd_probe"\n'
+        'source_license = "Apache-2.0 WITH LLVM-exception"\n'
+        'kernel_license = "Apache-2.0 WITH LLVM-exception"\n'
+        "\n"
+        "[[programs]]\n"
+        'source = "%s"\n' % source
+        + 'entry = "xdp_entry"\n'
+        'program_type = "xdp"\n'
+        'section = "xdp"\n'
+        "[[maps]]\n"
+        'name = "mojobpf_map0"\n'
+        'map_type = "array"\n'
+        'key_type = "u32"\n'
+        'value_type = "%s"\n' % value_type
+        + "max_entries = %d\n" % max_entries
+    )
+
+
+def build_object(source, profile, core, value_type, max_entries):
+    """Build through the production route; return image bytes."""
+    check_tools("mojo", "llc")
+    for path in (source, SERVICE, LOCKFILE):
+        if not os.path.isfile(path):
+            raise EnvironmentFailure("missing repo file: %s" % path)
+    parent = tempfile.mkdtemp(prefix="mojo-fwd-prod-")
+    try:
+        project = os.path.join(parent, "proj")
+        os.makedirs(project)
+        staged = os.path.join(
+            project, os.path.basename(source)
+        )
+        shutil.copyfile(source, staged)
+        manifest_path = os.path.join(project, "mojobpf.toml")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                manifest_text(
+                    profile, core, os.path.basename(source),
+                    value_type, max_entries,
+                )
+            )
+        out_dir = os.path.join(parent, "out")
+        result = build_project(
+            BuildRequest(
+                manifest_path=manifest_path,
+                out_dir=out_dir,
+                adapter_path=SERVICE,
+                search_paths=(PIXI_BIN,),
+                timeout_s=600,
+                lockfile_path=LOCKFILE,
+            )
+        )
+        assert result.success is True, (
+            [str(item) for item in result.diagnostics],
+        )
+        with open(
+            os.path.join(out_dir, "fwd_probe.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
+        objects = sorted(
+            entry for entry in os.listdir(out_dir)
+            if entry.endswith(".bpf.o")
+        )
+        assert len(objects) == 1, objects
+        with open(os.path.join(out_dir, objects[0]), "rb") as handle:
+            return handle.read()
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def _blob(types, strings):
+    header = struct.pack(
+        "<HBBIIIII", 0xEB9F, 1, 0, 24, 0, len(types),
+        len(types), len(strings),
+    )
+    return header + types + strings
+
+
+def fwd_blob():
+    """Synthetic .BTF: named struct forward 'node' (kind 7)."""
+    strings = b"\x00node\x00"
+    types = struct.pack("<III", 1, (7 << 24) | 0, 0)
+    return _blob(types, strings)
+
+
+def decl_tag_blob():
+    """Synthetic .BTF: INT 'x' + DECL_TAG 'tag' on type 1, idx -1."""
+    strings = b"\x00x\x00tag\x00"
+    types = b"".join([
+        struct.pack("<III", 1, (1 << 24) | 0, 4),
+        struct.pack("<I", 0x20),
+        struct.pack("<III", 3, (17 << 24) | 0, 1),
+        struct.pack("<i", -1),
+    ])
+    return _blob(types, strings)
+
+
+def type_tag_blob():
+    """Synthetic .BTF: INT 'x' + TYPE_TAG 'user' on type 1."""
+    strings = b"\x00x\x00user\x00"
+    types = b"".join([
+        struct.pack("<III", 1, (1 << 24) | 0, 4),
+        struct.pack("<I", 0x20),
+        struct.pack("<III", 3, (18 << 24) | 0, 1),
+    ])
+    return _blob(types, strings)
+
+
+def test_fwd_uapi_kinds():
+    with open(UAPI_HEADER, encoding="utf-8") as handle:
+        text = handle.read()
+    for name, want in sorted(FWD_KINDS.items()):
+        match = re.search(r"%s\s*=\s*(\d+)" % name, text)
+        assert match, "UAPI kind missing: %s" % name
+        assert int(match.group(1)) == want, (name, match.group(1))
+
+
+def _assert_rejected(blob, kind):
+    try:
+        _parse_btf_types(blob, "synthetic")
+    except ElfError as exc:
+        assert exc.code == "MBPF402", exc.code
+        assert str(exc) == "unexpected BTF kind %d" % kind, str(exc)
+    else:
+        raise AssertionError(
+            "kind-%d blob must raise MBPF402" % kind)
+
+
+def test_fwd_rejected():
+    _assert_rejected(fwd_blob(), 7)
+
+
+def test_decl_tag_rejected():
+    _assert_rejected(decl_tag_blob(), 17)
+
+
+def test_type_tag_rejected():
+    _assert_rejected(type_tag_blob(), 18)
+
+
+def _btf_kinds(image):
+    elf = parse_elf(image, "built")
+    sections = [s for s in elf.sections if s.name == ".BTF"]
+    assert len(sections) == 1, [s.name for s in elf.sections]
+    records, _strings = _parse_btf_types(
+        section_bytes(elf, sections[0]), "built")
+    return sorted(kind for _name, kind, _payload in records)
+
+
+PRODUCTION_BUILDS = (
+    # (source, profile, core, value_type, max_entries)
+    (ROUNDTRIP_SOURCE, BASE_PROFILE, False, "u64", 1),
+    (CORE_SOURCE, CORE_PROFILE, True, "bytes4096", 1),
+)
+
+
+def test_routes_emit_no_fwd():
+    for source, profile, core, value_type, max_entries in (
+            PRODUCTION_BUILDS):
+        kinds = _btf_kinds(build_object(
+            source, profile, core, value_type, max_entries))
+        assert kinds, source
+        for kind in sorted(FWD_KINDS.values()):
+            assert kind not in kinds, (source, kinds)
+
+
+def test_bpftool_cross_check_has_no_fwd():
+    check_tools("bpftool")
+    for source, profile, core, value_type, max_entries in (
+            PRODUCTION_BUILDS):
+        image = build_object(
+            source, profile, core, value_type, max_entries)
+        workdir = tempfile.mkdtemp(prefix="mojo-fwd-xcheck-")
+        try:
+            path = os.path.join(workdir, "probe.bpf.o")
+            with open(path, "wb") as handle:
+                handle.write(image)
+            proc = run_step(["bpftool", "btf", "dump", "file", path])
+            assert proc.returncode == 0, proc.stderr
+            for word in ("FWD", "DECL_TAG", "TYPE_TAG"):
+                assert word not in proc.stdout, (source, proc.stdout)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
+    failures = 0
+    for name, func in sorted(
+        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+    ):
+        try:
+            func()
+        except EnvironmentFailure as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            return 2
+        except AssertionError as exc:
+            print("FAIL %s: %s" % (name, exc))
+            failures += 1
+        else:
+            print("PASS %s" % name)
+    if failures:
+        return 1
+    print("fwd BTF: rejection and absence checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

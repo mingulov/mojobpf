@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Fwd/tag-shape index for F-BTF/fwd/attrs.
+#
+# FWD (kind 7), DECL_TAG (17) and TYPE_TAG (18) are
+# neither emitted nor decoded (MBPF402 with exact
+# "unexpected BTF kind N" messages). The kind pins,
+# the three rejections, and the emitter absence live
+# in tests/elf/test_fwd_btf.py. This file indexes the
+# vectors so reviewers can audit coverage without
+# reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BTF_KIND_FWD 7 | test_fwd_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_DECL_TAG 17 | test_fwd_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_TYPE_TAG 18 | test_fwd_uapi_kinds | pinned vs installed btf.h
+FWD record 'node' | test_fwd_rejected | MBPF402 unexpected BTF kind 7
+DECL_TAG record 'tag' | test_decl_tag_rejected | MBPF402 unexpected BTF kind 17
+TYPE_TAG record 'user' | test_type_tag_rejected | MBPF402 unexpected BTF kind 18
+map + core production builds | test_routes_emit_no_fwd | no kind 7/17/18 in either .BTF
+bpftool cross-check | test_bpftool_cross_check_has_no_fwd | no FWD/DECL_TAG/TYPE_TAG lines
