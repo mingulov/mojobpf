@@ -25,6 +25,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "btf:DECL_TAG": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_fwd_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "btf:ENUM": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -54,6 +61,13 @@
         "host:tests/elf/test_func_btf.py",
         "matrix:v6.12-tcg/kernel-core-layouts",
         "matrix:v6.6-tcg/kernel-core-layouts"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:FWD": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_fwd_btf.py"
       ],
       "implementation_state": "IMPLEMENTED"
     },
@@ -95,6 +109,13 @@
       "evidence_level": "tested",
       "evidence_refs": [
         "host:tests/elf/test_modifier_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:TYPE_TAG": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_fwd_btf.py"
       ],
       "implementation_state": "IMPLEMENTED"
     },
