@@ -9,8 +9,8 @@
 	.globl xdp_endian_tole
 	.type xdp_endian_tole,@function
 xdp_endian_tole:
-	r6 = *(u64 *)(r1 + 0)
-	r2 = *(u64 *)(r1 + 4)
+	r6 = *(u32 *)(r1 + 0)
+	r2 = *(u32 *)(r1 + 4)
 	r3 = r6
 	r3 += 16
 	if r3 > r2 goto +3
