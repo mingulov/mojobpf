@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# FUNC/FUNC_PROTO-shape index for F-BTF/func/func-proto.
+#
+# Our toolchain never emits BTF kinds 12/13, but the
+# inspector decodes them per UAPI when present in foreign
+# objects. The kind pins, the decode rules, and the
+# emitter absence live in tests/elf/test_func_btf.py.
+# This file indexes the vectors so reviewers can audit
+# coverage without reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BTF_KIND_FUNC 12 | test_func_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_FUNC_PROTO 13 | test_func_uapi_kinds | pinned vs installed btf.h
+synthetic INT+PROTO+FUNC blob | test_func_decode | exact names/kinds/payloads (int,1,4), (,13,1), (myfunc,12,2)
+truncated FUNC_PROTO params | test_func_proto_truncation_rejected | ElfError MBPF402
+genuine-pipeline object | test_pipeline_emits_no_func_btf | map BTF present, no kind 12/13
+bpftool cross-check | test_bpftool_cross_check_has_no_func | bpftool dump has no FUNC lines
+adapter debuginfo shape | test_adapter_debuginfo_lists_no_subprograms | exactly one DISubprogram, CU without subprograms, both adapter copies
