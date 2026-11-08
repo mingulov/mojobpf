@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# BTF display-flag index for F-BTF/flags/btf-opts.
+#
+# The four BTF_F_* bits are display options for the
+# bpf_snprintf_btf (149) / bpf_seq_printf_btf (150)
+# helpers. Neither helper is admitted, referenced, or
+# emitted anywhere in our toolchain, so the flags have
+# no carrier. The UAPI pins, the registry exclusion,
+# the tree surface proof, and the emission proof live
+# in tests/unit/test_btf_flags.py. This file indexes
+# the vectors so reviewers can audit coverage without
+# reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BTF_F_COMPACT bit 0 | test_btf_flags_uapi_bits | pinned vs installed bpf.h
+BTF_F_NONAME bit 1 | test_btf_flags_uapi_bits | pinned vs installed bpf.h
+BTF_F_PTR_RAW bit 2 | test_btf_flags_uapi_bits | pinned vs installed bpf.h
+BTF_F_ZERO bit 3 | test_btf_flags_uapi_bits | pinned vs installed bpf.h
+helper registry | test_registry_admits_no_flag_helpers | 149/150 unregistered, unadmitted by every profile
+flag macros in tree | test_no_btf_flag_macros_in_tree | zero hits outside suite + index
+helper names in tree | test_no_flag_helper_surface_in_tree | zero hits in src/compiler
+matcher self-check | test_matcher_catches_snprintf_call | planted call + flags caught
+map + core production builds | test_emitted_calls_carry_no_flag_helpers | no helper 149/150 calls

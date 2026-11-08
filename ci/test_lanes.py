@@ -30,6 +30,7 @@ OWNERS = {
         'tests/harness/test_process_guardian.py',
         'tests/harness/test_tool_admission.py',
         'tests/unit/test_artifact_publication.py',
+        'tests/unit/test_btf_flags.py',
         'tests/unit/test_ci_workflow_contract.py',
         'tests/unit/test_cleanup_guest_filter.py',
         'tests/unit/test_event_decoder.py',
