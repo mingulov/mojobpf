@@ -381,6 +381,8 @@ def test_x86_matrix_shape_unchanged():
         "v6.12-kvm",
         "v6.6-kvm",
         "v7.0.14-kvm",
+        "v7.2-kvm",
+        "v7.4-rc1-kvm",
         "v6.12-tcg",
     ]
     runner = _load_runner_module()
@@ -1009,6 +1011,8 @@ def test_kernels_locks_are_reviewed():
         "v6.12-kvm",
         "v6.6-kvm",
         "v7.0.14-kvm",
+        "v7.2-kvm",
+        "v7.4-rc1-kvm",
         "v6.12-tcg",
     ]
     cache_root = os.path.join(

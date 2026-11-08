@@ -50,7 +50,7 @@
       "version": "1.41"
     }
   },
-  "generated_by": "tools/lock_refresh.py (reviewed; vng guest boots observed on fp43, lane debs carried over byte-identical; x86 lanes converted to KVM with the named v6.12-tcg fallback, debs/hashes unchanged)",
+  "generated_by": "tools/lock_refresh.py (reviewed; vng guest boots observed on fp43, lane debs carried over byte-identical; x86 lanes converted to KVM with the named v6.12-tcg fallback, debs/hashes unchanged; v7.2 + v7.4-rc1 KVM lanes pinned from observed cache debs 2026-11-08)",
   "lanes": [
     {
       "accelerator": "kvm",
@@ -113,6 +113,48 @@
         "vng",
         "--run",
         "v7.0.14"
+      ]
+    },
+    {
+      "accelerator": "kvm",
+      "id": "v7.2-kvm",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-7.2.0-070200-generic_7.2.0-070200.202608162350_amd64.deb",
+          "sha256": "bd94fb85bfa402307040d4cd6745f7b04d467ddce1ccc312253e50f975cc38a2"
+        },
+        {
+          "file": "linux-modules-7.2.0-070200-generic_7.2.0-070200.202608162350_amd64.deb",
+          "sha256": "13ab3038e131dc8914e3a7cfaafbd2990b8c9c1aeeb574c2e5895f1e032c4ecf"
+        }
+      ],
+      "kernel_release": "7.2.0-070200-generic",
+      "release": "v7.2",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v7.2"
+      ]
+    },
+    {
+      "accelerator": "kvm",
+      "id": "v7.4-rc1-kvm",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-7.4.0-070400rc1-generic_7.4.0-070400rc1.202611012313_amd64.deb",
+          "sha256": "5cba6ee87fbd2e326256fadadfd70048245d33cc244dca9daecd7e8b3e8ea29b"
+        },
+        {
+          "file": "linux-modules-7.4.0-070400rc1-generic_7.4.0-070400rc1.202611012313_amd64.deb",
+          "sha256": "8febb36deb72ced896b98c7991ddcff6046622f7575fed54370b95a1f9bf6dba"
+        }
+      ],
+      "kernel_release": "7.4.0-070400rc1-generic",
+      "release": "v7.4-rc1",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v7.4-rc1"
       ]
     },
     {

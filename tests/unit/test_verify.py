@@ -578,7 +578,7 @@ def test_release_env_override(monkeypatch=None):
 
 
 def test_kernels_lock_schema():
-    """The lane lockfile pins three KVM lanes plus the TCG fallback."""
+    """The lane lockfile pins five KVM lanes plus the TCG fallback."""
     with open(LOCK_PATH, encoding="utf-8") as handle:
         lock = json.load(handle)
     assert lock["schema_version"] == 1, lock
@@ -625,6 +625,8 @@ def test_kernels_lock_schema():
         "v6.12-kvm",
         "v6.6-kvm",
         "v7.0.14-kvm",
+        "v7.2-kvm",
+        "v7.4-rc1-kvm",
         "v6.12-tcg",
     ], lanes
     for lane in lanes:
