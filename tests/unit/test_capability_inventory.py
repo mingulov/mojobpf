@@ -1267,6 +1267,30 @@ def test_helpers_are_registered_and_callable():
             assert ref.startswith("linux:"), ref
 
 
+def test_implemented_records_reproduce_from_flip_table():
+    # The updater (apply_evidence_flips) reads only the nested
+    # "flips" mapping: every IMPLEMENTED record must have a
+    # matching entry there, or a refresh silently unflips it.
+    registry = load_registry()
+    with open(os.path.join(ROOT, "capabilities",
+                           "alpha-evidence.json"),
+              encoding="utf-8") as handle:
+        flips = json.load(handle)["flips"]
+    implemented = [entry for entry in registry["records"]
+                   if entry["implementation_state"] == "IMPLEMENTED"]
+    assert implemented, "expected at least one IMPLEMENTED record"
+    assert set(flips) == set(entry["id"] for entry in implemented), (
+        "flip table must cover exactly the IMPLEMENTED records")
+    for entry in implemented:
+        pinned = flips[entry["id"]]
+        assert pinned["implementation_state"] == "IMPLEMENTED", \
+            entry["id"]
+        assert pinned["evidence_level"] == \
+            entry["evidence_level"] == "tested", entry["id"]
+        assert pinned["evidence_refs"] == entry["evidence_refs"], \
+            entry["id"]
+
+
 def test_kfuncs_are_enumerated_with_registration():
     registry = load_registry()
     kfuncs = [entry for entry in registry["records"]
