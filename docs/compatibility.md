@@ -77,12 +77,16 @@ vocabulary, and helper IDs
 
 Full binary hashes live in `toolchains.lock.json` (host tools)
 and `ci/kernels.lock.json` (guest runner plus both kernel
-lanes). The release matrix runs every release-scope
-guest-backed suite (the 28 wired suites) in both lanes on the
+lanes). The 0.3.0a1 release matrix ran every release-scope
+guest-backed suite wired at the cut (the 28 suites) in both lanes on the
 same committed bits
 (`ci/run_vm_tests.py`, `tests/kernel/test_cleanup.py` for the
 lane-identity assertions); the portability suite runs as its
-own lane (next section), never in the matrix.
+own lane (next section), never in the matrix. The runner now
+registers 40 suites: the 28 release-matrix suites plus the 12
+`kernel-isa-*` qualification suites added after the cut, each
+proven in its own leaf's lane runs rather than in a release
+matrix rerun (`ci/run_vm_tests.py` `SUITES`).
 
 Every behavior section below outside the named portability
 lanes was observed on the current tested combination (LLVM
@@ -434,6 +438,21 @@ placement variance a C control shows identically. Everything
 else under LRU stays out (see the unsupported list): other
 key/value widths, other entry counts, `BPF_NOEXIST` /
 `BPF_EXIST` spellings, and from-program iteration.
+
+## Measured arithmetic behavior
+
+Unsigned division and remainder by nonzero constants at
+8/16/32/64 bits are admitted (32-bit constants reduce to
+checked magic/shift/compare sequences; oracle-word pins;
+`compiler/tests/test_isa_alu64.py`,
+`compiler/tests/test_isa_alu32.py`; `ci/run_vm_tests.py --suite
+kernel-isa-alu` and `--suite kernel-isa-alu32`,
+`tests/kernel/test_alu64_qual.py` and
+`tests/kernel/test_alu32_qual.py`, 7/7 per lane on both
+lanes). Variable divisors select the DIV/MOD X-form, which
+the audit refuses, as do signed division/remainder, zero
+divisors, and widths outside 8/16/32/64 (`MBPF319`; same
+host suites, selected-but-refused vectors).
 
 ## Proven refusals
 
