@@ -2,7 +2,11 @@
 ; F-ISA/atomic/ops oracle corpus: atomicrmw/cmpxchg emission
 ; cells (one STX|ATOMIC word + trailing exit each).
 ; add/sub/and/or/xor/xchg x 64/32, cmpxchg x 64/32/weak,
-; nofetch x2 (llc sets FETCH even for unused results).
+; nofetch x2 (seq_cst sets FETCH even for unused results),
+; monotonic x2 (monotonic selects bare XADD, used or not).
+; FETCH rule: ordering is the boundary, usedness is
+; irrelevant. Other orderings and monotonic non-add ops are
+; unobserved in this corpus (explicit non-claim).
 ; Excluded: min/max/umin/umax, fence, atomic load/store
 ; (llc 22.1.8 crashes on all of them; the audit refuses
 ; them first with MBPF304). Per-function comments name the
@@ -137,5 +141,24 @@ entry:
 define i32 @nofetch_xchg_32(ptr %p) {
 entry:
   %v = atomicrmw xchg ptr %p, i32 5 seq_cst
+  ret i32 7
+}
+
+; monotonic_add_64_used: monotonic selects bare XADD even
+; though the result is used (returns the addend: a bare XADD
+; yields no old value).
+define i32 @monotonic_add_64_used(ptr %p) {
+entry:
+  %v = atomicrmw add ptr %p, i64 5 monotonic
+  %t = trunc i64 %v to i32
+  ret i32 %t
+}
+
+; monotonic_add_64_unused: monotonic selects bare XADD for
+; unused results too (usedness is irrelevant; ordering is
+; the boundary).
+define i32 @monotonic_add_64_unused(ptr %p) {
+entry:
+  %v = atomicrmw add ptr %p, i64 5 monotonic
   ret i32 7
 }

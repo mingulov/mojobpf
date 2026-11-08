@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """F-ISA/atomic/ops: atomicrmw/cmpxchg refuse, the STX|ATOMIC surface pins.
 
-The audit refuses every atomic construct (fence, atomicrmw,
-cmpxchg -> exit 4, MBPF304); no admitted Mojo emits atomics.
-Oracle pins cover the llc emission cells (rmw add/sub/and/or/
-xor/xchg x 64/32, cmpxchg x 64/32/weak, nofetch x2), the
-FETCH-always rule, and the hand-asm bare-XADD + LOAD_ACQ +
-STORE_REL words. Structural asserts pin one-STX|ATOMIC-word
-functions with UAPI immediates and trailing exits. See the
-leaf packet for the frozen vector list and the crash set.
+The audit refuses every atomic construct (fence/atomicrmw ->
+exit 4, MBPF319 at entries and MBPF304 in subprograms;
+cmpxchg -> exit 4, MBPF305 first-and-only); no admitted Mojo
+emits atomics. Oracle pins cover the llc emission cells (rmw
+add/sub/and/or/xor/xchg x 64/32, cmpxchg x 64/32/weak,
+nofetch x2, monotonic x2), the ordering-boundary FETCH rule
+(seq_cst FETCH / monotonic bare, usedness irrelevant), and
+the hand-asm bare-XADD + LOAD_ACQ + STORE_REL words.
+Structural asserts pin one-STX|ATOMIC-word functions with
+UAPI immediates and trailing exits. See the leaf packet for
+the frozen vector list and the crash set.
 """
 import struct
 
@@ -46,7 +49,14 @@ FUNC_NAMES = [
     "rmw_xchg_64", "rmw_xchg_32",
     "cmpxchg_64", "cmpxchg_32", "cmpxchg_weak",
     "nofetch_add_64", "nofetch_xchg_32",
+    "monotonic_add_64_used", "monotonic_add_64_unused",
 ]
+
+# Functions selecting bare XADD (monotonic ordering); every
+# other corpus function selects FETCH (seq_cst ordering).
+MONOTONIC_FUNCS = (
+    "monotonic_add_64_used", "monotonic_add_64_unused",
+)
 
 # Exact words per function, observed at RED, decode-verified
 # (one STX|ATOMIC word each: class 0xDB/0xC3, UAPI imm, regs
@@ -69,6 +79,8 @@ FUNC_WORDS = {
     "cmpxchg_weak": [0x2000002B7, 0x1000000B7, 0xF1000021DB, 0x95],
     "nofetch_add_64": [0x5000002B7, 0x1000021DB, 0x7000000B4, 0x95],
     "nofetch_xchg_32": [0x5000002B4, 0xE1000021C3, 0x7000000B4, 0x95],
+    "monotonic_add_64_used": [0x5000000B7, 0x1DB, 0x95],
+    "monotonic_add_64_unused": [0x5000002B7, 0x21DB, 0x7000000B4, 0x95],
 }
 
 # Hand-asm corpus words (bare XADD + LOAD_ACQ + STORE_REL +
@@ -141,7 +153,7 @@ def _atomic_words(words):
 
 def test_atomic_oracle_emission(tmp_path):
     funcs = _oracle_functions(tmp_path)
-    assert len(funcs) == len(FUNC_NAMES) == 17
+    assert len(funcs) == len(FUNC_NAMES) == 19
     for name, words in zip(FUNC_NAMES, funcs):
         assert words == FUNC_WORDS[name], name
 
@@ -160,14 +172,20 @@ def test_atomic_shape_and_imm(tmp_path):
 
 
 def test_atomic_fetch_rule(tmp_path):
-    # llc sets FETCH on every observed emission, including
-    # unused results. Bare forms ride the hand-asm oracle.
+    # FETCH rule: ordering is the boundary (seq_cst selects
+    # FETCH, monotonic selects bare XADD), usedness is
+    # irrelevant. Bare hand-asm forms ride the hand-asm
+    # oracle; other orderings are unobserved (non-claim).
     funcs = _oracle_functions(tmp_path)
     for name, words in zip(FUNC_NAMES, funcs):
         assert words == FUNC_WORDS[name], name
         for _, word in _atomic_words(words):
             imm = (word >> 32) & 0xFFFFFFFF
-            assert imm & 0x01, (name, hex(imm))
+            if name in MONOTONIC_FUNCS:
+                assert imm == 0x00, (name, hex(imm))
+                assert word & 0xFF == 0xDB, (name, hex(word))
+            else:
+                assert imm & 0x01, (name, hex(imm))
 
 
 def test_atomic_weak_equals_strong(tmp_path):
