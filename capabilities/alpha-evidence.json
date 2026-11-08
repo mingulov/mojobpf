@@ -618,6 +618,15 @@
       "implementation_state": "IMPLEMENTED"
     }
   },
+  "isa:BPF_ATOMIC": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_atomic.py",
+      "matrix:v6.12-tcg/kernel-isa-atomic",
+      "matrix:v6.6-tcg/kernel-isa-atomic"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_B": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -627,12 +636,30 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_CMPXCHG": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_atomic.py",
+      "matrix:v6.12-tcg/kernel-isa-atomic",
+      "matrix:v6.6-tcg/kernel-isa-atomic"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_DW": {
     "evidence_level": "tested",
     "evidence_refs": [
       "host:compiler/tests/test_isa_mem.py",
       "matrix:v6.12-tcg/kernel-isa-mem",
       "matrix:v6.6-tcg/kernel-isa-mem"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_FETCH": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_atomic.py",
+      "matrix:v6.12-tcg/kernel-isa-atomic",
+      "matrix:v6.6-tcg/kernel-isa-atomic"
     ],
     "implementation_state": "IMPLEMENTED"
   },
@@ -807,6 +834,15 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_LOAD_ACQ": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_atomic.py",
+      "matrix:v6.12-tcg/kernel-isa-atomic",
+      "matrix:v6.6-tcg/kernel-isa-atomic"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_MEM": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -888,6 +924,15 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_STORE_REL": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_atomic.py",
+      "matrix:v6.12-tcg/kernel-isa-atomic",
+      "matrix:v6.6-tcg/kernel-isa-atomic"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_STX": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -903,6 +948,15 @@
       "host:compiler/tests/test_isa_mem.py",
       "matrix:v6.12-tcg/kernel-isa-mem",
       "matrix:v6.6-tcg/kernel-isa-mem"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_XCHG": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_atomic.py",
+      "matrix:v6.12-tcg/kernel-isa-atomic",
+      "matrix:v6.6-tcg/kernel-isa-atomic"
     ],
     "implementation_state": "IMPLEMENTED"
   },
