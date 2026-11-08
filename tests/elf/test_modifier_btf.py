@@ -9,8 +9,8 @@ fail-closed behavior for a reader whose contract is
 our own objects. This suite pins the UAPI kind
 numbers, the per-kind rejection with exact messages,
 and the emitter absence on the map + core routes over
-the genuine pipeline (mojo -> adapter -> llc),
-cross-checked with bpftool.
+the production build (build_project, parsed route
+asserted), cross-checked with bpftool.
 
 Requires a working Mojo compiler, LLVM ``llc`` and ``bpftool``
 on PATH for the pipeline tests. A missing tool is reported
@@ -20,6 +20,7 @@ failure. Neither ever passes.
 Runnable directly (``python3 tests/elf/test_modifier_btf.py``) or
 under any ``test_``-style runner. Standard library only.
 """
+import json
 import os
 import re
 import shutil
@@ -33,7 +34,10 @@ REPO_ROOT = os.path.dirname(
 )
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
-from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
+from mojobpf.build import (  # noqa: E402
+    BuildRequest,
+    build_project,
+)
 from mojobpf.elf_reader import (  # noqa: E402
     ElfError,
     parse_elf,
@@ -47,9 +51,13 @@ ROUNDTRIP_SOURCE = os.path.join(
 CORE_SOURCE = os.path.join(
     REPO_ROOT, "tests", "core", "core_read.mojo"
 )
-SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
-ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
+SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
+LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
+PIXI_BIN = os.path.join(REPO_ROOT, ".pixi", "envs", "default", "bin")
 UAPI_HEADER = "/usr/include/linux/btf.h"
+
+BASE_PROFILE = "linux-bpfel-v3"
+CORE_PROFILE = "linux-bpfel-v3-core"
 
 MODIFIER_KINDS = {
     "BTF_KIND_TYPEDEF": 8,
@@ -75,84 +83,113 @@ def run_step(argv, timeout=600):
 
 def check_tools(*tools):
     for tool in tools:
-        if shutil.which(tool) is None:
-            raise EnvironmentFailure("%s not found on PATH" % tool)
+        found = shutil.which(tool) or os.path.join(PIXI_BIN, tool)
+        if not (shutil.which(tool) or os.path.isfile(found)):
+            raise EnvironmentFailure("%s not found" % tool)
 
 
-def build_object(source):
-    """Run the genuine three-step build; return the image bytes."""
+def manifest_text(profile, core, source, value_type, max_entries):
+    return (
+        "schema_version = 1\n"
+        "\n"
+        "[project]\n"
+        'name = "modifier-proof"\n'
+        "\n"
+        "[target]\n"
+        'profile = "%s"\n' % profile
+        + "core = %s\n" % ("true" if core else "false")
+        + "\n"
+        "[artifact]\n"
+        'name = "modifier_probe"\n'
+        'source_license = "Apache-2.0 WITH LLVM-exception"\n'
+        'kernel_license = "Apache-2.0 WITH LLVM-exception"\n'
+        "\n"
+        "[[programs]]\n"
+        'source = "%s"\n' % source
+        + 'entry = "xdp_entry"\n'
+        'program_type = "xdp"\n'
+        'section = "xdp"\n'
+        "[[maps]]\n"
+        'name = "mojobpf_map0"\n'
+        'map_type = "array"\n'
+        'key_type = "u32"\n'
+        'value_type = "%s"\n' % value_type
+        + "max_entries = %d\n" % max_entries
+    )
+
+
+def build_object(source, profile, core, value_type, max_entries):
+    """Build through the production route; return image bytes.
+
+    Uses build_project (route-selected like release builds)
+    and asserts the parsed route ran, so the absence proof
+    covers the production emitter, not just Lane-A.
+    """
     check_tools("mojo", "llc")
-    for path in (source, ADAPTER):
+    for path in (source, SERVICE, LOCKFILE):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
-    if not os.path.isdir(SDK_INCLUDE):
-        raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
-    workdir = tempfile.mkdtemp(prefix="mojo-mod-elf-")
-    stem = os.path.splitext(os.path.basename(source))[0]
-    raw_path = os.path.join(workdir, stem + ".ll")
-    adapted_path = os.path.join(workdir, stem + ".bpf.ll")
-    object_path = os.path.join(workdir, stem + ".bpf.o")
-    proc = run_step(
-        [
-            "mojo",
-            "build",
-            "--emit",
-            "llvm",
-            *FRONTEND_TARGET_FLAGS,
-            "-I",
-            SDK_INCLUDE,
-            "-o",
-            raw_path,
-            source,
-        ]
-    )
-    if proc.returncode != 0 or not os.path.isfile(raw_path):
-        raise AssertionError(
-            "frontend failed (exit %d):\n%s\n%s"
-            % (proc.returncode, proc.stdout, proc.stderr)
+    parent = tempfile.mkdtemp(prefix="mojo-mod-prod-")
+    try:
+        project = os.path.join(parent, "proj")
+        os.makedirs(project)
+        staged = os.path.join(
+            project, os.path.basename(source)
         )
-    proc = run_step(
-        [
-            sys.executable,
-            ADAPTER,
-            "--input",
-            raw_path,
-            "--output",
-            adapted_path,
-        ]
-    )
-    if proc.returncode != 0 or not os.path.isfile(adapted_path):
-        raise AssertionError(
-            "adapter failed (exit %d):\n%s\n%s"
-            % (proc.returncode, proc.stdout, proc.stderr)
+        shutil.copyfile(source, staged)
+        manifest_path = os.path.join(project, "mojobpf.toml")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                manifest_text(
+                    profile, core, os.path.basename(source),
+                    value_type, max_entries,
+                )
+            )
+        out_dir = os.path.join(parent, "out")
+        result = build_project(
+            BuildRequest(
+                manifest_path=manifest_path,
+                out_dir=out_dir,
+                adapter_path=SERVICE,
+                search_paths=(PIXI_BIN,),
+                timeout_s=600,
+                lockfile_path=LOCKFILE,
+            )
         )
-    proc = run_step(
-        [
-            "llc",
-            "-mtriple=bpfel",
-            "-mcpu=v3",
-            "-filetype=obj",
-            adapted_path,
-            "-o",
-            object_path,
-        ]
-    )
-    if proc.returncode != 0 or not os.path.isfile(object_path):
-        raise AssertionError(
-            "backend failed (exit %d):\n%s\n%s"
-            % (proc.returncode, proc.stdout, proc.stderr)
+        assert result.success is True, (
+            [str(item) for item in result.diagnostics],
         )
-    with open(object_path, "rb") as handle:
-        return handle.read()
+        with open(
+            os.path.join(out_dir, "modifier_probe.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
+        objects = sorted(
+            entry for entry in os.listdir(out_dir)
+            if entry.endswith(".bpf.o")
+        )
+        assert len(objects) == 1, objects
+        with open(os.path.join(out_dir, objects[0]), "rb") as handle:
+            return handle.read()
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def modifier_blob(kind):
-    """Synthetic .BTF: INT + one KIND record pointing at it."""
+    """Synthetic .BTF: INT + one KIND record pointing at it.
+
+    VOLATILE/CONST/RESTRICT are unnamed (name_off 0), as the
+    kernel validator requires; TYPEDEF keeps its name.
+    """
     strings = b"\x00int\x00mod\x00"
+    name_off = 5 if kind == 8 else 0
     types = b"".join([
         struct.pack("<III", 1, (1 << 24) | 0, 4),
         struct.pack("<I", 0x20),
-        struct.pack("<III", 5, (kind << 24) | 0, 1),
+        struct.pack("<III", name_off, (kind << 24) | 0, 1),
     ])
     header = struct.pack(
         "<HBBIIIII", 0xEB9F, 1, 0, 24, 0, len(types),
@@ -206,9 +243,18 @@ def _btf_kinds(image):
     return sorted(kind for _name, kind, _payload in records)
 
 
+PRODUCTION_BUILDS = (
+    # (source, profile, core, value_type, max_entries)
+    (ROUNDTRIP_SOURCE, BASE_PROFILE, False, "u64", 1),
+    (CORE_SOURCE, CORE_PROFILE, True, "bytes4096", 1),
+)
+
+
 def test_routes_emit_no_modifiers():
-    for source in (ROUNDTRIP_SOURCE, CORE_SOURCE):
-        kinds = _btf_kinds(build_object(source))
+    for source, profile, core, value_type, max_entries in (
+            PRODUCTION_BUILDS):
+        kinds = _btf_kinds(build_object(
+            source, profile, core, value_type, max_entries))
         assert kinds, source
         for kind in sorted(MODIFIER_KINDS.values()):
             assert kind not in kinds, (source, kinds)
@@ -216,16 +262,21 @@ def test_routes_emit_no_modifiers():
 
 def test_bpftool_cross_check_has_no_modifiers():
     check_tools("bpftool")
-    for source in (ROUNDTRIP_SOURCE, CORE_SOURCE):
-        image = build_object(source)
+    for source, profile, core, value_type, max_entries in (
+            PRODUCTION_BUILDS):
+        image = build_object(
+            source, profile, core, value_type, max_entries)
         workdir = tempfile.mkdtemp(prefix="mojo-mod-xcheck-")
-        path = os.path.join(workdir, "probe.bpf.o")
-        with open(path, "wb") as handle:
-            handle.write(image)
-        proc = run_step(["bpftool", "btf", "dump", "file", path])
-        assert proc.returncode == 0, proc.stderr
-        for word in ("TYPEDEF", "VOLATILE", "CONST", "RESTRICT"):
-            assert word not in proc.stdout, (source, proc.stdout)
+        try:
+            path = os.path.join(workdir, "probe.bpf.o")
+            with open(path, "wb") as handle:
+                handle.write(image)
+            proc = run_step(["bpftool", "btf", "dump", "file", path])
+            assert proc.returncode == 0, proc.stderr
+            for word in ("TYPEDEF", "VOLATILE", "CONST", "RESTRICT"):
+                assert word not in proc.stdout, (source, proc.stdout)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def main():
