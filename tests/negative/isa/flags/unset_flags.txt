@@ -21,6 +21,8 @@ TEST_REG_INVARIANTS bit 7 | test_prog_flags_uapi_bits | unset by construction; v
 verify.py staged load | test_verify_staged_load_carries_no_flags | exactly `$LOAD_RUN prog load "$OBJ" "$PIN"`, no flags
 Q-harness load argv | test_harness_load_argv_carries_no_flags | 5-element [bpftool, prog, load, object, pin], no flags
 CLI + harness options | test_cli_and_harness_expose_no_prog_flag_option | no sleepable/align/prog-flag/test-* option
-product tree setters | test_no_prog_flags_setter_in_tree | no set_flags/prog_flags/bpf_prog_load/owned-macro (word match, .py/.txt/.mojo/.cpp/.h/.c) outside this index + the suite
+product tree setters | test_no_prog_flags_setter_in_tree | no set_flags/bpf_program__set_flags/prog_flags/bpf_prog_load/owned-macro (word match, .py/.txt/.mojo/.cpp/.h/.c) outside this index + the suite
+libbpf API matcher | test_setter_matcher_catches_libbpf_api_call | retained mutant: the full bpf_program__set_flags call matches exactly one needle
+external joint wrapper | recorded audit (packet A2) | libbpf-mojo @ cc4b03d, bare bpf_object__load, zero setter matches in native/ + src/
 all shell load sites | test_shell_load_sites_carry_no_flags | 111 prog-load lines carry no flag tokens
 emitted sections | test_emitted_sections_trigger_no_libbpf_auto_flags | xdp/tracepoint/uprobe/socket/classifier only; no .s/frags/syscall/struct_ops trigger

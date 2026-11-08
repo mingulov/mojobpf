@@ -61,9 +61,13 @@ NEIGHBOR_FLAGS = {
     "BPF_F_XDP_DEV_BOUND_ONLY": 6,
 }
 
-# Identifiers that would set or forward prog_flags.
+# Identifiers that would set or forward prog_flags. The full
+# libbpf API name is pinned separately: \bset_flags\b cannot
+# match inside bpf_program__set_flags (no word boundary
+# between _ and s), which a scratch mutant proved.
 SETTER_NAMES = (
     "set_flags",
+    "bpf_program__set_flags",
     "prog_flags",
     "bpf_prog_load",
     "BPF_PROG_LOAD",
@@ -181,18 +185,38 @@ def _walk_files():
                     yield rel, handle.read()
 
 
-def test_no_prog_flags_setter_in_tree():
-    patterns = [
+def _setter_patterns():
+    return [
         re.compile(r"\b%s\b" % re.escape(needle))
         for needle in list(PROG_FLAGS) + list(SETTER_NAMES)
     ]
+
+
+def test_no_prog_flags_setter_in_tree():
+    # Repo-local roots only. The external joint wrapper
+    # (read-only libbpf-mojo checkout, outside this tree)
+    # is covered by the recorded audit in the leaf packet
+    # (Amendment A2): no setter at the pinned commit.
+    needles = list(PROG_FLAGS) + list(SETTER_NAMES)
     hits = []
     for rel, text in _walk_files():
-        for needle, pattern in zip(
-                list(PROG_FLAGS) + list(SETTER_NAMES), patterns):
+        for needle, pattern in zip(needles, _setter_patterns()):
             if pattern.search(text):
                 hits.append((rel, needle))
     assert hits == [], hits
+
+
+def test_setter_matcher_catches_libbpf_api_call():
+    # Retained mutation: the full API call must match even
+    # though \bset_flags\b alone cannot match inside it.
+    call = "bpf_program__set_flags(prog, 1u << 4);"
+    needles = list(PROG_FLAGS) + list(SETTER_NAMES)
+    matched = [
+        needle for needle, pattern in zip(needles,
+                                          _setter_patterns())
+        if pattern.search(call)
+    ]
+    assert matched == ["bpf_program__set_flags"], matched
 
 
 # Tokens that would smuggle prog_flags through a shell load.
