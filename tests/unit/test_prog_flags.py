@@ -4,14 +4,21 @@
 Six UAPI bits (STRICT_ALIGNMENT, ANY_ALIGNMENT,
 TEST_RND_HI32, TEST_STATE_FREQ, SLEEPABLE,
 TEST_REG_INVARIANTS) ride ``prog_flags`` on BPF_PROG_LOAD.
-No product load path sets any of them: every load goes
-through ``bpftool prog load``, whose syntax exposes no
-flags option, and our staged commands, CLI, and harness
-pass none. This suite pins the UAPI bits against the
-installed header and proves the unset surface over the
-product tree. Kernel-side semantics of set flags are out
-of scope (we never set them). See the leaf packet for
-the per-flag disposition.
+Claim (emitted profile): on every object our toolchain
+emits, no product load path sets any of the six bits —
+every load goes through ``bpftool prog load`` (no flags
+option exists) or the joint native ``bpf_object__load``
+wrapper (which sets none), our staged commands, CLI, and
+harness pass none, and our emitted sections trigger none
+of libbpf's automatic prog_flags insertions. This suite
+pins the UAPI bits against the installed header and
+proves the unset surface over the product tree.
+Kernel-side semantics of set flags, and flags on
+arbitrary third-party objects handed to the generic
+``verify --object`` loader, are out of scope (libbpf
+auto-sets SLEEPABLE only for ``.s``-suffixed sections,
+which our emitter never produces). See the leaf packet
+for the per-flag disposition.
 """
 import ast
 import os
@@ -25,6 +32,7 @@ sys.path.insert(
     ),
 )
 
+from mojobpf import build as build_module  # noqa: E402
 from mojobpf import cli as cli_module  # noqa: E402
 from mojobpf import verify as verify_module  # noqa: E402
 
@@ -148,28 +156,105 @@ def test_cli_and_harness_expose_no_prog_flag_option():
     assert hits == [], hits
 
 
-def test_no_prog_flags_setter_in_tree():
-    roots = ["src", "compiler", "tests", "ci"]
-    allowed = {
-        os.path.join("tests", "unit", "test_prog_flags.py"),
-        os.path.join("tests", "negative", "isa", "flags",
-                     "unset_flags.txt"),
-    }
-    names = list(PROG_FLAGS) + list(SETTER_NAMES)
-    hits = []
-    for root in roots:
+WALK_ROOTS = ["src", "compiler", "tests", "ci"]
+WALK_EXTENSIONS = (".py", ".txt", ".mojo", ".cpp", ".h", ".c")
+WALK_ALLOWED = {
+    os.path.join("tests", "unit", "test_prog_flags.py"),
+    os.path.join("tests", "negative", "isa", "flags",
+                 "unset_flags.txt"),
+}
+
+
+def _walk_files():
+    for root in WALK_ROOTS:
         for current, _dirs, files in os.walk(
                 os.path.join(REPO_ROOT, root)):
             for name in sorted(files):
-                if not name.endswith(".py") and not name.endswith(
-                        ".txt"):
+                if not name.endswith(WALK_EXTENSIONS):
                     continue
-                rel = os.path.relpath(
-                    os.path.join(current, name), REPO_ROOT)
-                with open(os.path.join(current, name),
-                          encoding="utf-8", errors="replace") as handle:
-                    text = handle.read()
-                for needle in names:
-                    if needle in text and rel not in allowed:
-                        hits.append((rel, needle))
+                path = os.path.join(current, name)
+                rel = os.path.relpath(path, REPO_ROOT)
+                if rel in WALK_ALLOWED:
+                    continue
+                with open(path, encoding="utf-8",
+                          errors="replace") as handle:
+                    yield rel, handle.read()
+
+
+def test_no_prog_flags_setter_in_tree():
+    patterns = [
+        re.compile(r"\b%s\b" % re.escape(needle))
+        for needle in list(PROG_FLAGS) + list(SETTER_NAMES)
+    ]
+    hits = []
+    for rel, text in _walk_files():
+        for needle, pattern in zip(
+                list(PROG_FLAGS) + list(SETTER_NAMES), patterns):
+            if pattern.search(text):
+                hits.append((rel, needle))
     assert hits == [], hits
+
+
+# Tokens that would smuggle prog_flags through a shell load.
+LOAD_FLAG_TOKENS = (
+    "flag",
+    "sleepable",
+    "SLEEPABLE",
+    "align",
+    "ALIGN",
+    "rnd-hi32",
+    "RND_HI32",
+    "state-freq",
+    "STATE_FREQ",
+    "reg-invariants",
+    "REG_INVARIANTS",
+)
+
+
+def test_shell_load_sites_carry_no_flags():
+    sites, hits = 0, []
+    for rel, text in _walk_files():
+        for number, line in enumerate(text.splitlines(), 1):
+            if "prog load" not in line and not (
+                    '"prog"' in line and '"load"' in line):
+                continue
+            sites += 1
+            lowered = line.lower()
+            for token in LOAD_FLAG_TOKENS:
+                if token.lower() in lowered:
+                    hits.append((rel, number, token, line.strip()))
+    assert sites == 111, (
+        "load-site inventory drifted (%d); audit the new "
+        "sites for flag tokens, then re-pin" % sites)
+    assert hits == [], hits
+
+
+# Sections our pipeline emits (entry -> (prog type, section)).
+EMITTED_SECTIONS = {
+    "xdp_entry": ("xdp", "xdp"),
+    "trace_entry": ("tracepoint",
+                    "tracepoint/syscalls/sys_enter_getpid"),
+    "uprobe_entry": ("uprobe", "uprobe"),
+    "socket_entry": ("socket", "socket"),
+    "tc_entry": ("tc", "classifier"),
+}
+
+
+def _triggers_libbpf_auto_flags(section):
+    # libbpf_prepare_prog_load (libbpf 1.6/1.7 src/libbpf.c)
+    # sets BPF_F_SLEEPABLE only for SEC_SLEEPABLE section
+    # defs (`.s`-suffixed sections, `syscall`, `struct_ops`)
+    # and BPF_F_XDP_HAS_FRAGS only for `xdp.frags*`.
+    base = section.split("/")[0]
+    return (
+        base.endswith(".s")
+        or section.startswith("xdp.frags")
+        or section in ("syscall", "struct_ops")
+    )
+
+
+def test_emitted_sections_trigger_no_libbpf_auto_flags():
+    assert build_module.ENTRY_PROGRAM_SECTIONS == EMITTED_SECTIONS
+    for entry, (_prog_type, section) in sorted(
+            EMITTED_SECTIONS.items()):
+        assert not _triggers_libbpf_auto_flags(section), entry
