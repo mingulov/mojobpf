@@ -207,6 +207,48 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "flag:BPF_F_ANY_ALIGNMENT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/unit/test_prog_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BPF_F_SLEEPABLE": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/unit/test_prog_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BPF_F_STRICT_ALIGNMENT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/unit/test_prog_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BPF_F_TEST_REG_INVARIANTS": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/unit/test_prog_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BPF_F_TEST_RND_HI32": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/unit/test_prog_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "flag:BPF_F_TEST_STATE_FREQ": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/unit/test_prog_flags.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "helper:get_current_pid_tgid": {
       "evidence_level": "tested",
       "evidence_refs": [
