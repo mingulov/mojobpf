@@ -68,7 +68,7 @@ def tool(name):
     return executable
 
 
-def _section_words(path, section):
+def _sections(path):
     data = path.read_bytes()
     assert data[:4] == b"\x7fELF" and len(data) >= 64
     (e_shoff,) = struct.unpack_from("<Q", data, 40)
@@ -77,13 +77,39 @@ def _section_words(path, section):
     rows = [struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + index * 64)
             for index in range(e_shnum)]
     base = rows[e_shstrndx][4]
+    sections = []
     for row in rows:
         end = data.index(b"\x00", base + row[0])
-        if data[base + row[0]:end] == section.encode():
-            text = data[row[4]:row[4] + row[5]]
+        sections.append((data[base + row[0]:end].decode(),
+                         row[2], row[4], row[5]))
+    return data, sections
+
+
+def _section_words(path, section):
+    data, sections = _sections(path)
+    for name, _, offset, size in sections:
+        if name == section:
+            text = data[offset:offset + size]
             assert len(text) % 8 == 0
             return [word for (word,) in struct.iter_unpack("<Q", text)]
     raise AssertionError("%s section missing" % section)
+
+
+SHF_EXECINSTR = 0x4
+
+
+def _exec_section_words(path):
+    """(name, words) for every executable section carrying bytes."""
+    data, sections = _sections(path)
+    found = []
+    for name, flags, offset, size in sections:
+        if flags & SHF_EXECINSTR and size:
+            text = data[offset:offset + size]
+            assert len(text) % 8 == 0, name
+            found.append(
+                (name, [word for (word,) in struct.iter_unpack(
+                    "<Q", text)]))
+    return found
 
 
 def test_legacy_uapi_modes():
@@ -140,12 +166,17 @@ def test_legacy_absent_all_corpora(tmp_path):
         result = llc(["-march=bpfel", "-mcpu=v3", "-filetype=obj",
                       str(corpus), "-o", str(out)])
         assert result.returncode == 0, (corpus, result.stderr)
-        words = _section_words(out, ".text")
-        found = _legacy_words(words)
+        exec_sections = _exec_section_words(out)
+        scanned = sum(len(words) for _, words in exec_sections)
+        assert scanned >= 1, (
+            "corpus %s scanned zero executable words" % corpus.name)
+        found = [(section, slot, word)
+                 for section, words in exec_sections
+                 for slot, word in _legacy_words(words)]
         assert found == [], (
             "corpus %s must carry zero legacy-mode words, got %r"
-            % (corpus.name, [(slot, hex(word))
-                             for slot, word in found],)
+            % (corpus.name, [(section, slot, hex(word))
+                             for section, slot, word in found],)
         )
 
 
