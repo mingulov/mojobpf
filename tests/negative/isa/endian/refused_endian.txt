@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-endian-shape corpus index for F-ISA/misc/endian.
+#
+# The audit refuses the bswap intrinsic (the `nocallback`
+# attribute is outside the frozen producer model); no admitted
+# Mojo emits BPF_END. The vectors live in
+# compiler/tests/test_isa_endian.py (RED-first, pinning the
+# observed faces — entry AND subprogram refuse identically
+# with exit 4, MBPF319). This file indexes them so reviewers
+# can audit coverage without reading the test body. Every
+# vector below is refused at the parsed layer (check-target
+# exits 4 with the named code); nothing here reaches llc,
+# the verifier, or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+bswap i32 (entry) | test_endian_refused_entry | exit 4, MBPF319 frozen producer model (nocallback)
+bswap i32 (subprogram callee) | test_endian_refused_subprog | exit 4, MBPF319 frozen producer model (nocallback)
+plain ALU, same constant (entry) | test_endian_admitted_companion | exit 0 (admission companion)

@@ -103,6 +103,7 @@ SUITES = (
     ("kernel-isa-jmp", "tests/kernel/test_jmp_qual.py", 1500),
     ("kernel-isa-jcc", "tests/kernel/test_jcc_qual.py", 1500),
     ("kernel-isa-atomic", "tests/kernel/test_atomic_qual.py", 1500),
+    ("kernel-isa-endian", "tests/kernel/test_endian_qual.py", 1500),
     ("kernel-map", "tests/kernel/test_map_roundtrip.py", 1500),
     ("kernel-packet", "tests/kernel/test_packet_sdk.py", 1500),
     ("kernel-parse", "tests/kernel/test_parse_checksum_sdk.py", 1500),
@@ -222,6 +223,15 @@ SUITE_CASES = {
         "test_atomic_guest_objects_admit_atomics  "
         "test_atomic_mutation_aborts  "
         "test_atomic_stale_object_fails test_fixture_bytes  "
+        "test_guest_provenance"
+    ).split(),
+    "kernel-isa-endian": (
+        "test_endian_c_zero_returns_pass  "
+        "test_endian_c_mixed_returns_drop  "
+        "test_endian_oracles_execute  "
+        "test_endian_guest_objects_admit_endian  "
+        "test_endian_mutation_aborts  "
+        "test_endian_stale_object_fails test_fixture_bytes  "
         "test_guest_provenance"
     ).split(),
     "kernel-map": (
@@ -678,6 +688,11 @@ SUITE_DENIALS = {
         ),
         "test_atomic_stale_object_fails": (
             "test_atomic_mutation_aborts", "RUNTIME"
+        ),
+    },
+    "kernel-isa-endian": {
+        "test_endian_stale_object_fails": (
+            "test_endian_mutation_aborts", "RUNTIME"
         ),
     },
     "kernel-map": {
