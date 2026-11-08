@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Modifier/qualifier-shape index for F-BTF/modifiers/qualifiers.
+#
+# Our toolchain neither emits BTF kinds 8/9/10/11 nor decodes
+# them: the inspector rejects each with MBPF402 (exact
+# "unexpected BTF kind N" messages). The kind pins, the
+# per-kind rejections, and the emitter absence live in
+# tests/elf/test_modifier_btf.py. This file indexes the
+# vectors so reviewers can audit coverage without reading
+# the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BTF_KIND_TYPEDEF 8 | test_modifier_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_VOLATILE 9 | test_modifier_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_CONST 10 | test_modifier_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_RESTRICT 11 | test_modifier_uapi_kinds | pinned vs installed btf.h
+TYPEDEF record | test_typedef_rejected | MBPF402 unexpected BTF kind 8
+VOLATILE record | test_volatile_rejected | MBPF402 unexpected BTF kind 9
+CONST record | test_const_rejected | MBPF402 unexpected BTF kind 10
+RESTRICT record | test_restrict_rejected | MBPF402 unexpected BTF kind 11
+map + core genuine builds | test_routes_emit_no_modifiers | no kind 8/9/10/11 in either .BTF
+bpftool cross-check | test_bpftool_cross_check_has_no_modifiers | no TYPEDEF/VOLATILE/CONST/RESTRICT lines

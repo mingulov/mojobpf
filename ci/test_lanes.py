@@ -100,6 +100,7 @@ OWNERS = {
         'tests/elf/test_map_btf.py',
         'tests/elf/test_map_contract.py',
         'tests/elf/test_minimal_object.py',
+        'tests/elf/test_modifier_btf.py',
         'tests/elf/test_mutations.py',
         'tests/elf/test_net_struct.py',
         'tests/elf/test_packet_struct.py',
