@@ -1578,7 +1578,7 @@ def check_vector_spelling(line, lineno, raw):
 # Opcodes admitted on non-call body lines: exactly the union
 # observed across the 61 validating genuine emissions covering
 # all 9 modes plus the one validating .ll fixture (onelane
-# one-lane-vector element ops; WP-2 Task 2 corpus scans).
+# one-lane-vector element ops; corpus scans of the validating emissions).
 # `call` is deliberately absent: call lines carry their own
 # shape gate, and a leaked one must fail closed here rather
 # than pass as "call".

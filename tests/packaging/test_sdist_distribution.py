@@ -125,7 +125,7 @@ def test_packaging_source_ignores_ancestor_git(tmp_path):
     assert packaging_source.snapshot_source(ancestor) == before
 
 
-# NOTE (WP-1 staged scope): preservation/canary tests (adapter +
+# NOTE (staged scope): preservation/canary tests (adapter +
 # native-install coupled) return with the deferred installed-v2
 # feature package.
 
@@ -183,7 +183,7 @@ def test_all_archive_markdown_links_resolve(distribution):
 
 
 def assert_native_fixture_inventory(source):
-    # NOTE (WP-1): tests/packaging/test_native_adapter_install.py
+    # NOTE (staged scope): tests/packaging/test_native_adapter_install.py
     # rejoins with the deferred installed-v2 feature package.
     required = ["tests/harness/packaging_source.py",
                 "tests/packaging/test_adapter_generation.py",

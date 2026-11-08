@@ -665,7 +665,7 @@ done:
 
 @pytest.mark.parametrize("load_offset,guard_offset", [(12, 15), (3, 5)])
 def test_packet_non14_offset_inside_proved_range_admits(tmp_path, load_offset, guard_offset):
-    # WP-1 split-merge: the proved range (not the literal 14) admits
+    # Split-merge: the proved range (not the literal 14) admits
     # the byte access; guards below 15 count once they dominate.
     result, report = check(tmp_path, module(_packet_body(load_offset, guard_offset)))
     success(result, report)
@@ -745,7 +745,7 @@ def test_packet_inbounds_gep_scaling_underflow_refuses(tmp_path):
 
 
 def test_packet_load_past_proved_range_reports_range_not_edge(tmp_path):
-    # WP-1 split-merge: a dominating edge with an exceeded range is
+    # Split-merge: a dominating edge with an exceeded range is
     # MBPF317 (range), while no dominating edge stays MBPF314.
     # (A plain GEP asserts nothing, so the load reports; an
     # inbounds GEP past the guard reports at the address -- see

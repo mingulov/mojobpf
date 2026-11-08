@@ -36,7 +36,7 @@ include tests/codegen_cost/cases.json tests/codegen_cost/collect.py
 include tests/packaging/sdist-members.json
 include tests/packaging/test_wheel_contents.py tests/packaging/test_sdist_distribution.py
 include tests/packaging/test_adapter_generation.py
-# NOTE (WP-1): tests/packaging/test_native_adapter_install.py joins
+# NOTE (staged scope): tests/packaging/test_native_adapter_install.py joins
 # this list with its deferred feature package (installed-v2).
 # Archive self-containment: docs/compiler-target-model.md links this
 # cited acceptance file, so the archive must carry it for its own

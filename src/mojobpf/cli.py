@@ -336,8 +336,8 @@ def _command_check(args) -> int:
                     "%s\n" % _format_diagnostic(diagnostic)
                 )
         return _build_exit_code(compile_result)
-    # Lockfile-less discovery never compiles, so it never passes: F-031
-    # permits nonzero-or-MBPF105, and the WP-3 plan requires check to
+    # Lockfile-less discovery never compiles, so it never passes: the
+    # check contract permits nonzero-or-MBPF105, and requires check to
     # fail (not pass) when no compilation proof exists. Discovery lines
     # above still print; only the verdict says unqualified.
     sys.stderr.write(

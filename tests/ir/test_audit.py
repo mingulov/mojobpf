@@ -4044,7 +4044,7 @@ def _assert_numeric_def_order(ir_text):
 
 
 def test_keyfresh_tracepoint_reorder_rejected():
-    # Imported reordered tracepoint fixture (F-017): the committed
+    # Imported reordered tracepoint fixture: the committed
     # counter with key_slot1() hoisted above the filter lookup
     # (audit probe freshness_probe.mojo, freshness.raw.ll:7-10).
     # The hoisted preparation keeps its shape but takes a named
@@ -4545,7 +4545,7 @@ def test_keyfresh_direct_slot_store_validates():
 
 def test_keyfresh_freeze_alias_lookup_rejected():
     # A freeze of the key slot still addresses the key cell. The
-    # opcode allowlist (WP-2) rejects freeze before dataflow, so
+    # opcode allowlist rejects freeze before dataflow, so
     # these probes now pin MBPF321; the alias proof still covers
     # freeze defensively if the allowlist ever widens.
     slot = (KEYSLOT % "%2") + "\n"
@@ -4598,7 +4598,7 @@ def test_keyfresh_freeze_alias_delete_rejected():
 def test_keyfresh_insertvalue_alias_lookup_rejected():
     # An insertvalue/extractvalue round trip launders the key-slot
     # pointer through an aggregate the extraction recovers. The
-    # opcode allowlist (WP-2) rejects both aggregate opcodes
+    # opcode allowlist rejects both aggregate opcodes
     # before dataflow, so these probes now pin MBPF321; the alias
     # proof still covers them defensively if the allowlist ever
     # widens. (The admitted one-lane-vector insert/extractELEMENT
