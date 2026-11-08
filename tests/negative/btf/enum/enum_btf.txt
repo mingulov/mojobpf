@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Enum/union-shape index for F-BTF/enum/union.
+#
+# UNION (kind 5) decodes in our reader but is never
+# emitted; ENUM (6) and ENUM64 (19) are neither emitted
+# nor decoded (MBPF402 with exact "unexpected BTF kind
+# N" messages). The kind pins, the UNION decode rule,
+# the ENUM rejections, and the emitter absence live in
+# tests/elf/test_enum_btf.py. This file indexes the
+# vectors so reviewers can audit coverage without
+# reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BTF_KIND_UNION 5 | test_enum_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_ENUM 6 | test_enum_uapi_kinds | pinned vs installed btf.h
+BTF_KIND_ENUM64 19 | test_enum_uapi_kinds | pinned vs installed btf.h
+synthetic UNION record | test_union_decode | exact member list (u,5,[(a,1,0),(b,1,0)])
+ENUM record | test_enum_rejected | MBPF402 unexpected BTF kind 6
+ENUM64 record | test_enum64_rejected | MBPF402 unexpected BTF kind 19
+map + core production builds | test_routes_emit_no_enum_union | no kind 5/6/19 in either .BTF
+bpftool cross-check | test_bpftool_cross_check_has_no_enum_union | no UNION/ENUM/ENUM64 lines
