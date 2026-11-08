@@ -183,18 +183,19 @@ def test_func_decode():
 
 
 def test_func_proto_truncation_rejected():
-    # Consistent header lengths with the FUNC_PROTO param cut
-    # short, so the failure lands at the param guard (not the
-    # generic size check): type section shrinks by 4 bytes.
+    # The type section ends INSIDE the FUNC_PROTO param (4 of
+    # 8 bytes present; trailing FUNC dropped): header lengths
+    # stay consistent, so the failure lands at the param
+    # guard (pos + 8*vlen > end), not the size check or the
+    # record-header guard.
     blob = bytearray(func_blob())
     header_len = 24
-    type_len = struct.unpack_from("<I", blob, 12)[0]
-    str_len = struct.unpack_from("<I", blob, 20)[0]
-    param_end = header_len + 12 + 4 + 12 + 8
-    del blob[param_end - 4:param_end]
-    struct.pack_into("<I", blob, 12, type_len - 4)
-    struct.pack_into("<I", blob, 16, type_len - 4)
-    assert len(blob) == header_len + (type_len - 4) + str_len
+    keep = header_len + 12 + 4 + 12 + 4
+    strings = bytes(blob[header_len + 48:])
+    del blob[keep:header_len + 48]
+    struct.pack_into("<I", blob, 12, 32)
+    struct.pack_into("<I", blob, 16, 32)
+    assert bytes(blob[header_len + 32:]) == strings
     try:
         _parse_btf_types(bytes(blob), "synthetic")
     except ElfError as exc:
