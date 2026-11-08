@@ -912,6 +912,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_PSEUDO_CALL": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_static_call.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_PSEUDO_MAP_FD": {
       "evidence_level": "tested",
       "evidence_refs": [
