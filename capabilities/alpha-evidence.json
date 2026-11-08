@@ -547,6 +547,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_CALL": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_calls_abi.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_CMPXCHG": {
       "evidence_level": "tested",
       "evidence_refs": [
