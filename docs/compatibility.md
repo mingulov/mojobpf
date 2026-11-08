@@ -9,23 +9,20 @@ proof.
 
 ## Supported profiles
 
-Eight target profiles exist: `linux-bpfel-v3` (little-endian BPF,
-CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
-tracepoint counter and event programs, `core_supported =
-false`, `subprog_supported = false`), `linux-bpfel-v3-core`
-(everything the base profile admits, plus the 4096-byte opaque
-core map value and validated CO-RE relocation records,
-`core_supported = true`), `linux-bpfel-v3-hash` (everything the
-base profile admits, plus hash maps with `u32` keys and `u64`
-values in 1-4 entries, `core_supported = false`),
+Eight target profiles are supported: `linux-bpfel-v3`
+(little-endian BPF, CPU v3, XDP programs plus the
+`syscalls:sys_enter_getpid` tracepoint counter and event
+programs, `core_supported = false`, `subprog_supported =
+false`), `linux-bpfel-v3-core` (everything the base profile
+admits, plus the 4096-byte opaque core map value and
+validated CO-RE relocation records, `core_supported =
+true`), `linux-bpfel-v3-hash` (everything the base profile
+admits, plus hash maps with `u32` keys and `u64` values in
+1-4 entries, `core_supported = false`),
 `linux-bpfel-v3-lru` (everything the base profile admits, plus
 LRU hash maps with `u32` keys and `u64` values in 1-4 entries,
 reusing the lookup/update/delete helpers, `core_supported =
-false`), `linux-bpfel-v3-percpu-hash` (everything the base
-profile admits, plus per-CPU hash maps with `u32` keys and
-`u64` values in 1-4 entries, reusing the lookup/update/delete
-helpers, `core_supported = false`),
-`linux-bpfel-v3-net` (everything the base profile
+false`), `linux-bpfel-v3-net` (everything the base profile
 admits, plus the socket-filter and TC classifier pairs and the
 two skb helpers 9 and 26, `core_supported = false`),
 `linux-bpfel-v3-reserve` (everything the base profile admits,
@@ -43,8 +40,6 @@ a manifest requesting hash maps under the base profile fails
 (`tests/unit/test_manifest.py::test_hash_map_type_refused`),
 a manifest requesting LRU maps under the base profile fails
 (`tests/unit/test_manifest.py::test_lru_map_type_refused`),
-a manifest requesting per-CPU-hash maps under the base profile fails
-(`tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`),
 socket/TC pairs under the base profile fail
 (`tests/unit/test_manifest.py::test_net_pairs_refused_under_base_profile`),
 a reservation object inspected under the base profile reports
@@ -59,16 +54,25 @@ a uprobe object inspected under the base profile reports its
 a net object inspected under the base profile reports its
 socket/TC sections as outside the profile
 (`tests/elf/test_net_struct.py::test_net_profile_gating`),
-and all eight records pin the exact map types, sizes, value
-vocabulary, and helper IDs
-(`tests/unit/test_manifest.py::test_profile_registry_holds_supported_profiles`,
-`tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`,
+and the per-profile records pin the exact map types, sizes,
+value vocabulary, and helper IDs
+(`tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`,
 `tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`,
 `tests/unit/test_manifest.py::test_lru_profile_extends_base_with_lru_vocabulary`,
 `tests/unit/test_manifest.py::test_net_profile_extends_base_with_net_pairs`,
 `tests/unit/test_manifest.py::test_reserve_profile_extends_base_with_reserve_helpers`,
 `tests/unit/test_manifest.py::test_subprog_profile_extends_base_with_subprog_flag`,
 `tests/unit/test_manifest.py::test_uprobe_profile_extends_base_with_uprobe_pair`).
+
+Per-CPU-hash maps are not supported in this release. The
+`linux-bpfel-v3-percpu-hash` registry entry and its
+implementation are retained in-tree but unclaimed: the kind
+lacks the parsed-route lowering proof its support requires,
+so no profile claims it (planned for a later release). The
+base profile still refuses the kind
+(`tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`),
+and `tests/kernel/test_percpu_hash_maps.py` guards the
+retained implementation without claiming the kind.
 
 | Role | Proven identity |
 |---|---|
@@ -78,28 +82,36 @@ vocabulary, and helper IDs
 | Frontend target | canonical `--target-cpu znver4` plus the frozen feature set (`FRONTEND_TARGET_FLAGS` in `src/mojobpf/build.py`); qualifying captures reproduced byte-identical under the pinned environment, other hosts unproven |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
 | Loader/observer | `bpftool` 7.6.0 with libbpf 1.6, unmodified |
-| Guest runner | virtme-ng 1.41, QEMU 10.2.2, software emulation (TCG) |
-| Guest kernels | 6.12.0-061200-generic and 6.6.0-060600-generic (Ubuntu mainline builds, pinned by hash in `ci/kernels.lock.json`), plus 7.0.14-070014-generic for the joint suite only |
+| Guest runner | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration on x86-64; one named TCG fallback lane (`v6.12-tcg`) for the no-KVM spot-proof only |
+| Guest kernels | none claimed (pending, see below). Candidate lanes in `ci/kernels.lock.json`: 6.12.0-061200-generic, 6.6.0-060600-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc1-generic (Ubuntu mainline builds, pinned by hash) |
 
 Full binary hashes live in `toolchains.lock.json` (host tools)
-and `ci/kernels.lock.json` (guest runner plus both kernel
-lanes). The 0.3.0a1 release matrix ran every release-scope
-guest-backed suite wired at the cut (the 28 suites) in both lanes on the
-same committed bits
+and `ci/kernels.lock.json` (guest runner plus the pinned
+lanes). The historical 0.3.0a1 alpha matrix ran every
+release-scope guest-backed suite wired at the cut (the 28
+suites) in both lanes on the same committed bits
 (`ci/run_vm_tests.py`, `tests/kernel/test_cleanup.py` for the
 lane-identity assertions); the portability suite runs as its
 own lane (next section), never in the matrix. The runner now
-registers 40 suites: the 28 release-matrix suites plus the 12
-`kernel-isa-*` qualification suites added after the cut, each
-proven in its own leaf's lane runs rather than in a release
-matrix rerun (`ci/run_vm_tests.py` `SUITES`).
+registers 41 suites: the 28 release-matrix suites plus the 12
+`kernel-isa-*` qualification suites plus `kernel-percpu-hash`
+(`ci/run_vm_tests.py` `SUITES`,
+`tests/unit/test_portability_locks.py::test_x86_matrix_shape_unchanged`).
+
+No kernel is claimed by the current tree. A kernel is claimed
+only when the full 41-suite matrix passes on its lane; those
+runs are pending, so every candidate kernel above is
+unclaimed until its matrix verdict lands. The historical
+alpha runs do not qualify the current tree.
 
 Every behavior section below outside the named portability
-lanes was observed on the current tested combination (LLVM
-22.1.8, bpftool 7.6.0 with libbpf 1.6, QEMU 10.2.2) in both
-lanes of the alpha matrix; see
-[evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the anchor
-board.
+lanes records the 0.3.0a1 alpha qualification on the tested
+combination at the time (LLVM 22.1.8, bpftool 7.6.0 with
+libbpf 1.6, QEMU 10.2.2, software emulation) in both alpha
+lanes; see [evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the
+anchor board. Those observations stand as the alpha record;
+the current tree re-proves them in the pending release
+matrix, and no kernel is claimed until that matrix passes.
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
@@ -445,47 +457,23 @@ else under LRU stays out (see the unsupported list): other
 key/value widths, other entry counts, `BPF_NOEXIST` /
 `BPF_EXIST` spellings, and from-program iteration.
 
-## Measured per-CPU-hash behavior
+## Per-CPU-hash maps (not claimed)
 
-Per-CPU hash maps are claimed narrowly in this release: `u32`
-keys and `u64` values in 1-4 entries, admitted only under
-the `linux-bpfel-v3-percpu-hash` profile, with the existing
-lookup, update (`BPF_ANY` only), and delete helpers. On both
-x86-64 lanes the one-entry lifecycle shapes initialize key 0
-to 41 on both CPUs and observe exactly 42 on the running CPU
-with the other CPU still at 41 after one taskset-pinned run,
-with exact quiesced per-slot counts after repeated runs;
-absent keys miss without inserting anything; a userspace
-insert followed by a run increments exactly the running CPU's
-slot of the inserted key; the delete probe observes success
-and every entry is gone; a get-next-key walk plus a JSON dump
-observe exactly the inserted set with exact per-slot bytes
-(hash order is unspecified, so iteration order is never
-claimed); oversize keys/values and entry counts are refused;
-a fifth insert into a 4-entry map fails `E2BIG` (the LRU
-contrast, where it would evict); runs pinned to different
-CPUs move only their own slot, proving per-CPU isolation;
-and a pinned stock-libbpf C object driven identically
-observes byte-identical map contents
-(`tests/kernel/test_percpu_hash_maps.py::test_lifecycle_init_run_observe`,
-`tests/kernel/test_percpu_hash_maps.py::test_exact_counts_after_quiescence`,
-`tests/kernel/test_percpu_hash_maps.py::test_miss_path_inserts_nothing`,
-`tests/kernel/test_percpu_hash_maps.py::test_scoped_update_after_insert`,
-`tests/kernel/test_percpu_hash_maps.py::test_kernel_delete_removes_entries`,
-`tests/kernel/test_percpu_hash_maps.py::test_userspace_delete_lifecycle`,
-`tests/kernel/test_percpu_hash_maps.py::test_iteration_set_and_bytes`,
-`tests/kernel/test_percpu_hash_maps.py::test_sizes_refused`,
-`tests/kernel/test_percpu_hash_maps.py::test_full_map_refuses_fifth_insert`,
-`tests/kernel/test_percpu_hash_maps.py::test_isolation_moves_only_running_cpu`,
-`tests/kernel/test_percpu_hash_maps.py::test_control_matches_mojo_bytes`).
-Out-of-bounds and unchecked per-CPU-hash programs are rejected
-by the kernel verifier at load
-(`tests/kernel/test_percpu_hash_maps.py::test_oob_rejected_by_verifier`,
-`tests/kernel/test_percpu_hash_maps.py::test_unchecked_rejected_by_verifier`).
-Everything else under per-CPU hash stays out (see the
-unsupported list): other key/value widths, other entry
-counts, `BPF_NOEXIST` / `BPF_EXIST` spellings, and
-from-program iteration.
+Per-CPU-hash maps are not supported in this release. The
+`linux-bpfel-v3-percpu-hash` registry entry and its
+implementation are retained in-tree but unclaimed (see
+[Supported profiles](#supported-profiles)): the kind lacks
+the parsed-route lowering proof its support requires, so no
+profile claims it. `tests/kernel/test_percpu_hash_maps.py`
+guards the retained implementation without claiming the
+kind — lifecycle, exact counts, miss path, delete,
+iteration, the full-map `E2BIG` refusal, CPU isolation, size
+refusals, and verifier negatives are exercised there as
+implementation guards, not as support claims. Everything
+under per-CPU hash stays out (see the unsupported list): the
+kind itself, other key/value widths, other entry counts,
+`BPF_NOEXIST` / `BPF_EXIST` spellings, and from-program
+iteration.
 
 ## Measured arithmetic behavior
 
@@ -507,8 +495,9 @@ host suites, selected-but-refused vectors).
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
   `PERCPU_ARRAY` / `RINGBUF` (plus `HASH` under the hash
   capability profile only, plus `LRU_HASH` under the LRU
-  capability profile only, plus `PERCPU_HASH` under the
-  per-CPU-hash capability profile only), ring sizes outside
+  capability profile only; `PERCPU_HASH` is refused under
+  every claimed profile and its capability entry is retained
+  but unclaimed), ring sizes outside
   4096/131072, key/value vocabulary on ring buffers, and key
   widths outside the declared dense coverage fail manifest
   validation with `MBPF205`
@@ -613,16 +602,21 @@ host suites, selected-but-refused vectors).
 * tcx programs, XDP attach (objects load and run under
   test-run only), and attach beyond the proven socket legs:
   outside the surface.
-* Kernel 7.x beyond the joint-only lane: no full matrix ran
-  there, so no 7.x claim extends past the joint cells (see
-  the pair matrix).
+* Per-CPU-hash maps: implemented in-tree but unclaimed (see
+  above); the kind is refused under every claimed profile.
+* Every candidate kernel: no kernel is claimed until the full
+  41-suite matrix passes on its lane, and those runs are
+  pending — including 6.6 and 6.12, whose historical alpha
+  verdicts do not qualify the current tree.
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header
   chains: unproven (see the
   [architecture non-claims](architecture.md#explicit-non-claims)).
-* KVM acceleration: the release runs pin software emulation
-  for every lane. `verify --kernel` accepts `--accelerator
-  kvm`, but no release proof ran under KVM.
+* KVM dependence: the x86-64 lanes boot with KVM hardware
+  acceleration, and the one named TCG fallback lane
+  (`v6.12-tcg`) exists solely for the no-KVM-dependence
+  spot-proof. The historical alpha matrix ran under software
+  emulation; the pending release matrix proves the KVM lanes.
 
 ## Audit boundaries
 

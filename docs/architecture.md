@@ -226,12 +226,15 @@ demonstrated in a Linux guest; each bullet names its proof.
   the kernel verifier with its own logged reason
   (`tests/elf/test_map_btf.py`, `tests/kernel/test_map_roundtrip.py`).
 - A generalized map SDK slice: `ARRAY`, `PERCPU_ARRAY`,
-  `HASH`, `LRU_HASH`, and `PERCPU_HASH` maps with u32 keys and
-  u64 values in
-  one- to four-entry sizes, named update flags (`BPF_ANY`
+  `HASH`, and `LRU_HASH` maps with u32 keys and u64 values in
+  one- to four-entry sizes (`PERCPU_HASH` is implemented
+  in-tree but unclaimed; see [compatibility](compatibility.md)),
+  named update flags (`BPF_ANY`
   lowers; `BPF_NOEXIST`/`BPF_EXIST` are refused with a named
   diagnostic), documented mutation semantics, layout/BTF
-  proofs per shape at all 40 shapes, and kernel proofs per
+  proofs per shape at the 32 claimed shapes (the 8
+  per-CPU-hash shapes are retained as implementation guards,
+  unclaimed), and kernel proofs per
   operation and kind at the measured counts for the array,
   per-CPU, and hash kinds: read-modify-write lifecycle (41 to
   42) and exact counts per entry, deletion refused with
@@ -254,13 +257,10 @@ demonstrated in a Linux guest; each bullet names its proof.
   lifecycle, exact counts, miss path, delete, iteration,
   eviction, size refusals, and verifier negatives; the LRU slice
   here covers the host pipeline: profile, kind tag, map/BTF
-  emission, and reconciliation). (Per-CPU-hash kernel behavior
-  is proven by `tests/kernel/test_percpu_hash_maps.py`: lifecycle,
-  exact counts, miss path, delete, iteration, the full-map
-  `E2BIG` refusal, CPU isolation, size refusals, and verifier
-  negatives; the per-CPU-hash slice here covers the host
-  pipeline: profile, kind tag, map/BTF emission, and
-  reconciliation).
+  emission, and reconciliation). (Per-CPU-hash maps are not
+  claimed: `tests/kernel/test_percpu_hash_maps.py` guards the
+  retained implementation without claiming the kind; see
+  [compatibility](compatibility.md).)
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
   `tests/compile/maps_*.mojo`, `tests/compile/percpu_*.mojo`,
   `tests/compile/hash_*.mojo`, `tests/compile/maps_hash_*.mojo`,
@@ -402,16 +402,14 @@ demonstrated in a Linux guest; each bullet names its proof.
 ## Toolchain pins
 
 The proofs above were validated on tested combinations; the table
-below names the current pins. Behavior proofs not yet
-re-qualified on the current combination are not claimed for it:
-only the tracepoint-counter and generalized-array guest proofs
-are re-qualified on LLVM 22.1.8
-(`tests/kernel/test_tracepoint_counter.py`,
-`tests/kernel/test_generalized_arrays.py`); every other
-guest-behavior proof above was validated on the previous tested
-combination (LLVM 21.1.8, bpftool 7.7.0 with libbpf 1.7, QEMU
-10.2.1) and awaits re-qualification. Other combinations are
-unproven, not supported. Full binary paths and hashes are
+below names the current pins. The 0.3.0a1 alpha record (see
+[compatibility](compatibility.md) and
+[evidence-0.3.0a1.md](evidence-0.3.0a1.md)) observed the
+measured behaviors on LLVM 22.1.8 with bpftool 7.6.0 /
+libbpf 1.6 under software emulation; the current tree re-proves
+them on the KVM lanes in the pending release matrix, and no
+kernel is claimed until that matrix passes. Other combinations
+are unproven, not supported. Full binary paths and hashes are
 recorded in `toolchains.lock.json`; rerun
 `tests/probes/toolchain_inventory.py` to re-probe any machine.
 
@@ -420,8 +418,8 @@ recorded in `toolchains.lock.json`; rerun
 | Mojo compiler | 1.1.0 (`8189361e`), pixi-pinned from the Modular channel |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel-unknown-none`, cpu `v3` |
 | Loader/observer | bpftool 7.6.0 with libbpf 1.6, unmodified |
-| Guest kernel | 6.12.0-061200-generic under virtme-ng 1.41, QEMU 10.2.2, software emulation |
-| Host drivers | Python 3.14, pixi-managed Mojo environment, standard library only |
+| Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; candidate kernels 6.12.0, 6.6.0, 7.0.14, 7.2, 7.4-rc1 (pending matrix proof) plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
+| Host drivers | Python 3.11+ (3.14.8 observed), pixi-managed Mojo environment, standard library only |
 | C reference | Clang 22.1.8 builds the independent C controls and fixtures in `tests/reference_c/` (XDP controls, ring-buffer controls, license witness pair, map references) |
 
 The adapter fails closed on frontend drift outside its validated
@@ -482,13 +480,15 @@ of them is implied by the results above:
   verdicts (see the compatibility documentation); every other
   Mojo/LLVM combination, every `llc` backend version but
   22.1.8, every host architecture but x86-64, and big-endian
-  BPF still need theirs. The two x86-64 guest kernels, 6.12.0
-  and 6.6.0, are the qualification lanes pinned in
-  `ci/kernels.lock.json` and driven by `ci/run_vm_tests.py`,
-  with the 6.6 loop-shape verifier boundary pinned per lane
-  (see the compatibility documentation). A full-matrix-green
-  verdict on the LLVM 22.1.8 toolchain is not claimed here;
-  each proof above names the suite that demonstrates it.
+  BPF still need theirs. The candidate x86-64 lanes (6.12.0,
+  6.6.0, 7.0.14, 7.2, 7.4-rc1, all KVM, plus the named
+  `v6.12-tcg` fallback) are pinned in `ci/kernels.lock.json`
+  and driven by `ci/run_vm_tests.py`, with the 6.6 loop-shape
+  verifier boundary pinned per lane (see the compatibility
+  documentation); no lane is claimed until the full 41-suite
+  matrix passes on it. A full-matrix-green verdict is not
+  claimed here; each proof above names the suite that
+  demonstrates it.
 - CO-RE beyond the proven slice, and multi-program objects:
   unproven. BTF covers map metadata only, with no function
   records and no `.BTF.ext`, except on the CO-RE probe object
@@ -509,10 +509,11 @@ of them is implied by the results above:
   `tests/kernel/test_uprobe_register.py`).
 - Map kinds and shapes beyond the proven matrix:
   map-in-map and `PROG_ARRAY` declarations are refused by the
-  build driver, as are hash, LRU, and per-CPU-hash shapes
-  outside the qualified form (`u32` keys with `u64` values
-  under the hash, LRU, and per-CPU-hash profiles), entry
-  counts outside 1 to 4, ring sizes
+  build driver, as are hash and LRU shapes outside the
+  qualified form (`u32` keys with `u64` values under the hash
+  and LRU profiles); per-CPU-hash shapes are refused under
+  every claimed profile (the kind is implemented but
+  unclaimed), as are entry counts outside 1 to 4, ring sizes
   outside the two qualified sizes, and key literals outside the
   declared dense coverage.
   Programs mixing map operations (pairs

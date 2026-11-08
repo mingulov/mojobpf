@@ -3,12 +3,16 @@
 # MojoBPF quickstart
 
 Build a Mojo XDP counter into a standard BPF object and load it
-in a disposable guest. Every command below was run verbatim from
-a fresh directory; every output is transcribed from that run
-with only machine-specific absolute paths shortened (the
-working directory to `<qs>`, user tool installations to their
-bare tool names). Absolute paths on your machine will differ;
-versions, exit codes, and result lines must match.
+in a disposable guest. Every command below runs verbatim from
+a fresh directory; every output is transcribed from the
+reference run with only machine-specific absolute paths
+shortened (the working directory to `<qs>`, user tool
+installations to their bare tool names). Absolute paths on
+your machine will differ; versions, exit codes, and result
+lines must match. The transcribed hashes are from the
+reference run (the installed end-to-end re-proof on the
+current tree is pending the release matrix); the tool and SDK
+versions and the profile list below match the current tree.
 
 ## Prerequisites
 
@@ -63,18 +67,21 @@ mojobpf doctor
 ```text
 mojobpf doctor
 informational discovery only: pins are qualified by check/build with --lockfile, never here
-mojobpf 0.3.0a1 (sdk 1.7) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
+mojobpf 0.3.0a1 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
 platform: linux/x86_64
 tool mojo: present Mojo 1.1.0 (8189361e) at <mojo-on-PATH>
 tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>
 tool bpftool: present bpftool v7.6.0 at <bpftool-on-PATH>
 tool python: present Python 3.14.8 at <qs>/.venv/bin/python3
-target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-lru, linux-bpfel-v3-net, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
+target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-lru, linux-bpfel-v3-net, linux-bpfel-v3-percpu-hash, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
 kernel tests: runner available at <vng-on-PATH>
 ```
 
 `doctor` changes nothing. Every tool must read `present`; a
-missing tool is reported, never silently worked around.
+missing tool is reported, never silently worked around. The
+candidate list names every registered profile; only eight are
+supported — `linux-bpfel-v3-percpu-hash` is retained in-tree
+but unclaimed (see [compatibility](compatibility.md)).
 
 ## 4. Write the counter project
 
@@ -243,7 +250,10 @@ guest commands: load/unload only; no attach, no test-run
 
 The object loaded under unmodified `bpftool`/libbpf inside a
 disposable guest and unloaded cleanly: nothing was attached to
-any interface, and nothing ran on the host. Exit code 0.
+any interface, and nothing ran on the host. Exit code 0. The
+reference transcript uses the named `v6.12-tcg` fallback lane;
+the pinned x86-64 lanes boot with KVM hardware acceleration
+(see [compatibility](compatibility.md)).
 
 ## What can go wrong
 
