@@ -14,6 +14,7 @@ BTF_KIND_FUNC 12 | test_func_uapi_kinds | pinned vs installed btf.h
 BTF_KIND_FUNC_PROTO 13 | test_func_uapi_kinds | pinned vs installed btf.h
 synthetic INT+PROTO+FUNC blob | test_func_decode | exact names/kinds/payloads (int,1,4), (,13,1), (myfunc,12,2)
 truncated FUNC_PROTO params | test_func_proto_truncation_rejected | ElfError MBPF402
-genuine-pipeline object | test_pipeline_emits_no_func_btf | map BTF present, no kind 12/13
+genuine-pipeline map object | test_map_route_emits_no_func_btf | map BTF present, no kind 12/13
+genuine-pipeline core object | test_core_route_emits_exact_func_pair | exactly one linked FUNC_PROTO + FUNC xdp_entry
 bpftool cross-check | test_bpftool_cross_check_has_no_func | bpftool dump has no FUNC lines
 adapter debuginfo shape | test_adapter_debuginfo_lists_no_subprograms | exactly one DISubprogram, CU without subprograms, both adapter copies
