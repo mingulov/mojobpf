@@ -654,6 +654,15 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_END": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_endian.py",
+      "matrix:v6.12-tcg/kernel-isa-endian",
+      "matrix:v6.6-tcg/kernel-isa-endian"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_FETCH": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -861,6 +870,15 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_MISC": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_endian.py",
+      "matrix:v6.12-tcg/kernel-isa-endian",
+      "matrix:v6.6-tcg/kernel-isa-endian"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_PSEUDO_BTF_ID": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -939,6 +957,24 @@
       "host:compiler/tests/test_isa_mem.py",
       "matrix:v6.12-tcg/kernel-isa-mem",
       "matrix:v6.6-tcg/kernel-isa-mem"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_TO_BE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_endian.py",
+      "matrix:v6.12-tcg/kernel-isa-endian",
+      "matrix:v6.6-tcg/kernel-isa-endian"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_TO_LE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_endian.py",
+      "matrix:v6.12-tcg/kernel-isa-endian",
+      "matrix:v6.6-tcg/kernel-isa-endian"
     ],
     "implementation_state": "IMPLEMENTED"
   },
