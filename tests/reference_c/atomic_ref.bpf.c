@@ -21,9 +21,12 @@
  * oldB=200, oldC=0xF0, oldD=0) -> XDP_PASS (2); the mixed
  * packet (bytes 14..17 = 1,2,4,8) scores A=102 B=3 C=0xFF
  * D=0x5A (oldD=8) -> XDP_DROP (1); anything else ->
- * XDP_ABORTED (0). The suite's mutant rebuilds with
- * -DXCHG_VAL=0x5B (D reads 0x5B, matching neither arm ->
- * XDP_ABORTED).
+ * XDP_ABORTED (0). The suite's mutant byte-patches one word
+ * of the built object: the verdict-gate JNE imm 0x5A -> 0x5B,
+ * so D (still 0x5A) misses the gate -> XDP_ABORTED while the
+ * atomics execute with identical operands. A -DXCHG_VAL
+ * rebuild would move want and gate together and stay
+ * behavior-preserving, so it cannot serve as the mutant.
  *
  * Build with the system Clang BPF backend, CPU pinned (unprivileged):
  *

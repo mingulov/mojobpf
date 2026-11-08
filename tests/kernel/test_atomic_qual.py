@@ -9,15 +9,16 @@ packet-derived operands) plus three hand-built oracles: hand-IR
 returning the computed value 42 as its action), and two
 hand-asm refusal objects (STORE_REL / LOAD_ACQ words, which
 both lanes' verifiers reject with exact "invalid atomic
-opcode" messages). A C mutant (XCHG_VAL 0x5A -> 0x5B,
-expecting XDP_ABORTED) and a stale-object leg (base object
+opcode" messages). A single-word ops mutant (verdict-gate
+imm 0x5A -> 0x5B, expecting XDP_ABORTED) and a stale-object
+leg (base object
 against the DROP expectation, failing at RUNTIME) complete
 the behavior proof, with an independent packet oracle and
 guest-side hash re-verification of every staged byte. The
 executed objects' bytes are decoded host-side over the xdp
 section to prove the STX|ATOMIC words (exact words per
 object), the no-acq/rel rule on executed objects, the
-two-word mutant, CFG acyclicity, and trailing exits.
+single-word mutant, CFG acyclicity, and trailing exits.
 """
 import hashlib
 import json
@@ -96,12 +97,16 @@ ACQONLY_ATOMIC = (
     (4, 0x100000010DB),
 )
 
-# The two XCHG_VAL materializations: (slot, base word, mutant
-# word). Slot 29 is the MOV32-K, slot 50 the JNE32-K gate.
-MUT_WORDS = (
-    (29, 0x5A000001B4, 0x5B000001B4),
-    (50, 0x5A00070556, 0x5B00070556),
-)
+# The verdict-gate materialization the mutant patches: (slot,
+# base word, mutant word). A -D rebuild would move BOTH the
+# stored want (slot 29) and the gate (slot 50) together and
+# stay behavior-preserving; the mutant patches only the gate
+# so the atomics execute with identical operands while the
+# verdict flips to ABORTED.
+MUT_WORD = (50, 0x5A00070556, 0x5B00070556)
+# The untouched want materialization (identical in base and
+# mutant, proving the patch is exactly one word).
+WANT_WORD = (29, 0x5A000001B4)
 
 # Pinned verifier rejection messages (observed pre-seal on
 # both lanes; the refusal legs assert these substrings in
@@ -136,8 +141,8 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def _staged_section_words(stage, name, section):
-    with open(os.path.join(stage, name), "rb") as handle:
+def _section_file_range(object_path, section):
+    with open(object_path, "rb") as handle:
         data = handle.read()
     assert data[:4] == b"\x7fELF" and len(data) >= 64
     (e_shoff,) = struct.unpack_from("<Q", data, 40)
@@ -148,10 +153,19 @@ def _staged_section_words(stage, name, section):
     for row in rows:
         end = data.index(b"\x00", base + row[0])
         if data[base + row[0]:end] == section.encode():
-            text = data[row[4]:row[4] + row[5]]
-            assert len(text) % 8 == 0
-            return [word for (word,) in struct.iter_unpack("<Q", text)]
-    raise AssertionError("%s section missing in %s" % (section, name))
+            return row[4], row[5]
+    raise AssertionError(
+        "%s section missing in %s" % (section, object_path))
+
+
+def _staged_section_words(stage, name, section):
+    start, size = _section_file_range(
+        os.path.join(stage, name), section)
+    with open(os.path.join(stage, name), "rb") as handle:
+        data = handle.read()
+    text = data[start:start + size]
+    assert len(text) % 8 == 0
+    return [word for (word,) in struct.iter_unpack("<Q", text)]
 
 
 def _atomic_entries(words):
@@ -201,6 +215,35 @@ def build_asm(source, workdir, name):
             "asm build failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
+    return object_path
+
+
+def build_mutant(base_path, workdir):
+    """Single-word ops mutant: copy the base object, patch the gate.
+
+    The base object is copied byte-for-byte, then exactly the
+    MUT_WORD verdict-gate immediate flips 0x5A -> 0x5B. The
+    expected base word is asserted before patching so codegen
+    drift fails loud instead of patching the wrong slot. No
+    consumes_source wrapper: the only source is C_SOURCE,
+    already consumed by the base build, and the staged bytes
+    are tracked by stage_consumed_for_guest.
+    """
+    slot, base_word, mut_word = MUT_WORD
+    start, size = _section_file_range(base_path, "xdp")
+    assert size % 8 == 0
+    with open(base_path, "rb") as handle:
+        data = bytearray(handle.read())
+    offset = start + slot * 8
+    (seen,) = struct.unpack_from("<Q", data, offset)
+    assert seen == base_word, (
+        "mutant base word drifted at slot %d: got %#x, want %#x"
+        % (slot, seen, base_word)
+    )
+    struct.pack_into("<Q", data, offset, mut_word)
+    object_path = os.path.join(workdir, "mutated.bpf.o")
+    with open(object_path, "wb") as handle:
+        handle.write(data)
     return object_path
 
 
@@ -274,8 +317,7 @@ def guest_run():
     with guest_proc.open_consumed(PACKET_MIXED, "rb") as handle:
         packet_mixed = handle.read()
     cref_obj = build_c(C_SOURCE, stage, "cref")
-    mutated_obj = build_c(C_SOURCE, stage, "mutated",
-                          extra=("-DXCHG_VAL=0x5B",))
+    mutated_obj = build_mutant(cref_obj, stage)
     oll_obj = build_oracle(OLL_SOURCE, stage)
     oasm_obj = build_asm(OASM_SOURCE, stage, "oasm")
     refused_obj = build_asm(REFUSED_SOURCE, stage, "refused")
@@ -513,7 +555,7 @@ def test_atomic_mutation_aborts():
         contract_version=record.get("contract_version"),
         note=record.get("note"), expect=0)
     assert record["actual_action"] == XDP_ABORTED, (
-        "XCHG_VAL mutant must miss the gate, got %r"
+        "gate mutant must miss the gate, got %r"
         % (record.get("actual_action"),)
     )
     assert record["actual_action"] != run["results"]["c-zero"][
@@ -580,14 +622,18 @@ def test_atomic_guest_objects_admit_atomics():
     diff = [index for index, (ours, theirs)
             in enumerate(zip(cref_xdp, mut_xdp))
             if ours != theirs]
-    assert len(diff) == 2, (
-        "mutant must differ in exactly the two XCHG_VAL "
-        "materializations, got %r" % (diff,)
+    assert diff == [MUT_WORD[0]], (
+        "mutant must differ in exactly the gate word, got %r"
+        % (diff,)
     )
-    for slot, base_word, mut_word in MUT_WORDS:
-        assert diff.count(slot) == 1, (slot, diff)
-        assert cref_xdp[slot] == base_word, (slot, hex(cref_xdp[slot]))
-        assert mut_xdp[slot] == mut_word, (slot, hex(mut_xdp[slot]))
+    slot, base_word, mut_word = MUT_WORD
+    assert cref_xdp[slot] == base_word, (slot, hex(cref_xdp[slot]))
+    assert mut_xdp[slot] == mut_word, (slot, hex(mut_xdp[slot]))
+    want_slot, want_word = WANT_WORD
+    assert cref_xdp[want_slot] == want_word, (
+        want_slot, hex(cref_xdp[want_slot]))
+    assert mut_xdp[want_slot] == want_word, (
+        want_slot, hex(mut_xdp[want_slot]))
 
 
 def test_guest_provenance():
@@ -609,6 +655,14 @@ def test_guest_provenance():
             stage=record.get("stage"),
             contract_version=record.get("contract_version"),
             note=record.get("note"), expect=want_exit)
+        if want_exit == 4:
+            # Load-refused legs never pin: the harness leaves
+            # cleanup_ok unset (array/hash-maps precedent); the
+            # global pin-absence checks above prove no residue.
+            assert record.get("cleanup_ok") is None, (
+                "%s: harness must leave cleanup_ok unset" % tag
+            )
+            continue
         assert record.get("cleanup_ok") is True, (
             "%s: harness must report cleanup_ok" % tag
         )
