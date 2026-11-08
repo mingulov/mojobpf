@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Array, per-CPU array, hash, and LRU hash map definitions.
+# Array, per-CPU array, hash, LRU hash, and per-CPU hash map definitions.
 #
 # The supported maps hold u32 keys and u64 values, declared in the
 # standard loader-compatible form with map BTF: arrays, per-CPU
-# arrays, hash maps, and LRU hash maps with the manifest-declared
-# entry counts (1, 2, 3, or 4).
+# arrays, hash maps, LRU hash maps, and per-CPU hash maps with the
+# manifest-declared entry counts (1, 2, 3, or 4).
 # The map address is loaded from the map metadata section by
 # `MapHandle.load` (arrays), `PercpuHandle.load` (per-CPU
 # arrays, which additionally tags the program as per-CPU so the
 # pipeline emits the per-CPU map description),
 # `HashHandle.load` (hash maps, which tags the program as hash
-# so the pipeline emits the hash map description), or
+# so the pipeline emits the hash map description),
 # `LruHandle.load` (LRU hash maps, which tags the program as LRU
-# so the pipeline emits the LRU map description). Key and value
+# so the pipeline emits the LRU map description), or
+# `PercpuHashHandle.load` (per-CPU hash maps, which tags the
+# program as per-CPU hash so the pipeline emits the per-CPU-hash
+# map description). Key and value
 # scratch slots live in fixed stack slots prepared by `key_slot`,
 # `key_slot1`, `key_slot2`, `key_slot3`, and `value_slot`. All
 # four key preparations share one stack cell: each stores its own
@@ -77,6 +80,14 @@
 #   map: where a hash update fails, an LRU update evicts the
 #   least-recently-used entry and inserts the new key.
 #
+# Mutation semantics (per-CPU hash maps):
+#
+# * Lookup, update, and delete follow the hash discipline above:
+#   absent keys miss, `BPF_ANY` creates-or-replaces, delete
+#   removes and reports success. Values are per-CPU: each CPU
+#   reads and writes its own slot, and userspace reads every
+#   CPU's slot.
+#
 # Vocabulary outside this module (other map types, key/value widths,
 # other entry counts, helpers) is refused by the build driver and
 # the IR audit with named diagnostics; nothing silently falls back.
@@ -87,6 +98,7 @@ comptime MAP_TYPE_ARRAY = 2
 comptime MAP_TYPE_HASH = 1
 comptime MAP_TYPE_LRU_HASH = 9
 comptime MAP_TYPE_PERCPU_ARRAY = 6
+comptime MAP_TYPE_PERCPU_HASH = 5
 comptime MAP_KEY_SIZE = 4
 comptime MAP_VALUE_SIZE = 8
 comptime MAP_MAX_ENTRIES = 1
@@ -223,6 +235,45 @@ struct LruHandle(ImplicitlyCopyable):
             Int64,
             constraints="=r,0,~{memory}",
             has_side_effect=True,
+        ](addr)
+        return Self(tagged)
+
+
+@fieldwise_init
+struct PercpuHashHandle(ImplicitlyCopyable):
+    """Address of the single per-CPU hash map, loaded from its metadata section.
+
+    The map-address load is the same audited shape as
+    `MapHandle.load`; the additional kind tag marks the program as
+    per-CPU hash so the pipeline emits the per-CPU-hash map
+    description. The tag ties the loaded address to its result
+    through an empty template with a memory clobber but no side
+    effect, so the backend emits nothing for it while the audit
+    tells it apart from the per-CPU tag (no clobber), the hash
+    tag (side effect, no clobber), and the LRU tag (side
+    effect); its value is always the map address, and it is the
+    value helper calls take as their map operand. Every
+    per-CPU-hash handle load tags exactly once; mixing tagged
+    and untagged loads, or per-CPU-hash tags with per-CPU,
+    hash, or LRU tags, in one program is refused.
+    """
+
+    var addr: Int64
+
+    @staticmethod
+    @inline(.always)
+    def load() -> Self:
+        var addr = inlined_assembly[
+            "r0 = mojobpf_map0 ll",
+            Int64,
+            constraints="={r0}",
+            has_side_effect=True,
+        ]()
+        var tagged = inlined_assembly[
+            "",
+            Int64,
+            constraints="=r,0,~{memory}",
+            has_side_effect=False,
         ](addr)
         return Self(tagged)
 

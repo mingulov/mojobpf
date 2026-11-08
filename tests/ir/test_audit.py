@@ -84,6 +84,7 @@ KEYADDR = (
 KINDTAG = '  %s = call i64 asm "", "=r,0"(i64 %s)'
 HASHTAG = '  %s = call i64 asm sideeffect "", "=r,0"(i64 %s)'
 LRUTAG = '  %s = call i64 asm sideeffect "", "=r,0,~{memory}"(i64 %s)'
+PCPUTAG = '  %s = call i64 asm "", "=r,0,~{memory}"(i64 %s)'
 SKBLOAD = (
     "  %s = call i64 @__mojobpf_skb_load_bytes_v1"
     "(ptr %s, i32 %s, ptr %s, i32 %s)"
@@ -251,6 +252,7 @@ def test_combined_count_vector_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 2,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -280,6 +282,7 @@ def test_combined_count_vector_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 1,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -309,6 +312,7 @@ def test_combined_count_vector_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 3,
         "rbmapaddr": 1,
         "rbsize": 1,
@@ -338,6 +342,7 @@ def test_combined_count_vector_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 3,
         "rbmapaddr": 1,
         "rbsize": 1,
@@ -367,6 +372,7 @@ def test_combined_count_vector_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 3,
         "rbmapaddr": 1,
         "rbsize": 1,
@@ -1719,6 +1725,134 @@ def test_mixed_kind_and_lru_tags_rejected():
     assert_rejected(tagged, "MBPF307")
 
 
+def test_pcpuhashtag_pair_validates_percpuhash():
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (PCPUTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (PCPUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    program = audit.scan(tagged)
+    assert program.mode == "map"
+    assert program.family == "map"
+    assert program.entries == 1
+    assert program.percpu is False
+    assert program.hashkind is False
+    assert program.lrukind is False
+    assert program.pcpuhashkind is True
+
+
+def test_mixed_pcpuhashtags_rejected():
+    # One per-CPU-hash tag for two map-address loads matches neither
+    # array (zero tags) nor per-CPU-hash (one tag per load).
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (PCPUTAG % ("%30", "%3")),
+        1,
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_mixed_kind_and_percpuhash_tags_rejected():
+    # One per-CPU tag and one per-CPU-hash tag: one program defines
+    # one map of one kind, so the two tag kinds never mix.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (KINDTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (PCPUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_mixed_hash_and_percpuhash_tags_rejected():
+    # One hash tag and one per-CPU-hash tag: one program defines
+    # one map of one kind, so the two tag kinds never mix.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (HASHTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (PCPUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_mixed_lru_and_percpuhash_tags_rejected():
+    # One LRU tag and one per-CPU-hash tag: one program defines
+    # one map of one kind, so the two tag kinds never mix.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (LRUTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (PCPUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_pcpuhashtag_bad_operand_rejected():
+    # A per-CPU-hash tag tied to anything but a map-address load
+    # carries no map provenance.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (PCPUTAG % ("%30", "%2")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (PCPUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_percpuhash_bare_mapaddr_operand_rejected():
+    # The tag counts fit per-CPU-hash but one call takes the bare
+    # map-address load: per-CPU-hash calls take tags only.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (PCPUTAG % ("%30", "%3")),
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (PCPUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
 def test_mixed_hash_and_lru_tags_rejected():
     # One hash tag and one LRU tag: one program defines one
     # map of one kind, so the two tag kinds never mix.
@@ -2431,6 +2565,7 @@ def test_skb_count_vectors_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 0,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -2460,6 +2595,7 @@ def test_skb_count_vectors_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 0,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -2604,6 +2740,7 @@ def test_skb_loadmap_vector_exact():
         "kindtag": 0,
         "hashtag": 0,
         "lrutag": 0,
+        "pcpuhashtag": 0,
         "valslot": 1,
         "rbmapaddr": 0,
         "rbsize": 0,

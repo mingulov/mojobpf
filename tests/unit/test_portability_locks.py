@@ -382,7 +382,10 @@ def test_x86_matrix_shape_unchanged():
         "v7.0.14-tcg",
     ]
     runner = _load_runner_module()
-    assert len(runner.SUITES) == 28
+    # 28 release-cut suites + 12 R2 kernel-isa-* qual suites + R3
+    # kernel-percpu-hash; R3 leaves bump this count with their SUITES
+    # registration (same commit).
+    assert len(runner.SUITES) == 41
     paths = [relpath for (_suite_id, relpath, _timeout) in runner.SUITES]
     assert "tests/kernel/test_arch_portability.py" not in paths
 

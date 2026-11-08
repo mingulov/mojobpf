@@ -450,6 +450,20 @@ LRUTAG_CALL_RE = re.compile(
     r"\s*\"=r,0,~\{memory\}\""
     r"\(i64\s+%(\S+)\)$"
 )
+# Per-CPU-hash kind tag: the loaded map address tied to its result
+# through an empty template with a memory clobber but no sideeffect
+# marker, so the backend emits nothing for it while the audit tells
+# it apart from the per-CPU tag (no clobber), the hash tag
+# (sideeffect, no clobber) and the LRU tag (sideeffect plus
+# clobber). The operand must be a map-address SSA value and the
+# tag result is what per-CPU-hash helper calls take as their map
+# operand (the operand provenance check enforces both); the tag's
+# own value is always that address.
+PCPUTAG_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+\"\","
+    r"\s*\"=r,0,~\{memory\}\""
+    r"\(i64\s+%(\S+)\)$"
+)
 VALSLOT_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
     r"\"r0 = r10\\0Ar0 \+= -16\",\s*\"=\{r0\}\"\(\)$"
@@ -613,6 +627,7 @@ ASM_SHAPES = (
     ("kindtag", KINDTAG_CALL_RE),
     ("hashtag", HASHTAG_CALL_RE),
     ("lrutag", LRUTAG_CALL_RE),
+    ("pcpuhashtag", PCPUTAG_CALL_RE),
     ("valslot", VALSLOT_CALL_RE),
     ("rbmapaddr", RBMAPADDR_CALL_RE),
     ("rbsize", RBSIZE_CALL_RE),
@@ -748,6 +763,7 @@ CLASSIFIER_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -777,6 +793,7 @@ MAP_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -806,6 +823,7 @@ COMBINED_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 2,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -835,6 +853,7 @@ TRACEPOINT_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -864,6 +883,7 @@ EVENT_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 3,
     "rbmapaddr": 1,
     "rbsize": 1,
@@ -904,6 +924,7 @@ RESERVE_SUBMIT_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 3,
     "rbmapaddr": 1,
     "rbsize": 1,
@@ -938,6 +959,7 @@ RESERVE_DISCARD_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 3,
     "rbmapaddr": 1,
     "rbsize": 1,
@@ -973,6 +995,7 @@ CORE_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -1010,6 +1033,7 @@ UPROBE_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -1043,6 +1067,7 @@ SKB_LOAD_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -1072,6 +1097,7 @@ SKB_STORE_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -1105,6 +1131,7 @@ SKB_LOADMAP_COUNTS = {
     "kindtag": 0,
     "hashtag": 0,
     "lrutag": 0,
+    "pcpuhashtag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -1420,6 +1447,10 @@ class Program(object):
         # together with percpu or hashkind: one program defines
         # one map of one kind).
         self.lrukind = False
+        # Whether per-CPU-hash tags mark this program
+        # per-CPU-hash (never set together with percpu, hashkind
+        # or lrukind: one program defines one map of one kind).
+        self.pcpuhashkind = False
         # Ring-buffer size in bytes from the size tag (event
         # and reserve families only; None until the tag line is
         # scanned).
@@ -3452,10 +3483,13 @@ def _match_pairs(program):
         return False
     if program.counts["lrutag"] not in (0, 2 * pairs):
         return False
+    if program.counts["pcpuhashtag"] not in (0, 2 * pairs):
+        return False
     if sum((
         program.counts["kindtag"] > 0,
         program.counts["hashtag"] > 0,
         program.counts["lrutag"] > 0,
+        program.counts["pcpuhashtag"] > 0,
     )) > 1:
         return False
     if not _dense_keys(program, pairs, 2):
@@ -3467,6 +3501,7 @@ def _match_pairs(program):
     program.percpu = program.counts["kindtag"] > 0
     program.hashkind = program.counts["hashtag"] > 0
     program.lrukind = program.counts["lrutag"] > 0
+    program.pcpuhashkind = program.counts["pcpuhashtag"] > 0
     return True
 
 
@@ -3508,10 +3543,13 @@ def _match_deletes(program):
         return False
     if program.counts["lrutag"] not in (0, deletes):
         return False
+    if program.counts["pcpuhashtag"] not in (0, deletes):
+        return False
     if sum((
         program.counts["kindtag"] > 0,
         program.counts["hashtag"] > 0,
         program.counts["lrutag"] > 0,
+        program.counts["pcpuhashtag"] > 0,
     )) > 1:
         return False
     if not _dense_keys(program, deletes, 1):
@@ -3523,6 +3561,7 @@ def _match_deletes(program):
     program.percpu = program.counts["kindtag"] > 0
     program.hashkind = program.counts["hashtag"] > 0
     program.lrukind = program.counts["lrutag"] > 0
+    program.pcpuhashkind = program.counts["pcpuhashtag"] > 0
     return True
 
 
@@ -3693,6 +3732,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == CLASSIFIER_COUNTS:
         _check_decls(program, 0, 0, False)
@@ -3727,6 +3767,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == UPROBE_COUNTS:
         _check_decls(program, 1, 1, False)
@@ -3736,6 +3777,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == EVENT_COUNTS:
         _check_decls(
@@ -3748,6 +3790,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == RESERVE_SUBMIT_COUNTS:
         _check_decls(
@@ -3760,6 +3803,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == RESERVE_DISCARD_COUNTS:
         _check_decls(
@@ -3772,6 +3816,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == CORE_COUNTS:
         _check_decls(
@@ -3784,6 +3829,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == SKB_LOAD_COUNTS:
         _check_decls(program, 0, 0, False, want_skbload=1)
@@ -3794,6 +3840,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == SKB_STORE_COUNTS:
         _check_decls(program, 0, 0, False, want_skbstore=1)
@@ -3804,6 +3851,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if program.counts == SKB_LOADMAP_COUNTS:
         _check_decls(
@@ -3816,6 +3864,7 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         program.lrukind = False
+        program.pcpuhashkind = False
         return
     if _match_pairs(program):
         return
@@ -3886,6 +3935,7 @@ def _check_counts(program):
         + program.counts["kindtag"]
         + program.counts["hashtag"]
         + program.counts["lrutag"]
+        + program.counts["pcpuhashtag"]
         + program.counts["valslot"]
         + program.counts["rbmapaddr"]
         + program.counts["rbsize"]
@@ -4204,6 +4254,8 @@ def _check_helper_operands(program):
             expect = (("map", 2, ("mapaddr",)),)
         elif shape == "lrutag":
             expect = (("map", 2, ("mapaddr",)),)
+        elif shape == "pcpuhashtag":
+            expect = (("map", 2, ("mapaddr",)),)
         elif shape == "rbsize":
             expect = (("map", 2, ("rbmapaddr",)),)
         elif shape == "output":
@@ -4264,6 +4316,15 @@ def _check_helper_operands(program):
         ):
             expect = tuple(
                 (role, group, ("lrutag",))
+                if role == "map"
+                else (role, group, origins)
+                for role, group, origins in expect
+            )
+        if program.pcpuhashkind and shape in (
+            "lookup", "update", "delete"
+        ):
+            expect = tuple(
+                (role, group, ("pcpuhashtag",))
                 if role == "map"
                 else (role, group, origins)
                 for role, group, origins in expect
@@ -4344,6 +4405,26 @@ def _check_helper_operands(program):
                             remedy=(
                                 "load the map address through the "
                                 "LRU handle"
+                            ),
+                        )
+                    if origins == ("pcpuhashtag",):
+                        raise AuditError(
+                            CODE_MAP_SHAPE,
+                            "%s %s operand %%%s must be the "
+                            "per-CPU-hash kind tag of a "
+                            "map-address load, not defined at "
+                            "%s: call at %s"
+                            % (
+                                shape,
+                                role,
+                                name,
+                                _at(program.defs.get(name, 0)),
+                                _at(lineno),
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "load the map address through the "
+                                "per-CPU-hash handle"
                             ),
                         )
                     if origins == ("rbsize",):

@@ -63,7 +63,11 @@ SDK_SCHEMA_VERSION = 1
 # `bpf_skb_store_bytes`, and the two helper-ID constants) to the
 # helpers module. No 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, or 1.6 name or
 # signature changed.
-SDK_SURFACE_MINOR = 7
+# Minor 8 adds the per-CPU hash map handle (`PercpuHashHandle`)
+# and its kind constant (`MAP_TYPE_PERCPU_HASH`) to the maps
+# module. No 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, or 1.7 name or
+# signature changed.
+SDK_SURFACE_MINOR = 8
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -159,9 +163,11 @@ SDK_EXPORTS = {
         "MAP_TYPE_HASH",
         "MAP_TYPE_LRU_HASH",
         "MAP_TYPE_PERCPU_ARRAY",
+        "MAP_TYPE_PERCPU_HASH",
         "MAP_VALUE_SIZE",
         "MapHandle",
         "PercpuHandle",
+        "PercpuHashHandle",
         "key_slot",
         "key_slot1",
         "key_slot2",
@@ -414,6 +420,7 @@ SDK_SIGNATURES = {
         "MAP_TYPE_HASH": "MAP_TYPE_HASH = 1",
         "MAP_TYPE_LRU_HASH": "MAP_TYPE_LRU_HASH = 9",
         "MAP_TYPE_PERCPU_ARRAY": "MAP_TYPE_PERCPU_ARRAY = 6",
+        "MAP_TYPE_PERCPU_HASH": "MAP_TYPE_PERCPU_HASH = 5",
         "MAP_VALUE_SIZE": "MAP_VALUE_SIZE = 8",
         "HashHandle": (
             "@fieldwise_init struct HashHandle(ImplicitlyCopyable):"
@@ -437,6 +444,12 @@ SDK_SIGNATURES = {
             "@fieldwise_init struct PercpuHandle(ImplicitlyCopyable):"
         ),
         "PercpuHandle.load": (
+            "@staticmethod @inline(.always) def load() -> Self:"
+        ),
+        "PercpuHashHandle": (
+            "@fieldwise_init struct PercpuHashHandle(ImplicitlyCopyable):"
+        ),
+        "PercpuHashHandle.load": (
             "@staticmethod @inline(.always) def load() -> Self:"
         ),
         "key_slot": (

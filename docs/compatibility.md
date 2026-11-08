@@ -21,7 +21,11 @@ values in 1-4 entries, `core_supported = false`),
 `linux-bpfel-v3-lru` (everything the base profile admits, plus
 LRU hash maps with `u32` keys and `u64` values in 1-4 entries,
 reusing the lookup/update/delete helpers, `core_supported =
-false`), `linux-bpfel-v3-net` (everything the base profile
+false`), `linux-bpfel-v3-percpu-hash` (everything the base
+profile admits, plus per-CPU hash maps with `u32` keys and
+`u64` values in 1-4 entries, reusing the lookup/update/delete
+helpers, `core_supported = false`),
+`linux-bpfel-v3-net` (everything the base profile
 admits, plus the socket-filter and TC classifier pairs and the
 two skb helpers 9 and 26, `core_supported = false`),
 `linux-bpfel-v3-reserve` (everything the base profile admits,
@@ -39,6 +43,8 @@ a manifest requesting hash maps under the base profile fails
 (`tests/unit/test_manifest.py::test_hash_map_type_refused`),
 a manifest requesting LRU maps under the base profile fails
 (`tests/unit/test_manifest.py::test_lru_map_type_refused`),
+a manifest requesting per-CPU-hash maps under the base profile fails
+(`tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`),
 socket/TC pairs under the base profile fail
 (`tests/unit/test_manifest.py::test_net_pairs_refused_under_base_profile`),
 a reservation object inspected under the base profile reports
@@ -439,6 +445,48 @@ else under LRU stays out (see the unsupported list): other
 key/value widths, other entry counts, `BPF_NOEXIST` /
 `BPF_EXIST` spellings, and from-program iteration.
 
+## Measured per-CPU-hash behavior
+
+Per-CPU hash maps are claimed narrowly in this release: `u32`
+keys and `u64` values in 1-4 entries, admitted only under
+the `linux-bpfel-v3-percpu-hash` profile, with the existing
+lookup, update (`BPF_ANY` only), and delete helpers. On both
+x86-64 lanes the one-entry lifecycle shapes initialize key 0
+to 41 on both CPUs and observe exactly 42 on the running CPU
+with the other CPU still at 41 after one taskset-pinned run,
+with exact quiesced per-slot counts after repeated runs;
+absent keys miss without inserting anything; a userspace
+insert followed by a run increments exactly the running CPU's
+slot of the inserted key; the delete probe observes success
+and every entry is gone; a get-next-key walk plus a JSON dump
+observe exactly the inserted set with exact per-slot bytes
+(hash order is unspecified, so iteration order is never
+claimed); oversize keys/values and entry counts are refused;
+a fifth insert into a 4-entry map fails `E2BIG` (the LRU
+contrast, where it would evict); runs pinned to different
+CPUs move only their own slot, proving per-CPU isolation;
+and a pinned stock-libbpf C object driven identically
+observes byte-identical map contents
+(`tests/kernel/test_percpu_hash_maps.py::test_lifecycle_init_run_observe`,
+`tests/kernel/test_percpu_hash_maps.py::test_exact_counts_after_quiescence`,
+`tests/kernel/test_percpu_hash_maps.py::test_miss_path_inserts_nothing`,
+`tests/kernel/test_percpu_hash_maps.py::test_scoped_update_after_insert`,
+`tests/kernel/test_percpu_hash_maps.py::test_kernel_delete_removes_entries`,
+`tests/kernel/test_percpu_hash_maps.py::test_userspace_delete_lifecycle`,
+`tests/kernel/test_percpu_hash_maps.py::test_iteration_set_and_bytes`,
+`tests/kernel/test_percpu_hash_maps.py::test_sizes_refused`,
+`tests/kernel/test_percpu_hash_maps.py::test_full_map_refuses_fifth_insert`,
+`tests/kernel/test_percpu_hash_maps.py::test_isolation_moves_only_running_cpu`,
+`tests/kernel/test_percpu_hash_maps.py::test_control_matches_mojo_bytes`).
+Out-of-bounds and unchecked per-CPU-hash programs are rejected
+by the kernel verifier at load
+(`tests/kernel/test_percpu_hash_maps.py::test_oob_rejected_by_verifier`,
+`tests/kernel/test_percpu_hash_maps.py::test_unchecked_rejected_by_verifier`).
+Everything else under per-CPU hash stays out (see the
+unsupported list): other key/value widths, other entry
+counts, `BPF_NOEXIST` / `BPF_EXIST` spellings, and
+from-program iteration.
+
 ## Measured arithmetic behavior
 
 Unsigned division and remainder by nonzero constants at
@@ -459,10 +507,11 @@ host suites, selected-but-refused vectors).
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
   `PERCPU_ARRAY` / `RINGBUF` (plus `HASH` under the hash
   capability profile only, plus `LRU_HASH` under the LRU
-  capability profile only), ring sizes outside 4096/131072,
-  key/value vocabulary on ring buffers, and key widths outside
-  the declared dense coverage fail manifest validation with
-  `MBPF205`
+  capability profile only, plus `PERCPU_HASH` under the
+  per-CPU-hash capability profile only), ring sizes outside
+  4096/131072, key/value vocabulary on ring buffers, and key
+  widths outside the declared dense coverage fail manifest
+  validation with `MBPF205`
   (`tests/unit/test_manifest.py::test_ringbuf_unqualified_size_refused`,
   `tests/unit/test_manifest.py::test_ringbuf_key_vocabulary_refused`,
   `tests/unit/test_manifest.py::test_hash_map_type_refused`,
@@ -470,7 +519,10 @@ host suites, selected-but-refused vectors).
   `tests/unit/test_manifest.py::test_hash_profile_refuses_bad_key_value_sizes`,
   `tests/unit/test_manifest.py::test_lru_map_type_refused`,
   `tests/unit/test_manifest.py::test_lru_profile_refuses_non_lru_kinds`,
-  `tests/unit/test_manifest.py::test_lru_profile_refuses_bad_key_value_sizes`).
+  `tests/unit/test_manifest.py::test_lru_profile_refuses_bad_key_value_sizes`,
+  `tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`,
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_non_percpu_hash_kinds`,
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_bad_key_value_sizes`).
 * A five-pair program over dense keys 0–4 passes the IR audit
   under its generic N-pair rule but is refused at build time
   with `MBPF107`: no manifest can declare 5 entries and the

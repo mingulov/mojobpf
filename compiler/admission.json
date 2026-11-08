@@ -275,6 +275,59 @@
       "core_supported": false,
       "subprog_supported": false
     },
+    "linux-bpfel-v3-percpu-hash": {
+      "profile_id": "linux-bpfel-v3-percpu-hash",
+      "byte_order": "little",
+      "cpu": "v3",
+      "allowed_pairs": [
+        [
+          "xdp",
+          "xdp"
+        ],
+        [
+          "tracepoint",
+          "tracepoint/syscalls/sys_enter_getpid"
+        ]
+      ],
+      "allowed_map_types": [
+        "array",
+        "percpu_array",
+        "ringbuf",
+        "percpu_hash"
+      ],
+      "allowed_key_types": [
+        "u32"
+      ],
+      "allowed_value_types": [
+        "u64"
+      ],
+      "allowed_max_entries": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "allowed_ringbuf_sizes": [
+        4096,
+        131072
+      ],
+      "helper_ids": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        14,
+        130
+      ],
+      "btf_scope": "map-only",
+      "entry_return": "i32",
+      "entry_parameters": [
+        "ptr"
+      ],
+      "core_supported": false,
+      "subprog_supported": false
+    },
     "linux-bpfel-v3-reserve": {
       "profile_id": "linux-bpfel-v3-reserve",
       "byte_order": "little",

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused per-CPU-hash corpus index for M-KEYED/map/percpu-hash.
+#
+# The vectors live in tests/compile/percpuhash_*.mojo,
+# tests/compile/maps_percpuhash_*.mojo, and
+# tests/compile/unsupported/*percpuhash*.ll. This file indexes
+# them so reviewers can audit coverage without reading the test
+# bodies. Every vector below names its FIRST rejecting layer:
+# manifest validation (MBPF205), the IR audit at adapter time
+# (MBPF3xx), backend kind reconciliation (MBPF216), the parsed
+# contract comparison (MBPF219), or the kernel (verifier log
+# line / errno). Nothing refused above the kernel reaches a
+# guest; nothing refused by the verifier executes.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+
+manifest map_type percpu_hash under base profile | test_percpu_hash_map_type_refused (tests/unit/test_manifest.py) | MBPF205 names percpu_hash
+array program + percpu_hash manifest | test_array_program_percpuhash_manifest_rejected (tests/compile/test_build_pipeline.py) | MBPF219 parsed contract, got 'percpu_hash'
+percpu_hash program + array manifest | test_percpuhash_kind_mismatch_rejected (tests/compile/test_build_pipeline.py) | MBPF216 backend reconciliation
+mixed array + per-CPU-hash handles, maps_percpuhash_mixed.mojo | test_percpuhash_mixed_kind_rejected_through_driver (tests/compile/test_build_pipeline.py) | MBPF307 adapter.audit
+mixed array + per-CPU-hash handles, maps_percpuhash_mixed.mojo | test_mixed_percpuhash_kind_refused (tests/elf/test_generalized_maps.py) | MBPF307
+mixed per-CPU + per-CPU-hash tags, maps_percpuhash_kind_mixed.mojo | test_mixed_percpuhash_percpu_refused (tests/elf/test_generalized_maps.py) | MBPF307
+update with BPF_NOEXIST, maps_percpuhash_noexist.mojo | test_percpuhash_update_noexist_refused (tests/elf/test_map_contract.py) | MBPF314
+tag tied to lookup result, percpuhash_tag_bad_operand.ll | test_fixture_rejections (tests/compile/test_subset_rejection.py) | MBPF307 adapter.audit
+mixed per-CPU + per-CPU-hash tags, percpuhash_kindtag_mixed.ll | test_fixture_rejections (tests/compile/test_subset_rejection.py) | MBPF307 adapter.audit
+tracepoint + per-CPU-hash tag, tracepoint_percpuhashtag.ll | test_fixture_rejections (tests/compile/test_subset_rejection.py) | MBPF307 adapter.audit
+event + per-CPU-hash tag, event_percpuhashtag.ll | test_fixture_rejections (tests/compile/test_subset_rejection.py) | MBPF307 adapter.audit
+out-of-bounds value read, percpuhash_oob.mojo | test_oob_rejected_by_verifier (tests/kernel/test_percpu_hash_maps.py) | verifier "invalid access to map value" at load
+unchecked lookup dereference, percpuhash_unchecked.mojo | test_unchecked_rejected_by_verifier (tests/kernel/test_percpu_hash_maps.py) | verifier "invalid mem access 'map_value_or_null'" at load
+fifth insert into 4-entry map | test_full_map_refuses_fifth_insert (tests/kernel/test_percpu_hash_maps.py) | E2BIG (Errno 7), first four entries exact

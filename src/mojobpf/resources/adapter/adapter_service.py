@@ -360,8 +360,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     refuses with MBPF219 (a new mode earns its route explicitly,
     it never inherits one). All four single-map kinds flip
     per kind commit (array, then hash, then LRU, then percpu);
-    every other kind (mixed) stays ``lane-a``; the caller
-    reports the kind from the audit scan. Mixed kinds stay
+    every other kind (per-CPU hash, mixed) stays ``lane-a``;
+    the caller reports the kind from the audit scan. Mixed kinds stay
     routed (never refused): Lane-A owns the two-kinds
     diagnostic. Non-core modes on core profiles stay
     ``lane-a``: only the core mode's relocation proof is
@@ -1580,6 +1580,7 @@ def handle_request(request_path, response_path):
                 (program.percpu, "percpu"),
                 (program.hashkind, "hash"),
                 (program.lrukind, "lru"),
+                (program.pcpuhashkind, "pcpuhash"),
             )
             if flag
         ]

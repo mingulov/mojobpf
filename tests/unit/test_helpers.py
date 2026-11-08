@@ -306,6 +306,7 @@ def test_capabilities_helpers_for_profile_returns_all_admitted():
         "linux-bpfel-v3-core",
         "linux-bpfel-v3-hash",
         "linux-bpfel-v3-lru",
+        "linux-bpfel-v3-percpu-hash",
         "linux-bpfel-v3-subprog",
         "linux-bpfel-v3-uprobe",
     ):

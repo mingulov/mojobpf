@@ -460,6 +460,16 @@ HASHTAG_MARKER = 'call i64 asm sideeffect "", "=r,0"(i64 %'
 # kind's lines.
 LRUTAG_MARKER = 'call i64 asm sideeffect "", "=r,0,~{memory}"(i64 %'
 
+# Inline-assembly marker identifying per-CPU-hash adapted IR: the
+# per-CPU-hash tag shape in compiler/audit.py ties the loaded map
+# address to its result through an empty template with a memory
+# clobber but no sideeffect marker. Only per-CPU-hash programs
+# carry such a line (one per map-address load); the spelling is
+# disjoint from the per-CPU marker (no clobber there), the hash
+# marker (sideeffect and no clobber there) and the LRU marker
+# (sideeffect there), so no marker matches another kind's lines.
+PCPUTAG_MARKER = 'call i64 asm "", "=r,0,~{memory}"(i64 %'
+
 # Inline-assembly markers identifying event and reservation
 # adapted IR: the ring-size tag shape ties the ring-buffer map
 # address to its result through an empty template carrying the
@@ -499,25 +509,27 @@ RINGBUF_SIZES = (4096, 131072)
 # Map-type bounds the reconciliation accepts per manifest map type:
 # 2 is the array map type, 6 the per-CPU array map type, 27 the
 # ring-buffer map type, 1 the hash map type, 9 the LRU hash map
-# type.
+# type, 5 the per-CPU hash map type.
 MAP_TYPE_IDS = {
     "array": 2,
     "percpu_array": 6,
     "ringbuf": 27,
     "hash": 1,
     "lru_hash": 9,
+    "percpu_hash": 5,
 }
 # BTF map-type ids the parsed route can emit, valued in the
 # manifest spelling vocabulary (the gate compares against
 # declared.map_type, and the Lane-A marker arm speaks
-# spellings too). The spec contract admits all four
-# single-map kinds (array 2, hash 1, LRU 9, percpu 6), one
-# kind per commit; the parsed lowering consumes kind tags
-# into helper-call operands, so the staged object's BTF
-# attributes (not the adapted text) are the built kind
-# evidence on this route.
+# spellings too). The spec contract admits all five
+# single-map kinds (array 2, hash 1, LRU 9, percpu 6,
+# per-CPU hash 5), one kind per commit; the parsed lowering
+# consumes kind tags into helper-call operands, so the staged
+# object's BTF attributes (not the adapted text) are the built
+# kind evidence on this route.
 PARSED_MAP_TYPE_KINDS = {
     2: "array", 1: "hash", 9: "lru_hash", 6: "percpu_array",
+    5: "percpu_hash",
 }
 # Declared value-type vocabulary to BTF value sizes in bytes. Every
 # profile-admitted keyed-map value type has an entry here; a
@@ -3143,6 +3155,7 @@ def _adapted_shape(adapted_text: str,
     percpu = KINDTAG_MARKER in adapted_text
     hashkind = HASHTAG_MARKER in adapted_text
     lrukind = LRUTAG_MARKER in adapted_text
+    pcpuhashkind = PCPUTAG_MARKER in adapted_text
     if (
         lookups == 0
         and updates == 0
@@ -3157,12 +3170,12 @@ def _adapted_shape(adapted_text: str,
         and skbloads == 0
         and skbstores == 0
     ):
-        if percpu or hashkind or lrukind:
+        if percpu or hashkind or lrukind or pcpuhashkind:
             return None
         return ("classifier", 0, False)
     if skbloads or skbstores:
         if (
-            percpu or hashkind or lrukind or pids or ktimes
+            percpu or hashkind or lrukind or pcpuhashkind or pids or ktimes
             or cpus or outputs or reserves or submits
             or discards or deletes
         ):
@@ -3189,6 +3202,7 @@ def _adapted_shape(adapted_text: str,
             and not percpu
             and not hashkind
             and not lrukind
+            and not pcpuhashkind
         ):
             reinterps = adapted_text.count(
                 'call ptr asm "", "=r,0"'
@@ -3217,6 +3231,7 @@ def _adapted_shape(adapted_text: str,
             and not percpu
             and not hashkind
             and not lrukind
+            and not pcpuhashkind
         ):
             reinterps = adapted_text.count(
                 'call ptr asm "", "=r,0"'
@@ -3245,7 +3260,7 @@ def _adapted_shape(adapted_text: str,
             or discards
         ):
             return None
-        if percpu or hashkind or lrukind:
+        if percpu or hashkind or lrukind or pcpuhashkind:
             return None
         reinterps = adapted_text.count('call ptr asm "", "=r,0"')
         if reinterps != 2:
@@ -3262,6 +3277,7 @@ def _adapted_shape(adapted_text: str,
         and not percpu
         and not hashkind
         and not lrukind
+        and not pcpuhashkind
     ):
         if adapter_route == "parsed":
             if adapted_text.count(UPROBE_PARSED_CTXREAD_MARKER) != 1:
@@ -3279,6 +3295,7 @@ def _adapted_shape(adapted_text: str,
         and not percpu
         and not hashkind
         and not lrukind
+        and not pcpuhashkind
         and "llvm.bpf.passthrough" in adapted_text
         and "!llvm.preserve.access.index" in adapted_text
     ):
@@ -3291,7 +3308,7 @@ def _adapted_shape(adapted_text: str,
     if lookups == 2:
         reinterps = adapted_text.count('call ptr asm "", "=r,0"')
         if reinterps == 3:
-            if hashkind or lrukind:
+            if hashkind or lrukind or pcpuhashkind:
                 return None
             return ("combined", 2, percpu)
         if reinterps != 2:
@@ -3647,7 +3664,8 @@ def _map_entries_outcome(manifest, staged_obj: str,
 
     The adapter emits the map kind and entry count the audited
     program shape requires (the kind tag selects array, per-CPU
-    array, hash, or LRU hash; dense key coverage selects the count; the
+    array, hash, LRU hash, or per-CPU hash; dense key coverage
+    selects the count; the
     event and reservation shapes additionally emit the
     ring-buffer size from the audited size tag); a manifest
     declaring any other kind or
@@ -3706,7 +3724,8 @@ def _map_entries_outcome(manifest, staged_obj: str,
         )
     hashkind = HASHTAG_MARKER in adapted_text
     lrukind = LRUTAG_MARKER in adapted_text
-    if sum((hashkind, percpu, lrukind)) > 1:
+    pcpuhashkind = PCPUTAG_MARKER in adapted_text
+    if sum((hashkind, percpu, lrukind, pcpuhashkind)) > 1:
         return [
             Diagnostic(
                 code="MBPF216",
@@ -3727,6 +3746,8 @@ def _map_entries_outcome(manifest, staged_obj: str,
         want_kind = "hash"
     elif lrukind:
         want_kind = "lru_hash"
+    elif pcpuhashkind:
+        want_kind = "percpu_hash"
     elif percpu:
         want_kind = "percpu_array"
     else:

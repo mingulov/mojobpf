@@ -2,8 +2,9 @@
 """Structure proof for the generalized map shapes.
 
 Builds every map count family (read-modify-write pairs,
-deletions) over every supported entry count (1 to 4) in all four
-map kinds (array, per-CPU array, hash, LRU hash) plus the per-CPU combined
+deletions) over every supported entry count (1 to 4) in all five
+map kinds (array, per-CPU array, hash, LRU hash, per-CPU hash)
+plus the per-CPU combined
 workload through the genuine frontend and adapter, then proves
 the structural contract per shape: the audit family, the exact
 helper-call bytes, the BTF map attributes (kind and count), the
@@ -158,9 +159,44 @@ SHAPES = (
         "lru_del4", "lru_delete4.mojo", "delete", 4, "lru_hash",
         (3, 3, 3, 3),
     ),
+    (
+        "percpuhash_rmw1", "percpuhash_rmw1.mojo", "map", 1,
+        "percpu_hash", (1, 2),
+    ),
+    (
+        "percpuhash_rmw2", "percpuhash_rmw2.mojo", "map", 2,
+        "percpu_hash", (1, 2, 1, 2),
+    ),
+    (
+        "percpuhash_rmw3", "percpuhash_rmw3.mojo", "map", 3,
+        "percpu_hash", (1, 2, 1, 2, 1, 2),
+    ),
+    (
+        "percpuhash_rmw4", "percpuhash_rmw4.mojo", "map", 4,
+        "percpu_hash", (1, 2, 1, 2, 1, 2, 1, 2),
+    ),
+    (
+        "percpuhash_del1", "percpuhash_delete1.mojo", "delete", 1,
+        "percpu_hash", (3,),
+    ),
+    (
+        "percpuhash_del2", "percpuhash_delete2.mojo", "delete", 2,
+        "percpu_hash", (3, 3),
+    ),
+    (
+        "percpuhash_del3", "percpuhash_delete3.mojo", "delete", 3,
+        "percpu_hash", (3, 3, 3),
+    ),
+    (
+        "percpuhash_del4", "percpuhash_delete4.mojo", "delete", 4,
+        "percpu_hash", (3, 3, 3, 3),
+    ),
 )
 
-KIND_IDS = {"array": 2, "percpu_array": 6, "hash": 1, "lru_hash": 9}
+KIND_IDS = {
+    "array": 2, "percpu_array": 6, "hash": 1, "lru_hash": 9,
+    "percpu_hash": 5,
+}
 
 
 class EnvironmentFailure(Exception):
@@ -236,12 +272,15 @@ def built(name):
         assert (
             program.family, program.entries, program.percpu,
             program.hashkind, program.lrukind,
+            program.pcpuhashkind,
         ) == (
             row[2], row[3], row[4] == "percpu_array",
             row[4] == "hash", row[4] == "lru_hash",
+            row[4] == "percpu_hash",
         ), (
             name, program.family, program.entries, program.percpu,
             program.hashkind, program.lrukind,
+            program.pcpuhashkind,
         )
         adapted = adapter.adapt(raw)
         image = build_object(adapted)
@@ -521,12 +560,16 @@ def test_kind_is_one_btf_word():
         ("rmw2", "lru_rmw2"),
         ("rmw3", "lru_rmw3"),
         ("rmw4", "lru_rmw4"),
+        ("rmw2", "percpuhash_rmw2"),
+        ("rmw3", "percpuhash_rmw3"),
+        ("rmw4", "percpuhash_rmw4"),
     ]
     # Array-vs-hash delete pairs share code except the intended
     # status check: array probes expect -EINVAL (-22) while hash
     # probes expect success (0), so exactly the N jump-comparison
     # immediates differ (one per deletion). Array-vs-LRU pairs
-    # share the same shape: LRU deletes succeed like hash ones.
+    # share the same shape: LRU deletes succeed like hash ones,
+    # and so do per-CPU-hash deletes.
     status_pairs = [
         ("del1", "hash_del1"),
         ("del2", "hash_del2"),
@@ -536,6 +579,10 @@ def test_kind_is_one_btf_word():
         ("del2", "lru_del2"),
         ("del3", "lru_del3"),
         ("del4", "lru_del4"),
+        ("del1", "percpuhash_del1"),
+        ("del2", "percpuhash_del2"),
+        ("del3", "percpuhash_del3"),
+        ("del4", "percpuhash_del4"),
     ]
     for left_name, right_name in pairs:
         _raw, _adapted, left_image = built(left_name)
@@ -754,6 +801,16 @@ def test_mixed_lru_kind_refused():
 def test_mixed_lru_percpu_refused():
     check_negative("maps_lru_kind_mixed", "MBPF307")
     print("PASS mixed LRU/per-CPU tags refused with MBPF307")
+
+
+def test_mixed_percpuhash_kind_refused():
+    check_negative("maps_percpuhash_mixed", "MBPF307")
+    print("PASS mixed per-CPU-hash kind refused with MBPF307")
+
+
+def test_mixed_percpuhash_percpu_refused():
+    check_negative("maps_percpuhash_kind_mixed", "MBPF307")
+    print("PASS mixed per-CPU-hash/per-CPU tags refused with MBPF307")
 
 
 def test_getnext_attempt_refused():

@@ -234,6 +234,33 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         core_supported=False,
         subprog_supported=False,
     ),
+    # Per-CPU hash capability profile: everything the base profile
+    # admits, plus per-CPU hash maps with u32 keys and u64 values in
+    # one- to four-entry sizes. No helper, key/value width,
+    # entry count, or program type beyond the base set: the
+    # per-CPU-hash slice reuses the existing lookup/update/delete
+    # helpers and the dense key coverage, only the emitted map
+    # kind differs.
+    "linux-bpfel-v3-percpu-hash": TargetProfile(
+        profile_id="linux-bpfel-v3-percpu-hash",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf", "percpu_hash"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64",),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-only",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=False,
+        subprog_supported=False,
+    ),
     # Reservation capability profile: everything the base
     # profile admits, plus explicit ring-buffer reservations
     # (helpers 131, 132, 133). No map kind, key/value width,

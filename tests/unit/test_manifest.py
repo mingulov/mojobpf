@@ -163,6 +163,7 @@ def test_profile_registry_holds_supported_profiles():
         "linux-bpfel-v3-hash",
         "linux-bpfel-v3-lru",
         "linux-bpfel-v3-net",
+        "linux-bpfel-v3-percpu-hash",
         "linux-bpfel-v3-reserve",
         "linux-bpfel-v3-subprog",
         "linux-bpfel-v3-uprobe",
@@ -235,6 +236,27 @@ def test_lru_profile_extends_base_with_lru_vocabulary():
     assert profile.allowed_pairs == base.allowed_pairs
     assert profile.allowed_map_types == (
         "array", "percpu_array", "ringbuf", "lru_hash",
+    )
+    assert profile.allowed_key_types == base.allowed_key_types
+    assert profile.allowed_value_types == base.allowed_value_types
+    assert profile.allowed_max_entries == base.allowed_max_entries
+    assert profile.allowed_ringbuf_sizes == base.allowed_ringbuf_sizes
+    assert profile.helper_ids == base.helper_ids
+    assert profile.btf_scope == base.btf_scope
+    assert profile.entry_return == base.entry_return
+    assert profile.entry_parameters == base.entry_parameters
+    assert profile.core_supported is False
+    assert profile.subprog_supported is False
+
+
+def test_percpu_hash_profile_extends_base_with_percpu_hash_vocabulary():
+    profile = lookup_profile("linux-bpfel-v3-percpu-hash")
+    base = lookup_profile("linux-bpfel-v3")
+    assert profile.byte_order == base.byte_order
+    assert profile.cpu == base.cpu
+    assert profile.allowed_pairs == base.allowed_pairs
+    assert profile.allowed_map_types == (
+        "array", "percpu_array", "ringbuf", "percpu_hash",
     )
     assert profile.allowed_key_types == base.allowed_key_types
     assert profile.allowed_value_types == base.allowed_value_types
@@ -605,6 +627,63 @@ def test_lru_profile_refuses_bad_key_value_sizes():
     text = mutate_in(_lru_text(), "max_entries = 1", "max_entries = 5\n")
     diagnostic = expect_code(text, "MBPF205")
     assert "5" in diagnostic.explanation
+
+
+def test_percpu_hash_manifest_parses_under_percpu_hash_profile():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-percpu-hash"\n',
+    )
+    text = mutate_in(text, 'map_type = "array"', 'map_type = "percpu_hash"\n')
+    manifest_path, _tmpdir = write_project(text)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.target.profile == "linux-bpfel-v3-percpu-hash"
+    assert len(manifest.maps) == 1
+    mapping = manifest.maps[0]
+    assert mapping.map_type == "percpu_hash"
+    assert mapping.key_type == "u32"
+    assert mapping.value_type == "u64"
+    assert mapping.max_entries == 1
+
+
+def _percpu_hash_text():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-percpu-hash"\n',
+    )
+    return mutate_in(text, 'map_type = "array"', 'map_type = "percpu_hash"\n')
+
+
+def test_percpu_hash_profile_refuses_non_percpu_hash_kinds():
+    for refused in ("hash", "lru_hash", "array_of_maps", "prog_array"):
+        text = mutate_in(
+            _percpu_hash_text(), 'map_type = "percpu_hash"',
+            'map_type = "%s"\n' % refused,
+        )
+        diagnostic = expect_code(text, "MBPF205")
+        assert refused in diagnostic.explanation
+
+
+def test_percpu_hash_profile_refuses_bad_key_value_sizes():
+    text = mutate_in(
+        _percpu_hash_text(), 'key_type = "u32"', 'key_type = "u16"\n'
+    )
+    diagnostic = expect_code(text, "MBPF205")
+    assert "u16" in diagnostic.explanation
+    text = mutate_in(
+        _percpu_hash_text(), 'value_type = "u64"', 'value_type = "u32"\n'
+    )
+    diagnostic = expect_code(text, "MBPF205")
+    assert "u32" in diagnostic.explanation
+    text = mutate_in(_percpu_hash_text(), "max_entries = 1", "max_entries = 5\n")
+    diagnostic = expect_code(text, "MBPF205")
+    assert "5" in diagnostic.explanation
+
+
+def test_percpu_hash_map_type_refused():
+    text = mutate('map_type = "array"', 'map_type = "percpu_hash"\n')
+    diagnostic = expect_code(text, "MBPF205")
+    assert "percpu_hash" in diagnostic.explanation
 
 
 def test_unknown_schema_version_fails():

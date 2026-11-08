@@ -529,6 +529,128 @@
       ]
     },
     {
+      "case_id": "percpu-hash.entry.c.linux-bpfel-v3",
+      "family": "percpu-hash",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "percpu-hash.entry.mojo.linux-bpfel-v3",
+      "family": "percpu-hash",
+      "producer": "mojo",
+      "route": "legacy",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/compile/percpuhash_rmw1.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "percpu-hash.entry.rust.linux-bpfel-v3",
+      "family": "percpu-hash",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
       "case_id": "core.entry.c.linux-bpfel-v3",
       "family": "core",
       "producer": "c",

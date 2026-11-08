@@ -226,11 +226,12 @@ demonstrated in a Linux guest; each bullet names its proof.
   the kernel verifier with its own logged reason
   (`tests/elf/test_map_btf.py`, `tests/kernel/test_map_roundtrip.py`).
 - A generalized map SDK slice: `ARRAY`, `PERCPU_ARRAY`,
-  `HASH`, and `LRU_HASH` maps with u32 keys and u64 values in
+  `HASH`, `LRU_HASH`, and `PERCPU_HASH` maps with u32 keys and
+  u64 values in
   one- to four-entry sizes, named update flags (`BPF_ANY`
   lowers; `BPF_NOEXIST`/`BPF_EXIST` are refused with a named
   diagnostic), documented mutation semantics, layout/BTF
-  proofs per shape at all 32 shapes, and kernel proofs per
+  proofs per shape at all 40 shapes, and kernel proofs per
   operation and kind at the measured counts for the array,
   per-CPU, and hash kinds: read-modify-write lifecycle (41 to
   42) and exact counts per entry, deletion refused with
@@ -253,11 +254,19 @@ demonstrated in a Linux guest; each bullet names its proof.
   lifecycle, exact counts, miss path, delete, iteration,
   eviction, size refusals, and verifier negatives; the LRU slice
   here covers the host pipeline: profile, kind tag, map/BTF
-  emission, and reconciliation).
+  emission, and reconciliation). (Per-CPU-hash kernel behavior
+  is proven by `tests/kernel/test_percpu_hash_maps.py`: lifecycle,
+  exact counts, miss path, delete, iteration, the full-map
+  `E2BIG` refusal, CPU isolation, size refusals, and verifier
+  negatives; the per-CPU-hash slice here covers the host
+  pipeline: profile, kind tag, map/BTF emission, and
+  reconciliation).
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
   `tests/compile/maps_*.mojo`, `tests/compile/percpu_*.mojo`,
   `tests/compile/hash_*.mojo`, `tests/compile/maps_hash_*.mojo`,
   `tests/compile/lru_*.mojo`, `tests/compile/maps_lru_*.mojo`,
+  `tests/compile/percpuhash_*.mojo`,
+  `tests/compile/maps_percpuhash_*.mojo`,
   `tests/elf/test_map_contract.py`,
   `tests/elf/test_generalized_maps.py`,
   `tests/kernel/test_array_maps.py`,
@@ -500,9 +509,10 @@ of them is implied by the results above:
   `tests/kernel/test_uprobe_register.py`).
 - Map kinds and shapes beyond the proven matrix:
   map-in-map and `PROG_ARRAY` declarations are refused by the
-  build driver, as are hash and LRU shapes outside the
-  qualified form (`u32` keys with `u64` values under the hash
-  and LRU profiles), entry counts outside 1 to 4, ring sizes
+  build driver, as are hash, LRU, and per-CPU-hash shapes
+  outside the qualified form (`u32` keys with `u64` values
+  under the hash, LRU, and per-CPU-hash profiles), entry
+  counts outside 1 to 4, ring sizes
   outside the two qualified sizes, and key literals outside the
   declared dense coverage.
   Programs mixing map operations (pairs

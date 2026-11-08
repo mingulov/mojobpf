@@ -358,6 +358,28 @@ program_type = "xdp"
 section = "xdp"
 {maps}
 """
+PERCPUHASH_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-percpu-hash"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "{entry}"
+program_type = "xdp"
+section = "xdp"
+{maps}
+"""
 
 SUBPROG_MANIFEST_TEMPLATE = """\
 schema_version = 1
@@ -542,6 +564,21 @@ LRU_DELETE_SOURCES = {
 }
 LRU_MIXED_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_lru_mixed.mojo"
+)
+PERCPUHASH_RMW_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "percpuhash_rmw%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+PERCPUHASH_DELETE_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "percpuhash_delete%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+PERCPUHASH_MIXED_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_percpuhash_mixed.mojo"
 )
 GETNEXT_ATTEMPT_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_getnext_attempt.mojo"
@@ -1815,6 +1852,82 @@ def test_array_program_lru_manifest_rejected():
     assert "scans as array" in diagnostic.explanation, diagnostic
 
 
+def _check_percpuhash_shape_builds(source, entries, artifact):
+    manifest_path, out_dir = write_project(
+        source, "xdp_entry", artifact, True,
+        max_entries=entries, map_type="percpu_hash",
+        template=PERCPUHASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        object_path = os.path.join(out_dir, artifact + ".bpf.o")
+        assert os.path.isfile(object_path)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_percpuhash_shapes_build_through_driver():
+    # Every per-CPU-hash pair shape and every per-CPU-hash
+    # delete probe builds end to end with its matching
+    # per-CPU-hash manifest: audit, adapter, spill gate,
+    # inspection, and kind/count reconciliation all pass under
+    # the per-CPU-hash capability profile.
+    check_tools()
+    for entries, source in sorted(PERCPUHASH_RMW_SOURCES.items()):
+        _check_percpuhash_shape_builds(
+            source, entries, "percpuhash_rmw%d_obj" % entries
+        )
+    for entries, source in sorted(PERCPUHASH_DELETE_SOURCES.items()):
+        _check_percpuhash_shape_builds(
+            source, entries, "percpuhash_del%d_obj" % entries
+        )
+
+
+def test_percpuhash_kind_mismatch_rejected():
+    # A per-CPU-hash pair program paired with an array manifest
+    # fails kind reconciliation with MBPF216 instead of
+    # publishing an artifact that disagrees with its manifest.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        PERCPUHASH_RMW_SOURCES[4], "xdp_entry",
+        "percpuhash_kind_mismatch_obj",
+        True, max_entries=4, map_type="array",
+        template=PERCPUHASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "percpu_hash map" in diagnostic.explanation, diagnostic
+    assert "map_type = 'array'" in diagnostic.explanation, diagnostic
+
+
+def test_array_program_percpuhash_manifest_rejected():
+    # An array pair program paired with a per-CPU-hash manifest
+    # never builds. The array program routes parsed, where the
+    # unmigrated per-CPU-hash kind refuses in the contract
+    # comparison (MBPF219) instead of reaching backend kind
+    # reconciliation.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        RMW_SOURCES[4], "xdp_entry", "array_percpuhash_mismatch_obj",
+        True, max_entries=4, map_type="percpu_hash",
+        template=PERCPUHASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "got 'percpu_hash'" in diagnostic.explanation, diagnostic
+
+
 def test_multientry_count_mismatch_rejected():
     # A four-pair program paired with a two-entry manifest fails
     # count reconciliation with MBPF216.
@@ -2316,6 +2429,23 @@ def test_lru_mixed_kind_rejected_through_driver():
         LRU_MIXED_SOURCE, "xdp_entry", "lru_mixed_kind_obj", True,
         max_entries=1, map_type="lru_hash",
         template=LRU_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF307", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+
+
+def test_percpuhash_mixed_kind_rejected_through_driver():
+    # Array and per-CPU-hash handle loads in one program match
+    # no map count family: MBPF307 at the adapter audit.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        PERCPUHASH_MIXED_SOURCE, "xdp_entry",
+        "percpuhash_mixed_kind_obj", True,
+        max_entries=1, map_type="percpu_hash",
+        template=PERCPUHASH_MANIFEST_TEMPLATE,
     )
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)

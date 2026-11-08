@@ -135,6 +135,7 @@ SUITES = (
     ("kernel-joint", "tests/kernel/test_joint_stack.py", 1500),
     ("kernel-net", "tests/kernel/test_net_classifier.py", 1500),
     ("kernel-lru", "tests/kernel/test_lru_maps.py", 1800),
+    ("kernel-percpu-hash", "tests/kernel/test_percpu_hash_maps.py", 1800),
 )
 
 # Pinned plan case IDs per suite (the matrix's independent
@@ -631,6 +632,23 @@ SUITE_CASES = {
         "test_userspace_delete_lifecycle  "
         "test_walk_chain_refuses_broken_chains"
     ).split(),
+    "kernel-percpu-hash": (
+        "test_control_matches_mojo_bytes  "
+        "test_cpu_facts_agree test_decode_bpftool_dump_shape  "
+        "test_decode_values_exact test_exact_counts_after_quiescence  "
+        "test_full_map_refuses_fifth_insert test_guest_provenance  "
+        "test_isolation_moves_only_running_cpu  "
+        "test_iteration_set_and_bytes test_kernel_delete_removes_entries  "
+        "test_key_value_byte_helpers test_license_gate_agrees  "
+        "test_lifecycle_init_run_observe test_miss_path_inserts_nothing  "
+        "test_oob_rejected_by_verifier test_parse_possible_list_forms  "
+        "test_percpu_stride_padding  "
+        "test_residue_checks_refuse_blind_spots  "
+        "test_scoped_update_after_insert test_sizes_refused  "
+        "test_unchecked_rejected_by_verifier  "
+        "test_userspace_delete_lifecycle  "
+        "test_walk_chain_refuses_broken_chains"
+    ).split(),
 }
 
 # Pinned per-case obligations per suite (the matrix's independent
@@ -783,6 +801,14 @@ SUITE_DENIALS = {
     "kernel-joint": {},
     "kernel-net": {},
     "kernel-lru": {
+        "test_oob_rejected_by_verifier": (
+            "test_lifecycle_init_run_observe", "VERIFY"
+        ),
+        "test_unchecked_rejected_by_verifier": (
+            "test_lifecycle_init_run_observe", "VERIFY"
+        ),
+    },
+    "kernel-percpu-hash": {
         "test_oob_rejected_by_verifier": (
             "test_lifecycle_init_run_observe", "VERIFY"
         ),

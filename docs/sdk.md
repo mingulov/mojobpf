@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF SDK reference (surface 1.7)
+# MojoBPF SDK reference (surface 1.8)
 
 The `mojobpf` Mojo package is the only importable surface a kernel
 program may use. It ships eight modules under the packaged SDK
@@ -13,7 +13,7 @@ working directory):
 | `mojobpf.parse` | Ethernet field accessors with one optional VLAN tag |
 | `mojobpf.checksum` | Incremental ones-complement checksum arithmetic |
 | `mojobpf.helpers` | Map lookup/update/delete wrappers plus the nullable result type |
-| `mojobpf.maps` | Array, per-CPU array, hash, and LRU hash map handles, key/value slots, constants |
+| `mojobpf.maps` | Array, per-CPU array, hash, LRU hash, and per-CPU hash map handles, key/value slots, constants |
 | `mojobpf.events` | Fixed-record ring-buffer output: record layout, field views, PID/clock/CPU/output wrappers, ring handle, explicit reserve/submit/discard vocabulary |
 | `mojobpf.core` | CO-RE field vocabulary: relocated `task_struct.pid` read plus `task_struct.scx` existence check |
 | `mojobpf.uprobe` | Controlled-uprobe register vocabulary: pinned x86-64 first-argument read |
@@ -26,7 +26,7 @@ A claim without a citation is not a claim.
 
 ## Version and compatibility
 
-The SDK surface version is `1.7`
+The SDK surface version is `1.8`
 (`tests/unit/test_sdk_surface.py::test_sdk_version_pinned`).
 Within one major version only additive changes are allowed: new
 modules or new names may appear, but removing or renaming a module
@@ -41,9 +41,11 @@ constants to the `mojobpf.events` module, version 1.5 adds
 exactly the `mojobpf.uprobe` module
 (`uprobe_first_arg` plus the word and byte constants), and
 version 1.6 adds exactly `LruHandle` and `MAP_TYPE_LRU_HASH`
-to the `mojobpf.maps` module, and version 1.7 adds exactly
+to the `mojobpf.maps` module, version 1.7 adds exactly
 `bpf_skb_load_bytes`, `bpf_skb_store_bytes`, and the two skb
-helper-ID constants to the `mojobpf.helpers` module; the 1.0
+helper-ID constants to the `mojobpf.helpers` module, and
+version 1.8 adds exactly `PercpuHashHandle` and
+`MAP_TYPE_PERCPU_HASH` to the `mojobpf.maps` module; the 1.0
 surface is frozen and enforced as an unchanged subset of the
 current one
 (`tests/packaging/test_sdk_compat.py::test_additive_only_within_major`).
@@ -286,8 +288,8 @@ and sequence
 
 ## `mojobpf.maps`
 
-Array, per-CPU array, hash, and LRU hash maps with `u32`
-keys and `u64` values in 1-4 entries, declared in
+Array, per-CPU array, hash, LRU hash, and per-CPU hash maps
+with `u32` keys and `u64` values in 1-4 entries, declared in
 loader-compatible form with
 map BTF (the single-entry core map below is the one wider
 value). The key/value widths and counts are pinned against the
@@ -299,24 +301,28 @@ per shape (`tests/elf/test_generalized_maps.py::test_btf_dims_per_shape`,
 `tests/elf/test_generalized_maps.py::test_bpftool_accepts_btf_per_shape`).
 
 * `MapHandle.load()` / `PercpuHandle.load()` /
-  `HashHandle.load()` / `LruHandle.load()`: the map address
-  from its metadata section. The per-CPU, hash, and LRU loads
-  add a kind tag that emits no code; the array load is
-  untagged. Same-shape read-modify-write objects share code
-  exactly, and kinds differ in exactly one BTF word; delete
-  twins additionally differ exactly in the per-deletion
-  status-comparison immediates (array expects `-EINVAL`, hash
-  and LRU expect success)
+  `HashHandle.load()` / `LruHandle.load()` /
+  `PercpuHashHandle.load()`: the map address from its metadata
+  section. The per-CPU, hash, LRU, and per-CPU-hash loads add a
+  kind tag that emits no code; the array load is untagged.
+  Same-shape read-modify-write objects share code exactly, and
+  kinds differ in exactly one BTF word; delete twins
+  additionally differ exactly in the per-deletion
+  status-comparison immediates (array expects `-EINVAL`, hash,
+  LRU, and per-CPU hash expect success)
   (`tests/elf/test_generalized_maps.py::test_kind_is_one_btf_word`).
   Exactly one map symbol is declared
   (`tests/elf/test_map_contract.py::test_single_map_symbol_and_shared_declaration`),
-  and mixing tagged with untagged loads, or per-CPU, hash, and
-  LRU tags with each other, in one program is refused
+  and mixing tagged with untagged loads, or per-CPU, hash, LRU,
+  and per-CPU-hash tags with each other, in one program is
+  refused
   (`tests/elf/test_generalized_maps.py::test_mixed_kind_refused`,
   `tests/elf/test_generalized_maps.py::test_mixed_hash_kind_refused`,
   `tests/elf/test_generalized_maps.py::test_mixed_hash_percpu_refused`,
   `tests/elf/test_generalized_maps.py::test_mixed_lru_kind_refused`,
-  `tests/elf/test_generalized_maps.py::test_mixed_lru_percpu_refused`).
+  `tests/elf/test_generalized_maps.py::test_mixed_lru_percpu_refused`,
+  `tests/elf/test_generalized_maps.py::test_mixed_percpuhash_kind_refused`,
+  `tests/elf/test_generalized_maps.py::test_mixed_percpuhash_percpu_refused`).
 * `key_slot()` / `key_slot1()` / `key_slot2()` / `key_slot3()`:
   key scratch slots holding keys 0-3; a program's slots must
   cover exactly its map's entries. Dense keys validate, sparse
@@ -329,20 +335,21 @@ per shape (`tests/elf/test_generalized_maps.py::test_btf_dims_per_shape`,
   through. Slots compile to the audited stack immediates
   (`tests/ir/test_helper_lowering.py::test_stack_immediates_are_slots_and_increment`).
 * `BPF_ANY` (`0`): the only lowering update flag. On arrays
-  and per-CPU arrays it is an unconditional replace; on hash
-  and LRU maps it creates the entry when the key is absent and
-  replaces the value when it is present. The named spelling
-  lowers to the canonical shape
+  and per-CPU arrays it is an unconditional replace; on hash,
+  LRU, and per-CPU-hash maps it creates the entry when the key
+  is absent and replaces the value when it is present. The
+  named spelling lowers to the canonical shape
   (`tests/elf/test_map_contract.py::test_named_spelling_matches_canonical`).
   `BPF_NOEXIST` and `BPF_EXIST` name refused spellings: any
   nonzero flags value is rejected, never rewritten
   (`tests/elf/test_map_contract.py::test_update_noexist_refused`,
   `tests/elf/test_map_contract.py::test_update_exist_refused`,
   `tests/elf/test_map_contract.py::test_hash_update_noexist_refused`,
-  `tests/elf/test_map_contract.py::test_lru_update_noexist_refused`).
+  `tests/elf/test_map_contract.py::test_lru_update_noexist_refused`,
+  `tests/elf/test_map_contract.py::test_percpuhash_update_noexist_refused`).
 * `MAP_TYPE_ARRAY` (`2`), `MAP_TYPE_HASH` (`1`),
   `MAP_TYPE_LRU_HASH` (`9`), `MAP_TYPE_PERCPU_ARRAY` (`6`),
-  `MAP_KEY_SIZE` (`4`),
+  `MAP_TYPE_PERCPU_HASH` (`5`), `MAP_KEY_SIZE` (`4`),
   `MAP_VALUE_SIZE` (`8`), `MAP_MAX_ENTRIES` (`1`),
   `MAP_MAX_ENTRIES_COMBINED` (`2`), `MAP_MAX_ENTRIES_N3` (`3`),
   `MAP_MAX_ENTRIES_N4` (`4`): declarative mirrors of the emitted
@@ -354,7 +361,18 @@ the measured counts: hash kernel behavior ran at 4 entries
 (suite) plus an independent 2-entry read-modify-write
 consumer proof, the 1-entry hash shape is a load/unload
 proof, and layout, BTF, and relocation proofs cover every
-count at all 32 shapes. Proven: read-modify-write lifecycles
+count at all 40 shapes. Per-CPU-hash behavior is proven per
+slot on both CPUs: lifecycle, exact counts, miss/insert
+scoping, delete, iteration with exact per-slot bytes, the
+full-map `E2BIG` refusal, and CPU isolation
+(`tests/kernel/test_percpu_hash_maps.py::test_lifecycle_init_run_observe`,
+`tests/kernel/test_percpu_hash_maps.py::test_exact_counts_after_quiescence`,
+`tests/kernel/test_percpu_hash_maps.py::test_scoped_update_after_insert`,
+`tests/kernel/test_percpu_hash_maps.py::test_userspace_delete_lifecycle`,
+`tests/kernel/test_percpu_hash_maps.py::test_iteration_set_and_bytes`,
+`tests/kernel/test_percpu_hash_maps.py::test_full_map_refuses_fifth_insert`,
+`tests/kernel/test_percpu_hash_maps.py::test_isolation_moves_only_running_cpu`).
+Proven: read-modify-write lifecycles
 (41 to 42) with exact per-entry counts
 (`tests/kernel/test_generalized_arrays.py::test_rmw_lifecycle_four_entries`,
 `tests/kernel/test_generalized_arrays.py::test_rmw_exact_counts_four_entries`,
@@ -684,25 +702,29 @@ Third parties build the shape through the installed package only
   (`tests/unit/test_artifact_publication.py::test_requires_gpl_unknown_inputs`,
   `tests/elf/test_map_contract.py::test_no_foreign_helper_or_map_kind_emitted`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
-* Only `ARRAY`, `PERCPU_ARRAY`, `HASH`, and `LRU_HASH`
-  maps with `u32` keys, `u64` values, and 1-4 entries exist
-  (hash only under the hash capability profile, LRU hash only
-  under the LRU capability profile; the base profile still
-  refuses both), plus `RINGBUF` maps in the two qualified sizes
-  for the event program and the single-entry `ARRAY` core map
-  with its 4096-byte opaque value; other sizes, other kinds,
-  and other shapes are refused at manifest validation or the
-  audit
+* Only `ARRAY`, `PERCPU_ARRAY`, `HASH`, `LRU_HASH`, and
+  `PERCPU_HASH` maps with `u32` keys, `u64` values, and 1-4
+  entries exist (hash only under the hash capability profile,
+  LRU hash only under the LRU capability profile, per-CPU hash
+  only under the per-CPU-hash capability profile; the base
+  profile still refuses all three), plus `RINGBUF` maps in the
+  two qualified sizes for the event program and the single-entry
+  `ARRAY` core map with its 4096-byte opaque value; other
+  sizes, other kinds, and other shapes are refused at manifest
+  validation or the audit
   (`tests/unit/test_manifest.py::test_hash_map_type_refused`,
   `tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`,
   `tests/unit/test_manifest.py::test_hash_profile_refuses_non_hash_kinds`,
   `tests/unit/test_manifest.py::test_lru_map_type_refused`,
   `tests/unit/test_manifest.py::test_lru_profile_extends_base_with_lru_vocabulary`,
   `tests/unit/test_manifest.py::test_lru_profile_refuses_non_lru_kinds`,
+  `tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`,
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_extends_base_with_percpu_hash_vocabulary`,
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_non_percpu_hash_kinds`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * Only `BPF_ANY` updates lower; `BPF_NOEXIST`/`BPF_EXIST`
   spellings are refused, and there is no from-program iteration
-  spelling (see the maps section for all four refusal proofs).
+  spelling (see the maps section for all five refusal proofs).
 * Floating-point, multi-lane vectors, indirect calls, unwinding,
   allocation, and runtime calls have no SDK spelling and are
   rejected as a corpus with named codes

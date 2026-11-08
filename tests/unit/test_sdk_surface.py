@@ -87,8 +87,8 @@ CHECKER_CASES = (
 
 def test_sdk_version_pinned():
     assert sdk_module.SDK_SCHEMA_VERSION == 1
-    assert sdk_module.SDK_SURFACE_MINOR == 7
-    assert sdk_module.SDK_VERSION == "1.7"
+    assert sdk_module.SDK_SURFACE_MINOR == 8
+    assert sdk_module.SDK_VERSION == "1.8"
     assert sdk_module.SDK_VERSION == "%d.%d" % (
         sdk_module.SDK_SCHEMA_VERSION,
         sdk_module.SDK_SURFACE_MINOR,
