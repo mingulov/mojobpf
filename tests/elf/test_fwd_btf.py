@@ -187,12 +187,20 @@ def fwd_blob():
 
 
 def decl_tag_blob():
-    """Synthetic .BTF: INT 'x' + DECL_TAG 'tag' on type 1, idx -1."""
-    strings = b"\x00x\x00tag\x00"
+    """Synthetic .BTF: INT/STRUCT + DECL_TAG 'tag' on STRUCT, idx -1.
+
+    The tag targets the STRUCT (type 2): kernels only
+    accept FUNC/STRUCT/VAR/TYPEDEF as decl-tag targets
+    (btf_type_is_decl_tag_target), so an INT target
+    would be kernel-invalid.
+    """
+    strings = b"\x00x\x00s\x00a\x00tag\x00"
     types = b"".join([
         struct.pack("<III", 1, (1 << 24) | 0, 4),
         struct.pack("<I", 0x20),
-        struct.pack("<III", 3, (17 << 24) | 0, 1),
+        struct.pack("<III", 3, (4 << 24) | 1, 4),
+        struct.pack("<III", 5, 1, 0),
+        struct.pack("<III", 7, (17 << 24) | 0, 2),
         struct.pack("<i", -1),
     ])
     return _blob(types, strings)
