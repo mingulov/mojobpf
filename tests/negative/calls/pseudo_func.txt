@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Function-reference refusal index for F-CALLS/pseudo/func.
+#
+# BPF_PSEUDO_FUNC is the UAPI value 4 in the src_reg
+# of a 0x18 wide load. The value has no carrier:
+# the pinned backend never writes a kinded 0x18
+# word, every 0x18 pair in the production
+# map/core/subprog objects has src=0 (2/1/0
+# pairs), the name has zero tree surface in
+# src/compiler, and the cost collector refuses
+# src=4 with unsupported-code-reference. The UAPI
+# pin, the production absence, the zero surface,
+# and the cost refusal live in
+# compiler/tests/test_pseudo_func.py. This file
+# indexes the vectors so reviewers can audit
+# coverage without reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BPF_PSEUDO_FUNC 4 on 0x18 | test_bpf_pseudo_func_value | pinned vs installed bpf.h
+production wide loads | test_no_kinded_wide_load_in_production | src=0 on 2/1/0 pairs
+tree surface | test_zero_tree_surface | zero hits in src/compiler
+cost refusal | test_cost_refuses_pseudo_func | src=4 refused, src=0 baseline complete

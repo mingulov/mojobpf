@@ -76,6 +76,7 @@ OWNERS = {
         'compiler/tests/test_parsed_audit.py',
         'compiler/tests/test_parsed_elf.py',
         'compiler/tests/test_parsed_lowering.py',
+        'compiler/tests/test_pseudo_func.py',
         'compiler/tests/test_static_call.py',
         'compiler/tests/test_target_model.py',
         'compiler/tests/test_target_proof_table.py',
