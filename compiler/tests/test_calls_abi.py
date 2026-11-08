@@ -4,8 +4,10 @@
 BPF_CALL is the class-0x80 call operation; emitted
 helper calls encode as opcode 0x85 (BPF_JMP|BPF_CALL)
 with the helper ID in the 32-bit immediate and zero
-regs/offset. All 12 helpers admitted by every
-MojoBPF profile have lowering + emission proof
+regs/offset. The 12 helpers admitted across the
+profile union (seven in base/core/hash/lru/subprog/
+uprobe, plus 9/26 in -net, plus 131/132/133 in
+-reserve) have lowering + emission proof
 (reconciled in the leaf packet, review-verified).
 This suite pins the opcode, the encoding shape, and
 the representative emission (map route calls [1, 2],
@@ -62,8 +64,9 @@ BPF_CALL_CLASS = 0x80
 BPF_JMP_CLASS = 0x05
 BPF_OP_CALL = 0x85
 
-# The 12 admitted helper IDs, reconciled to existing
-# emission proof in the leaf packet.
+# The 12 helper IDs admitted across the profile
+# union, reconciled to existing emission proof in
+# the leaf packet.
 ADMITTED_TWELVE = (1, 2, 3, 5, 8, 9, 14, 26, 130, 131, 132, 133)
 
 
