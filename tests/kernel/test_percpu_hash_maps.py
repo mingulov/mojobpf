@@ -1208,7 +1208,8 @@ def guest_run():
         tuple(staged) + (HELPER_NAME, "data.bin", "guest_percpu_hash.sh"),
     )
     code, output = _run_guest(
-        ["vng", "--run", VNG_RELEASE, "--disable-kvm", "--cpus", "2",
+        ["vng", "--run", VNG_RELEASE,
+         *guest_proc.vng_accelerator_argv(), "--cpus", "2",
          "--exec", "bash %s" % script_path],
         stage,
         VNG_TIMEOUT,

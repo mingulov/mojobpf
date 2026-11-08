@@ -5,8 +5,9 @@ Pins the AArch64 lane lock (``ci/kernels.arm64.lock.json``) and
 the investigational compiler lock
 (``ci/toolchains.investigational.lock.json``) field by field, and
 guards the release freeze around them: the release toolchain
-pins, the two-lane x86-64 matrix lock, the 25-suite matrix
-shape, and the compatibility document's tested-only claims.
+pins, the four-lane x86-64 matrix lock (three KVM lanes plus the
+named TCG fallback), the 41-suite matrix shape, and the
+compatibility document's tested-only claims.
 The portability guest suite itself stays out of the matrix
 wiring; these tests assert that separation too.
 
@@ -377,9 +378,10 @@ def test_release_toolchain_pins_unchanged():
 def test_x86_matrix_shape_unchanged():
     lock = _load_json(X86_LOCK)
     assert [lane["id"] for lane in lock["lanes"]] == [
+        "v6.12-kvm",
+        "v6.6-kvm",
+        "v7.0.14-kvm",
         "v6.12-tcg",
-        "v6.6-tcg",
-        "v7.0.14-tcg",
     ]
     runner = _load_runner_module()
     # 28 release-cut suites + 12 R2 kernel-isa-* qual suites + R3
@@ -388,6 +390,71 @@ def test_x86_matrix_shape_unchanged():
     assert len(runner.SUITES) == 41
     paths = [relpath for (_suite_id, relpath, _timeout) in runner.SUITES]
     assert "tests/kernel/test_arch_portability.py" not in paths
+
+
+def test_x86_lanes_use_kvm_with_named_tcg_fallback():
+    """x86_64 lanes boot KVM; only v6.12-tcg may carry --disable-kvm.
+
+    Policy guard: TCG on x86_64 exists only as the one named
+    fallback lane (plus AArch64 cross-emulation, pinned in the
+    separate arm64 lock). Every other x86_64 lane must declare
+    ``accelerator: kvm`` with an argv prefix free of
+    ``--disable-kvm``.
+    """
+    lock = _load_json(X86_LOCK)
+    lanes = lock["lanes"]
+    assert len(lanes) >= 2, lanes
+    fallback = [
+        lane for lane in lanes if lane["id"] == "v6.12-tcg"
+    ]
+    assert [lane["id"] for lane in lanes].count("v6.12-tcg") == 1, (
+        [lane["id"] for lane in lanes]
+    )
+    (only,) = fallback
+    assert only["accelerator"] == "tcg", only
+    assert "--disable-kvm" in only["vng_argv_prefix"], only
+    for lane in lanes:
+        if lane["id"] == "v6.12-tcg":
+            continue
+        assert lane.get("arch", "x86_64") in (
+            "x86_64",
+            "amd64",
+        ), lane
+        assert lane["accelerator"] == "kvm", lane
+        assert "--disable-kvm" not in lane["vng_argv_prefix"], lane
+        assert lane["vng_argv_prefix"][:3] == [
+            "vng",
+            "--run",
+            lane["release"],
+        ], lane
+
+
+def test_matrix_suites_boot_the_lane_accelerator():
+    """Matrix suites take KVM/TCG from the lane, never hardcoded.
+
+    Every matrix suite boots through the shared
+    ``guest_proc.vng_accelerator_argv`` helper (which the matrix
+    runner drives per lane via ``MOJOBPF_VNG_ACCELERATOR``), so a
+    lock lane claiming KVM cannot silently boot TCG. A hardcoded
+    ``--disable-kvm`` in any matrix suite file fails this guard.
+    """
+    runner = _load_runner_module()
+    hardcoded = []
+    unmapped = []
+    for suite_id, relpath, _timeout in runner.SUITES:
+        path = os.path.join(REPO_ROOT, relpath)
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        if "--disable-kvm" in text:
+            hardcoded.append("%s (%s)" % (suite_id, relpath))
+        if "vng_accelerator_argv" not in text:
+            unmapped.append("%s (%s)" % (suite_id, relpath))
+    assert hardcoded == [], (
+        "matrix suites hardcoding --disable-kvm: %s" % hardcoded
+    )
+    assert unmapped == [], (
+        "matrix suites bypassing vng_accelerator_argv: %s" % unmapped
+    )
 
 
 def test_portability_suite_selects_lane_from_birth():
@@ -939,9 +1006,10 @@ def test_kernels_locks_are_reviewed():
     assert x86["status"] == "release-approved"
     assert arm64["status"] == "release-approved"
     assert [lane["id"] for lane in x86["lanes"]] == [
+        "v6.12-kvm",
+        "v6.6-kvm",
+        "v7.0.14-kvm",
         "v6.12-tcg",
-        "v6.6-tcg",
-        "v7.0.14-tcg",
     ]
     cache_root = os.path.join(
         os.path.expanduser("~"), ".cache", "virtme-ng"

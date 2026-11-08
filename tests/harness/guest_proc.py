@@ -359,6 +359,34 @@ def require_target_lease(caller):
         )
 
 
+VNG_ACCELERATOR_ENV = "MOJOBPF_VNG_ACCELERATOR"
+
+
+def vng_accelerator_argv(env=None):
+    """Return the ``vng --run`` argv fragment for the guest accelerator.
+
+    The matrix runner sets :data:`VNG_ACCELERATOR_ENV` per lane
+    from the lock; a standalone suite run (variable absent or
+    empty) boots KVM. ``\"tcg\"`` maps to ``[\"--disable-kvm\"]``
+    and ``\"kvm\"`` to ``[]``; anything else raises
+    :class:`ValueError` naming the variable and the observed
+    value, so a misspelled accelerator never boots the wrong
+    mode. ``env`` overrides the process environment for tests.
+    """
+    source = os.environ if env is None else env
+    value = source.get(VNG_ACCELERATOR_ENV, "")
+    if not value:
+        return []
+    if value == "kvm":
+        return []
+    if value == "tcg":
+        return ["--disable-kvm"]
+    raise ValueError(
+        "%s must be 'kvm' or 'tcg', got %r"
+        % (VNG_ACCELERATOR_ENV, value)
+    )
+
+
 def run_owned(argv, stage, timeout, log_name="guest.log"):
     """Run ``argv`` as an owned session leader; return (code, output).
 

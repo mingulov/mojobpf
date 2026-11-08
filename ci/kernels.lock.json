@@ -50,8 +50,71 @@
       "version": "1.41"
     }
   },
-  "generated_by": "tools/lock_refresh.py (reviewed; vng guest boots observed on fp43, lane debs carried over byte-identical)",
+  "generated_by": "tools/lock_refresh.py (reviewed; vng guest boots observed on fp43, lane debs carried over byte-identical; x86 lanes converted to KVM with the named v6.12-tcg fallback, debs/hashes unchanged)",
   "lanes": [
+    {
+      "accelerator": "kvm",
+      "id": "v6.12-kvm",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb",
+          "sha256": "3f156eab453866391b1939652829c67f4e4e9a9c18917d76751f41a26da4a330"
+        },
+        {
+          "file": "linux-modules-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb",
+          "sha256": "5c1bb612091143332f4ca1892086e29b676cc27c83f74cd2d48115203a0c72d8"
+        }
+      ],
+      "kernel_release": "6.12.0-061200-generic",
+      "release": "v6.12",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v6.12"
+      ]
+    },
+    {
+      "accelerator": "kvm",
+      "id": "v6.6-kvm",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-6.6.0-060600-generic_6.6.0-060600.202311151808_amd64.deb",
+          "sha256": "4534a0b1b8a27fad9d8a0d3f7daf198130f16d330327b533f510747926879ddd"
+        },
+        {
+          "file": "linux-modules-6.6.0-060600-generic_6.6.0-060600.202311151808_amd64.deb",
+          "sha256": "c8569e890db4d7d0eb7e76dd333dca3ed81636f6e814a28941734faaf722b543"
+        }
+      ],
+      "kernel_release": "6.6.0-060600-generic",
+      "release": "v6.6",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v6.6"
+      ]
+    },
+    {
+      "accelerator": "kvm",
+      "id": "v7.0.14-kvm",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-7.0.14-070014-generic_7.0.14-070014.202606271041_amd64.deb",
+          "sha256": "fb5e54e270e5aa40da7a404cbf448da176e26aba9c0deffb72639d1bc85b6ca9"
+        },
+        {
+          "file": "linux-modules-7.0.14-070014-generic_7.0.14-070014.202606271041_amd64.deb",
+          "sha256": "1a2f03d00d24f2f2fcd1e8b1b9b3e5b3754310383f08cf7a0600f2924ddff29c"
+        }
+      ],
+      "kernel_release": "7.0.14-070014-generic",
+      "release": "v7.0.14",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v7.0.14"
+      ]
+    },
     {
       "accelerator": "tcg",
       "id": "v6.12-tcg",
@@ -73,55 +136,11 @@
         "v6.12",
         "--disable-kvm"
       ]
-    },
-    {
-      "accelerator": "tcg",
-      "id": "v6.6-tcg",
-      "kernel_debs": [
-        {
-          "file": "linux-image-unsigned-6.6.0-060600-generic_6.6.0-060600.202311151808_amd64.deb",
-          "sha256": "4534a0b1b8a27fad9d8a0d3f7daf198130f16d330327b533f510747926879ddd"
-        },
-        {
-          "file": "linux-modules-6.6.0-060600-generic_6.6.0-060600.202311151808_amd64.deb",
-          "sha256": "c8569e890db4d7d0eb7e76dd333dca3ed81636f6e814a28941734faaf722b543"
-        }
-      ],
-      "kernel_release": "6.6.0-060600-generic",
-      "release": "v6.6",
-      "vng_argv_prefix": [
-        "vng",
-        "--run",
-        "v6.6",
-        "--disable-kvm"
-      ]
-    },
-    {
-      "accelerator": "tcg",
-      "id": "v7.0.14-tcg",
-      "kernel_debs": [
-        {
-          "file": "linux-image-unsigned-7.0.14-070014-generic_7.0.14-070014.202606271041_amd64.deb",
-          "sha256": "fb5e54e270e5aa40da7a404cbf448da176e26aba9c0deffb72639d1bc85b6ca9"
-        },
-        {
-          "file": "linux-modules-7.0.14-070014-generic_7.0.14-070014.202606271041_amd64.deb",
-          "sha256": "1a2f03d00d24f2f2fcd1e8b1b9b3e5b3754310383f08cf7a0600f2924ddff29c"
-        }
-      ],
-      "kernel_release": "7.0.14-070014-generic",
-      "release": "v7.0.14",
-      "vng_argv_prefix": [
-        "vng",
-        "--run",
-        "v7.0.14",
-        "--disable-kvm"
-      ]
     }
   ],
   "license": "Apache-2.0 WITH LLVM-exception",
   "notes": [
-    "Both lanes use software emulation (--disable-kvm, TCG) per their pinned argv. KVM hardware acceleration exists on fp43 (/dev/kvm is world-accessible) but the pinned lanes do not use it; a KVM lane needs its own lock entry and qualification.",
+    "x86-64 lanes boot with KVM hardware acceleration (no --disable-kvm in their pinned argv); v6.12-tcg is the one named TCG fallback lane (software emulation, --disable-kvm pinned) for the no-KVM spot-proof. AArch64 cross-emulation stays TCG in ci/kernels.arm64.lock.json.",
     "The runner binary is resolved via PATH at run time; its version and SHA-256 must match this lock. Absolute install paths are intentionally not pinned.",
     "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/; the .deb file names and hashes below identify the exact artifacts. A lane whose cache is absent fails the matrix; lanes are never silently skipped.",
     "execution-contract-v1: the runner entry is a console-script stub, so the lock also pins its exec chain (null here: the entry runs directly), the shebang interpreter hash, the first-party package modules, and the emulator image hash. Admission resolves each once and probes versions only after every static check passes.",

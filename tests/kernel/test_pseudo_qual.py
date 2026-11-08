@@ -412,7 +412,7 @@ def guest_run():
         tuple(staged) + ("data.bin", "guest_isa_pseudo.sh"),
     )
     returncode, output = _run_guest(
-        ["vng", "--run", VNG_RELEASE, "--disable-kvm",
+        ["vng", "--run", VNG_RELEASE, *guest_proc.vng_accelerator_argv(),
          "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )

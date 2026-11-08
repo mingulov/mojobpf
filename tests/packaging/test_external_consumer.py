@@ -1297,7 +1297,7 @@ def guest_run():
                 "and seal: %s" % _name
             )
     returncode, output = _run_guest(
-        [vng_path, "--run", VNG_RELEASE, "--disable-kvm",
+        [vng_path, "--run", VNG_RELEASE, *guest_proc.vng_accelerator_argv(),
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )

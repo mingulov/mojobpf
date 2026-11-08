@@ -455,7 +455,7 @@ def _executed_once():
     )
     try:
         returncode, output = run_guest(
-            ["vng", "--run", release, "--disable-kvm",
+            ["vng", "--run", release, *guest_proc.vng_accelerator_argv(),
              "--exec", "bash %s" % staged_script],
             stage,
             GUEST_TIMEOUT,

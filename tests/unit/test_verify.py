@@ -578,7 +578,7 @@ def test_release_env_override(monkeypatch=None):
 
 
 def test_kernels_lock_schema():
-    """The lane lockfile pins exactly two TCG lanes with hashes."""
+    """The lane lockfile pins three KVM lanes plus the TCG fallback."""
     with open(LOCK_PATH, encoding="utf-8") as handle:
         lock = json.load(handle)
     assert lock["schema_version"] == 1, lock
@@ -621,8 +621,12 @@ def test_kernels_lock_schema():
         assert dependency["record_sha256"] != "0" * 64, dependency
     assert distribution["emulator"]["qemu_version"] == runner["qemu"]
     lanes = lock["lanes"]
-    assert len(lanes) == 2, lanes
-    seen_releases = set()
+    assert [lane["id"] for lane in lanes] == [
+        "v6.12-kvm",
+        "v6.6-kvm",
+        "v7.0.14-kvm",
+        "v6.12-tcg",
+    ], lanes
     for lane in lanes:
         for key in (
             "id",
@@ -633,15 +637,21 @@ def test_kernels_lock_schema():
             "vng_argv_prefix",
         ):
             assert key in lane, (lane, key)
-        assert lane["accelerator"] == "tcg", lane
-        assert lane["vng_argv_prefix"] == [
-            "vng",
-            "--run",
-            lane["release"],
-            "--disable-kvm",
-        ], lane
-        assert lane["release"] not in seen_releases, lanes
-        seen_releases.add(lane["release"])
+        if lane["id"] == "v6.12-tcg":
+            assert lane["accelerator"] == "tcg", lane
+            assert lane["vng_argv_prefix"] == [
+                "vng",
+                "--run",
+                lane["release"],
+                "--disable-kvm",
+            ], lane
+        else:
+            assert lane["accelerator"] == "kvm", lane
+            assert lane["vng_argv_prefix"] == [
+                "vng",
+                "--run",
+                lane["release"],
+            ], lane
         assert len(lane["kernel_debs"]) >= 1, lane
         for deb in lane["kernel_debs"]:
             assert deb["file"].endswith(".deb"), deb
@@ -3207,22 +3217,30 @@ def test_resolve_lane_against_checkout_lock():
     assert lane["vng_argv_prefix"] == [
         "vng", "--run", "v6.12", "--disable-kvm",
     ], lane
-    lane = resolve_lane("v6.6", "tcg")
-    assert lane["id"] == "v6.6-tcg", lane
+    lane = resolve_lane("v6.6", "kvm")
+    assert lane["id"] == "v6.6-kvm", lane
+    assert lane["vng_argv_prefix"] == [
+        "vng", "--run", "v6.6",
+    ], lane
     try:
         resolve_lane("v9.99", "tcg", LOCK_PATH)
     except VerifyError as exc:
         assert "matches no lane" in str(exc), exc
         assert "v6.12/tcg" in str(exc), exc
-        assert "v6.6/tcg" in str(exc), exc
+        assert "v6.6/kvm" in str(exc), exc
     else:
         raise AssertionError("unlisted release resolved")
+    lane = resolve_lane("v6.12", "kvm", LOCK_PATH)
+    assert lane["id"] == "v6.12-kvm", lane
+    assert lane["vng_argv_prefix"] == [
+        "vng", "--run", "v6.12",
+    ], lane
     try:
-        resolve_lane("v6.12", "kvm", LOCK_PATH)
+        resolve_lane("v6.6", "tcg", LOCK_PATH)
     except VerifyError as exc:
         assert "matches no lane" in str(exc), exc
     else:
-        raise AssertionError("unlisted accelerator resolved")
+        raise AssertionError("removed TCG lane resolved")
     try:
         resolve_lane("v6.12\n", "tcg", LOCK_PATH)
     except VerifyError as exc:

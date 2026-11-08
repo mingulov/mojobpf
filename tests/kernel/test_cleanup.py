@@ -399,7 +399,7 @@ def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
         )
     try:
         returncode, output = guest_proc.run_owned(
-            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
+            ["vng", "--run", VNG_RELEASE, *guest_proc.vng_accelerator_argv(),
              "--exec", "bash %s" % script_path],
             fix["stage"], timeout,
             log_name=name + ".log",
@@ -1487,7 +1487,7 @@ def test_owned_runner_classification():
     """
     fix = fixture()
     owned_cmdline = (
-        "vng --run %s --disable-kvm --exec bash %s/guest_verify.sh "
+        "vng --run %s --exec bash %s/guest_verify.sh "
         % (VNG_RELEASE, fix["stage"])
     )
     assert _is_owned_runner(2**30 + 7, owned_cmdline), (

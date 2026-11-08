@@ -1300,7 +1300,8 @@ def guest_run():
         ]
     else:
         argv = [
-            "vng", "--run", VNG_RELEASE, "--disable-kvm",
+            "vng", "--run", VNG_RELEASE,
+            *guest_proc.vng_accelerator_argv(),
             "--exec", "bash %s" % script_path,
         ]
     code, output = _run_guest(argv, stage, VNG_TIMEOUT)

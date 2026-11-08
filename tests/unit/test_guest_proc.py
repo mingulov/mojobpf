@@ -7066,6 +7066,56 @@ def test_roundtrip_parse_fields_scopes_preamble():
         raise AssertionError("doubled preamble field must refuse")
 
 
+def test_vng_accelerator_argv_maps_lane_values():
+    helper = _load_helper()
+    assert helper.VNG_ACCELERATOR_ENV == "MOJOBPF_VNG_ACCELERATOR"
+    assert helper.vng_accelerator_argv(
+        {helper.VNG_ACCELERATOR_ENV: "kvm"}
+    ) == []
+    assert helper.vng_accelerator_argv(
+        {helper.VNG_ACCELERATOR_ENV: "tcg"}
+    ) == ["--disable-kvm"]
+
+
+def test_vng_accelerator_argv_defaults_to_kvm():
+    helper = _load_helper()
+    assert helper.vng_accelerator_argv({}) == []
+    assert helper.vng_accelerator_argv(
+        {helper.VNG_ACCELERATOR_ENV: ""}
+    ) == []
+
+
+def test_vng_accelerator_argv_rejects_unknown():
+    helper = _load_helper()
+    for bogus in ("bogus", "KVM", " hvm", "hvf", "hyperv"):
+        try:
+            helper.vng_accelerator_argv(
+                {helper.VNG_ACCELERATOR_ENV: bogus}
+            )
+        except ValueError as exc:
+            assert helper.VNG_ACCELERATOR_ENV in str(exc), exc
+            assert bogus in str(exc), exc
+        else:
+            raise AssertionError(
+                "accelerator %r admitted" % bogus
+            )
+
+
+def test_vng_accelerator_argv_reads_process_env():
+    helper = _load_helper()
+    saved = os.environ.get(helper.VNG_ACCELERATOR_ENV)
+    try:
+        os.environ.pop(helper.VNG_ACCELERATOR_ENV, None)
+        assert helper.vng_accelerator_argv() == []
+        os.environ[helper.VNG_ACCELERATOR_ENV] = "tcg"
+        assert helper.vng_accelerator_argv() == ["--disable-kvm"]
+    finally:
+        if saved is None:
+            os.environ.pop(helper.VNG_ACCELERATOR_ENV, None)
+        else:
+            os.environ[helper.VNG_ACCELERATOR_ENV] = saved
+
+
 def _direct_names():
     return sorted(
         name

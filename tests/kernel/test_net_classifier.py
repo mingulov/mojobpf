@@ -533,7 +533,7 @@ def guest_run():
         guest_proc.active_recorder(), stage, tuple(staged_names),
     )
     returncode, output = _run_guest(
-        ["vng", "--run", VNG_RELEASE, "--disable-kvm",
+        ["vng", "--run", VNG_RELEASE, *guest_proc.vng_accelerator_argv(),
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )

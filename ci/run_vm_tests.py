@@ -6,20 +6,21 @@ tracepoint/event/lifecycle tracing proofs, the verifier kernel
 and license suites, the external-consumer suite, and the
 cleanup suite) in each lane pinned by ``ci/kernels.lock.json``
 with the same committed source tree, and reports one board. The tree must be committed first:
-a dirty tree is refused up front so both lanes provably test the
+a dirty tree is refused up front so all lanes provably test the
 same bits. A lane whose cached kernel image is absent fails the run;
 lanes are never silently skipped.
 
-Each suite boots its own disposable guests through ``vng`` (software
-emulation, as pinned); the host itself only compiles. Lane selection
-reaches the suites through ``MOJOBPF_VNG_RELEASE``; every suite
-defaults to the primary lane when the variable is unset, so
-standalone runs are unchanged.
+Each suite boots its own disposable guests through ``vng`` (as
+pinned per lane: KVM, except the named TCG fallback); the host
+itself only compiles. Lane selection reaches the suites through
+``MOJOBPF_VNG_RELEASE`` and the lane accelerator through
+``MOJOBPF_VNG_ACCELERATOR``; every suite defaults to the primary
+lane with KVM when the variables are unset.
 
 Usage::
 
     python3 ci/run_vm_tests.py [--lock ci/kernels.lock.json]
-        [--lane v6.12-tcg] [--suite kernel-xdp] [--out-dir DIR]
+        [--lane v6.12-kvm] [--suite kernel-xdp] [--out-dir DIR]
         [--timeout SECS] [--consumer-path DIR]
 
 The ``packaging-*`` consumer suites build with an independently
@@ -2218,6 +2219,14 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
         return record
     env = dict(os.environ)
     env["MOJOBPF_VNG_RELEASE"] = lane["release"]
+    # The suite boots the lane's pinned accelerator through the
+    # shared helper: KVM lanes boot without --disable-kvm, the
+    # named TCG fallback lane boots with it. Set from the
+    # validated lock (never trusted from the incoming
+    # environment), so the recorded accelerator is the booted one.
+    # load_lock requires the key; the get-default mirrors
+    # lane_target_manifest for hand-built lanes.
+    env["MOJOBPF_VNG_ACCELERATOR"] = lane.get("accelerator", "tcg")
     # The matrix never synthesizes a target lease: the
     # incoming environment propagates verbatim, so an absent
     # or "0" lease stays unleased and the execution paths

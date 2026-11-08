@@ -568,7 +568,7 @@ def guest_run():
     )
     exit_code, output = _run_guest(
         [
-            "vng", "--run", release, "--disable-kvm",
+            "vng", "--run", release, *guest_proc.vng_accelerator_argv(),
             "--exec", "bash %s" % script_path,
         ],
         stage,
