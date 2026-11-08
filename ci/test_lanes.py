@@ -57,6 +57,7 @@ OWNERS = {
         'tests/packaging/test_wheel_contents.py',
     ),
     'compiler': (
+        'compiler/tests/test_calls_abi.py',
         'compiler/tests/test_ir_roundtrip.py',
         'compiler/tests/test_isa_alu32.py',
         'compiler/tests/test_isa_alu64.py',

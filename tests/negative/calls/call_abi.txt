@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Helper-call index for F-CALLS/call/helper-abi.
+#
+# BPF_CALL is the class-0x80 call operation; emitted
+# helper calls encode as opcode 0x85 with the helper
+# ID in the 32-bit immediate. All 12 admitted helpers
+# have lowering + emission proof (reconciled in the
+# leaf packet). The opcode pin, the encoding shape,
+# and the representative emission live in
+# compiler/tests/test_calls_abi.py. This file indexes
+# the vectors so reviewers can audit coverage without
+# reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BPF_CALL 0x80 / insn 0x85 | test_bpf_call_opcode | pinned vs installed bpf.h
+call encoding shape | test_call_encoding_shape | zero regs/offset, imm in admitted 12
+map production build | test_emitted_call_immediates | 0x85 calls [1, 2]
+core production build | test_emitted_call_immediates | 0x85 calls [1]
+admitted twelve | packet reconcile table | each ID mapped to emission proof
