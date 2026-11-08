@@ -46,6 +46,13 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "btf:FLOAT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_float_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "btf:FUNC": {
       "evidence_level": "tested",
       "evidence_refs": [
