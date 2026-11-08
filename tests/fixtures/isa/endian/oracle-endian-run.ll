@@ -6,10 +6,12 @@
 ; END words), so the swaps feed an xor-combination instead.
 ; Every SKIPPED swap flips the verdict (skip@8/skip@13 ->
 ; 0x0906, skip@10 -> 0x0201, vs 258), proving each swap
-; executes. Width errors are verdict-invisible on these
-; packets (the u32/u64 lanes contribute lo16-zero under any
-; width) and are caught by the exact-word structural pins
-; instead — no width-sensitivity is claimed here.
+; executes. Width errors are verdict-visible except the
+; 32<->64 substitutions on the u32/u64 lanes: those keep 258
+; (lo16-zero either way) and are caught by the exact-word
+; structural pins instead. (The u16 lane flips under any
+; width change; 16-bit substitutions on the wide lanes
+; yield 0x050A.)
 ; Zero packet: 0. Mixed packet (bytes 14..17 = 1,2,4,8):
 ; 0x0102 ^ 0x0000 ^ 0x0000 = 258.
 target datalayout = "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
