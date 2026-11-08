@@ -58,6 +58,7 @@ OWNERS = {
     ),
     'compiler': (
         'compiler/tests/test_calls_abi.py',
+        'compiler/tests/test_exit_return.py',
         'compiler/tests/test_ir_roundtrip.py',
         'compiler/tests/test_isa_alu32.py',
         'compiler/tests/test_isa_alu64.py',

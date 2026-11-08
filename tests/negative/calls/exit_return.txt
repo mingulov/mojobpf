@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Return-emission index for F-CALLS/exit/return.
+#
+# BPF_EXIT is the class-0x90 return operation;
+# emitted returns encode as opcode 0x95 with zero
+# regs/offset/imm (canonical). Every production
+# program ends in exactly one trailing 0x95 (map:
+# 22 insns, exit at 21; core: 15 insns, exit at
+# 14). The opcode pin, the encoding shape, and
+# the trailing-singleton emission live in
+# compiler/tests/test_exit_return.py. This file
+# indexes the vectors so reviewers can audit
+# coverage without reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BPF_EXIT 0x90 / insn 0x95 | test_bpf_exit_opcode | pinned vs installed bpf.h
+exit encoding shape | test_exit_encoding_shape | zero regs/offset/imm on both routes
+map production build | test_trailing_singleton_exit | 22 insns, single exit at 21
+core production build | test_trailing_singleton_exit | 15 insns, single exit at 14
