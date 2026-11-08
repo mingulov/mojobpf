@@ -25,6 +25,20 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "btf:ENUM": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_enum_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:ENUM64": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_enum_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "btf:FUNC": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -81,6 +95,13 @@
       "evidence_level": "tested",
       "evidence_refs": [
         "host:tests/elf/test_modifier_btf.py"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:UNION": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_enum_btf.py"
       ],
       "implementation_state": "IMPLEMENTED"
     },
