@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Static-call index for F-CALLS/pseudo/static-call.
+#
+# BPF_PSEUDO_CALL is the UAPI value 1 in the src_reg
+# of a 0x85 call; imm is -1 pending an R_BPF_64_32
+# (type 10) relocation against the defined callee.
+# The production parsed-route decision build emits
+# exactly one static call at 0x38. Admission is
+# exactly linux-bpfel-v3-subprog (per-profile view
+# + both descriptors). The 0x8D encoding is refused
+# everywhere (artifact-contract probe). The value
+# pin, the production-route encoding, the admission
+# view, and the inspect gate live in
+# compiler/tests/test_static_call.py. This file
+# indexes the vectors so reviewers can audit
+# coverage without reading the test body.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+BPF_PSEUDO_CALL 1 on 0x85 | test_bpf_pseudo_call_value | pinned vs installed bpf.h; no 0x8D emitted
+static-call encoding | test_static_call_encoding | one site at 0x38, src=1/imm=-1, reloc-10 vs decide
+subprog admission | test_subprog_admission | True on exactly -subprog, descriptors agree
+production inspect gate | test_production_inspect_gate | subprog ok / base MBPF406+MBPF407
