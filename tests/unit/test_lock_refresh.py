@@ -165,6 +165,10 @@ def _make_inventory(workdir):
         os.path.join(adapter_dir, "mojo_ir_adapter.py"),
         b"# fixture adapter\n",
     )
+    _write(
+        os.path.join(adapter_dir, "admission.json"),
+        b'{"fixture": true}\n',
+    )
     return {
         "bindir": bindir,
         "realdir": realdir,
@@ -340,8 +344,13 @@ def test_toolchains_generate_records_pins_and_report():
             os.path.join(fix["adapter_dir"], "adapter_service.py")
         )
         assert set(lock["adapter"]["siblings"]) == {
-            "audit.py", "mojo_ir_adapter.py"
+            "audit.py", "mojo_ir_adapter.py", "admission.json"
         }
+        assert lock["adapter"]["siblings"]["admission.json"] == (
+            _sha256_file(
+                os.path.join(fix["adapter_dir"], "admission.json")
+            )
+        )
         assert "vm" not in lock
         assert document["tool"] == "tools/lock_refresh.py"
         assert document["kind"] == "toolchains"
@@ -373,6 +382,38 @@ def test_toolchains_generate_records_pins_and_report():
         assert document["outputs"]["lock_sha256"] == (
             hashlib.sha256(raw).hexdigest()
         )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_toolchains_generate_refuses_lock_without_admission_descriptor():
+    # The driver requires the admission.json sibling pin for
+    # default-adapter builds; a regenerated lock without it fails
+    # every build (MBPF104), so generation refuses instead of
+    # emitting an unusable lock, and writes neither output.
+    tool = _load_tool()
+    workdir = tempfile.mkdtemp(prefix="lock-refresh-noadmission-")
+    try:
+        fix = _make_inventory(workdir)
+        os.unlink(
+            os.path.join(fix["adapter_dir"], "admission.json")
+        )
+        out = os.path.join(workdir, "toolchains.lock.json")
+        report = os.path.join(workdir, "report.json")
+        code = tool.main(
+            [
+                "generate",
+                "--kind", "toolchains",
+                "--inventory", fix["inventory"],
+                "--pixi-lock", fix["pixi_lock"],
+                "--adapter-dir", fix["adapter_dir"],
+                "--out", out,
+                "--report", report,
+            ]
+        )
+        assert code == 2, code
+        assert not os.path.exists(out)
+        assert not os.path.exists(report)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

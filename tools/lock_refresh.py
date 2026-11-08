@@ -388,6 +388,16 @@ def generate_toolchains(*, inventory, pixi_lock, adapter_dir):
         if not name.endswith(".py") or name == "adapter_service.py":
             continue
         siblings[name] = sha256_file(os.path.join(adapter_dir, name))
+    # The driver requires the admission descriptor pin for
+    # default-adapter builds; a lock without it fails every build,
+    # so generation refuses instead of emitting an unusable lock.
+    descriptor_path = os.path.join(adapter_dir, "admission.json")
+    if not os.path.isfile(descriptor_path):
+        raise LockRefreshError(
+            "adapter admission descriptor missing under %s; refusing "
+            "a lock without adapter pins" % adapter_dir
+        )
+    siblings["admission.json"] = sha256_file(descriptor_path)
     adapter = {
         "note": (
             "execution-contract-v1 pins for the packaged default "

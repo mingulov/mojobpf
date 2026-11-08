@@ -5,6 +5,19 @@
 # A wheel built from this sdist regenerates from these files; the
 # build hook refuses to package stale bytes without them.
 include tools/generate_adapter_resources.py
+# Lock regeneration for machines the reviewed pins do not cover
+# (docs/install.md): the refresh tool plus the inventory probe it
+# consumes. Both run from an unpacked archive with no checkout.
+include tools/lock_refresh.py
+include tests/probes/toolchain_inventory.py
+# compiler/tests/test_isa_jmp.py imports CFG-walk helpers from
+# tests/kernel/test_jmp_qual.py (plus its harness seam) and reads
+# the jmp fixtures; the archive must carry that closure for its
+# own test collection (test_archive_python_tests_collect_without_checkout)
+# to resolve without a checkout.
+include tests/kernel/test_jmp_qual.py
+include tests/harness/lane_lock.py tests/harness/guest_proc.py tests/harness/tool_admission.py
+recursive-include tests/fixtures/isa/jmp *
 graft compiler
 
 # Public source-archive documentation and standalone inputs.

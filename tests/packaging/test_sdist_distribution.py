@@ -293,6 +293,40 @@ def test_archive_native_fixture_imports_without_checkout(distribution):
     assert result.returncode == 0, (result.stdout, result.stderr)
 
 
+def test_archive_lock_regeneration_inputs_runnable_without_checkout(distribution):
+    # Machines the reviewed pins do not cover (docs/install.md)
+    # regenerate the toolchain lock from the archive alone: the
+    # refresh tool and the inventory probe it consumes must both
+    # ship in the archive and run with no checkout. Spawn-free
+    # (--help plus one fail-closed input error); the genuine
+    # inventory/generate flow is proven live from a clean clone.
+    work, exported, source, _ = distribution
+    for name in ("tools/lock_refresh.py",
+                 "tests/probes/toolchain_inventory.py"):
+        assert (source / name).is_file(), "archive omitted " + name
+    result = run_archive_python(work, exported, source,
+                                ["tools/lock_refresh.py", "--help"])
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "generate" in result.stdout and "verify" in result.stdout
+    result = run_archive_python(work, exported, source,
+                                ["tests/probes/toolchain_inventory.py",
+                                 "--help"])
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "--output" in result.stdout
+    result = run_archive_python(work, exported, source,
+                                ["tools/lock_refresh.py", "generate",
+                                 "--kind", "toolchains",
+                                 "--inventory", "missing-inventory.json",
+                                 "--pixi-lock", "pixi.lock",
+                                 "--adapter-dir", "compiler",
+                                 "--out", "out.lock.json",
+                                 "--report", "out.report.json"])
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "cannot read inventory" in result.stderr
+    assert not (source / "out.lock.json").exists()
+    assert not (source / "out.report.json").exists()
+
+
 def _collect_archive_packaging(work, exported, source):
     import hashlib
     helper_sha = hashlib.sha256((ROOT / "tests/harness/packaging_source.py").read_bytes()).hexdigest()

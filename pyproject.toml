@@ -37,11 +37,17 @@ mojobpf = [
 
 [tool.setuptools.data-files]
 "share/mojobpf/schemas" = [
-    "schemas/target.schema.json",
-    "schemas/fixture.schema.json",
-    "schemas/run-plan.schema.json",
-    "schemas/result.schema.json",
+    "schemas/artifact.schema.json",
+    "schemas/capability.schema.json",
     "schemas/cost.schema.json",
+    "schemas/diagnostics.schema.json",
+    "schemas/evidence.schema.json",
+    "schemas/fixture.schema.json",
+    "schemas/manifest.schema.json",
+    "schemas/result.schema.json",
+    "schemas/run-plan.schema.json",
+    "schemas/size-budget.schema.json",
+    "schemas/target.schema.json",
 ]
 
 [tool.setuptools]

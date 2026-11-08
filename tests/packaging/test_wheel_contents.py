@@ -6,9 +6,9 @@ Builds the ``mojobpf`` wheel offline (``pip wheel --no-deps
 content) and pins its contract:
 
 * the payload is exactly the Python tool modules, the validation
-  package modules, the seven Mojo SDK sources, and the three
+  package modules, the eight Mojo SDK sources, and the three
   adapter scripts plus the admission descriptor (byte-identical
-  to the tree), with the five contract schemas shipped as
+  to the tree), with the eleven contract schemas shipped as
   versioned wheel data files;
 * the console script, license texts, and metadata (name, version,
   Python floor, SPDX grant) are present and agree with the tree;
@@ -91,10 +91,16 @@ PINNED_PAYLOAD = (
 # "<dist>.data/data/" prefix), pinned by basename. A new,
 # removed, or renamed shipped schema fails here until reviewed.
 PINNED_SCHEMA_DATA = (
+    "artifact.schema.json",
+    "capability.schema.json",
     "cost.schema.json",
+    "diagnostics.schema.json",
+    "evidence.schema.json",
     "fixture.schema.json",
+    "manifest.schema.json",
     "result.schema.json",
     "run-plan.schema.json",
+    "size-budget.schema.json",
     "target.schema.json",
 )
 
@@ -351,6 +357,15 @@ def test_validation_sources_sync():
 
 
 def test_schemas_shipped_byte_identical():
+    # The wheel ships every tree schema: a contract schema added
+    # to schemas/ without a packaging pin fails here, never
+    # silently absent from installed environments.
+    tree_schemas = sorted(
+        entry
+        for entry in os.listdir(os.path.join(REPO_ROOT, "schemas"))
+        if entry.endswith(".schema.json")
+    )
+    assert tuple(tree_schemas) == PINNED_SCHEMA_DATA, tree_schemas
     prefix = "mojobpf-%s.data/data/share/mojobpf/schemas/" % (
         tree_version()
     )
