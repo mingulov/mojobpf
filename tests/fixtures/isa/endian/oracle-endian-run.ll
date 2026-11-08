@@ -3,8 +3,13 @@
 ; program returning bswap16(u16@[14]) ^ lo16(bswap32(u32@[16]))
 ; ^ lo16(bswap64(u64@[16])) as its action. The backend
 ; inverts direct swapped==const comparisons (eliminating the
-; END words), so the swaps feed an xor-combination instead:
-; every skipped or wrong-width swap flips the verdict.
+; END words), so the swaps feed an xor-combination instead.
+; Every SKIPPED swap flips the verdict (skip@8/skip@13 ->
+; 0x0906, skip@10 -> 0x0201, vs 258), proving each swap
+; executes. Width errors are verdict-invisible on these
+; packets (the u32/u64 lanes contribute lo16-zero under any
+; width) and are caught by the exact-word structural pins
+; instead — no width-sensitivity is claimed here.
 ; Zero packet: 0. Mixed packet (bytes 14..17 = 1,2,4,8):
 ; 0x0102 ^ 0x0000 ^ 0x0000 = 258.
 target datalayout = "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
