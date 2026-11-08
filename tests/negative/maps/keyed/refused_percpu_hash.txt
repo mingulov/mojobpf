@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Refused per-CPU-hash corpus index for M-KEYED/map/percpu-hash.
+# Refused per-CPU-hash corpus index for the per-CPU-hash map kind.
 #
 # The vectors live in tests/compile/percpuhash_*.mojo,
 # tests/compile/maps_percpuhash_*.mojo, and

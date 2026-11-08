@@ -1153,7 +1153,7 @@ def closure_fixture(tmp_path,controller,monkeypatch):
     original={"status":"PASS","files":original_rows,"sha256":digest_of(original_rows)}
     supplement={"status":"PASS","files":supplement_rows,"sha256":digest_of(supplement_rows),"modules":1}
     wheel_files={"mojobpf/__init__.py":b"# fixture\n","mojobpf/target_controller.py":b"# fixture controller\n","mojobpf/cli.py":b"def main(): return 0\n","mojobpf/resources/adapter/admission.json":b"{}\n","mojobpf-0.2.0.dist-info/licenses/LICENSE":b"fixture license\n","mojobpf-0.2.0.dist-info/METADATA":b"Metadata-Version: 2.4\nName: mojobpf\nVersion: 0.2.0\n","mojobpf-0.2.0.dist-info/WHEEL":b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n","mojobpf-0.2.0.dist-info/entry_points.txt":b"[console_scripts]\nmojobpf = mojobpf.cli:main\n","mojobpf-0.2.0.dist-info/top_level.txt":b"mojobpf\n","mojobpf-0.2.0.dist-info/RECORD":b"mojobpf-0.2.0.dist-info/RECORD,,\n"}
-    for name in ["cost","fixture","result","run-plan","target"]:wheel_files["mojobpf-0.2.0.data/data/share/mojobpf/schemas/"+name+".schema.json"]=b'{"type":"object"}\n'
+    for name in ["artifact","capability","cost","diagnostics","evidence","fixture","manifest","result","run-plan","size-budget","target"]:wheel_files["mojobpf-0.2.0.data/data/share/mojobpf/schemas/"+name+".schema.json"]=b'{"type":"object"}\n'
     wheel_raw=io.BytesIO()
     with zipfile.ZipFile(wheel_raw,"w",compression=zipfile.ZIP_DEFLATED) as archive:
         for name,raw in sorted(wheel_files.items()):archive.writestr(name,raw)
@@ -1225,6 +1225,12 @@ def test_complete_real_shaped_closure_and_wheel_mapping(tmp_path,controller,monk
     assert proof["files"]==len(distribution["files"])
     assert proof["wheel_members"]==len(distribution["producer"]["wheel_members"])
     assert proof["inventories"]==len(distribution["inventories"])
+
+
+def test_wheel_admission_schema_pin_matches_tree(controller):
+    root=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tree=sorted(entry for entry in os.listdir(os.path.join(root,"schemas")) if entry.endswith(".schema.json"))
+    assert tuple(tree)==tuple(controller._SHIPPED_SCHEMA_NAMES),tree
 
 
 @pytest.mark.parametrize("defect",["file-bytes","mode","empty-dir-inventory","farm-root","runtime-root","schema-mapping","metadata-source","record-mapping","generated-entrypoint","rootfs-role","excluded-sidecar","module-role","duplicate-member","missing-member","extra-sibling","ancestor-link"])

@@ -1790,7 +1790,7 @@ def parse_reported_hashes(output):
     return reported
 
 
-# Typed harness-record mapping (F-040): branch the harness
+# Typed harness-record mapping: branch the harness
 # classification before the exit assertion, so a degraded guest
 # (environment record) can never surface as a product FAIL. The
 # table below maps the bpf_test_run contract revision 2
@@ -2042,7 +2042,7 @@ def combine_outcomes(*hints):
     return ("PASS", None)
 
 
-# Unified guest-exit rule (F-043). A nonzero guest exit maps by
+# Unified guest-exit rule. A nonzero guest exit maps by
 # transcript evidence, identically in every suite: completed
 # proof evidence (a harness record with a product-failure
 # classification, or a suite-declared product marker) means the
@@ -2094,7 +2094,7 @@ def classify_guest_exit(returncode, output, *, records=(),
     return "proof"
 
 
-# Suite-result emission (F-049): the structured result protocol
+# Suite-result emission: the structured result protocol
 # between suites and the matrix runner. Each suite seals one
 # immutable run plan (case IDs, target, revisions, input hashes,
 # typed expectations), records one case result per case, runs the

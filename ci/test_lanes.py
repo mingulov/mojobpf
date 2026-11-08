@@ -38,6 +38,7 @@ OWNERS = {
         'tests/unit/test_hostile_inputs.py',
         'tests/unit/test_inspect_btf.py',
         'tests/unit/test_lane_lock.py',
+        'tests/unit/test_leakage_guard.py',
         'tests/unit/test_manifest.py',
         'tests/unit/test_matrix_runner.py',
         'tests/unit/test_mirror_sync.py',

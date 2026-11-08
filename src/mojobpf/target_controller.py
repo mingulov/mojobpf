@@ -806,6 +806,23 @@ _CLOSURE_COUNTS = {"files": 65536, "inventories": 16384, "edges": 65536,
 _WHEEL_BYTES = 64 * 1024 * 1024
 _WHEEL_EXPANDED = 256 * 1024 * 1024
 _WHEEL_MEMBER_BYTES = 32 * 1024 * 1024
+# Exact wheel data-file names the install admission accepts under
+# share/mojobpf/schemas/ (wheel contract; mirrors the
+# test_wheel_contents.py pin — a schema file added to schemas/
+# without updating this tuple fails admission here, never silently).
+_SHIPPED_SCHEMA_NAMES = (
+    "artifact.schema.json",
+    "capability.schema.json",
+    "cost.schema.json",
+    "diagnostics.schema.json",
+    "evidence.schema.json",
+    "fixture.schema.json",
+    "manifest.schema.json",
+    "result.schema.json",
+    "run-plan.schema.json",
+    "size-budget.schema.json",
+    "target.schema.json",
+)
 _RUNTIME_FILE_BYTES = 4 * 1024**3
 _RUNTIME_TOTAL_BYTES = 16 * 1024**3
 _CLOSURE_ROLES = {"controller", "runtime", "original_closure", "supplemental_closure",
@@ -1387,8 +1404,8 @@ class _ClosureVerifier:
             _require(row["installed_path"] == destination and destination not in destinations and _inside(destination, install)
                      and destination in self.roles["controller"], "installed member mapping differs")
             destinations.add(destination); self._regular(destination, row["sha256"], row["size"])
-        _require(schema_members == {"share/mojobpf/schemas/" + name + ".schema.json" for name in ("cost", "fixture", "result", "run-plan", "target")},
-                 "five shipped schemas are not mapped exactly")
+        _require(schema_members == {"share/mojobpf/schemas/" + name for name in _SHIPPED_SCHEMA_NAMES},
+                 "shipped schemas are not mapped exactly")
         generated, kinds = set(), {}
         allowed_generated = {scheme["purelib"] + "/" + distinfo + "/" + basename: kind for basename, kind in
                              (("RECORD", "record"), ("INSTALLER", "installer"), ("REQUESTED", "requested"), ("direct_url.json", "direct_url"))}
