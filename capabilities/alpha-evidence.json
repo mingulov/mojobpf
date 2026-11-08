@@ -618,6 +618,15 @@
       "implementation_state": "IMPLEMENTED"
     }
   },
+  "isa:BPF_ABS": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_legacy.py",
+      "matrix:v6.12-tcg/kernel-isa-legacy",
+      "matrix:v6.6-tcg/kernel-isa-legacy"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_ATOMIC": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -687,6 +696,15 @@
       "host:compiler/tests/test_isa_mem.py",
       "matrix:v6.12-tcg/kernel-isa-mem",
       "matrix:v6.6-tcg/kernel-isa-mem"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_IND": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_legacy.py",
+      "matrix:v6.12-tcg/kernel-isa-legacy",
+      "matrix:v6.6-tcg/kernel-isa-legacy"
     ],
     "implementation_state": "IMPLEMENTED"
   },
@@ -843,6 +861,15 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_LEN": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_legacy.py",
+      "matrix:v6.12-tcg/kernel-isa-legacy",
+      "matrix:v6.6-tcg/kernel-isa-legacy"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_LOAD_ACQ": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -876,6 +903,15 @@
       "host:compiler/tests/test_isa_endian.py",
       "matrix:v6.12-tcg/kernel-isa-endian",
       "matrix:v6.6-tcg/kernel-isa-endian"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_MSH": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_legacy.py",
+      "matrix:v6.12-tcg/kernel-isa-legacy",
+      "matrix:v6.6-tcg/kernel-isa-legacy"
     ],
     "implementation_state": "IMPLEMENTED"
   },
