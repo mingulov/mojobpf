@@ -102,6 +102,7 @@ SUITES = (
     ("kernel-isa-pseudo", "tests/kernel/test_pseudo_qual.py", 1500),
     ("kernel-isa-jmp", "tests/kernel/test_jmp_qual.py", 1500),
     ("kernel-isa-jcc", "tests/kernel/test_jcc_qual.py", 1500),
+    ("kernel-isa-atomic", "tests/kernel/test_atomic_qual.py", 1500),
     ("kernel-map", "tests/kernel/test_map_roundtrip.py", 1500),
     ("kernel-packet", "tests/kernel/test_packet_sdk.py", 1500),
     ("kernel-parse", "tests/kernel/test_parse_checksum_sdk.py", 1500),
@@ -211,6 +212,16 @@ SUITE_CASES = {
         "test_jcc_guest_objects_admit_jcc  "
         "test_jcc_mutation_aborts  "
         "test_jcc_stale_object_fails test_fixture_bytes  "
+        "test_guest_provenance"
+    ).split(),
+    "kernel-isa-atomic": (
+        "test_atomic_c_zero_returns_pass  "
+        "test_atomic_c_mixed_returns_drop  "
+        "test_atomic_oracles_execute  "
+        "test_atomic_acqrel_refused  "
+        "test_atomic_guest_objects_admit_atomics  "
+        "test_atomic_mutation_aborts  "
+        "test_atomic_stale_object_fails test_fixture_bytes  "
         "test_guest_provenance"
     ).split(),
     "kernel-map": (
@@ -659,6 +670,14 @@ SUITE_DENIALS = {
     "kernel-isa-jcc": {
         "test_jcc_stale_object_fails": (
             "test_jcc_mutation_aborts", "RUNTIME"
+        ),
+    },
+    "kernel-isa-atomic": {
+        "test_atomic_acqrel_refused": (
+            "test_atomic_oracles_execute", "VERIFY"
+        ),
+        "test_atomic_stale_object_fails": (
+            "test_atomic_mutation_aborts", "RUNTIME"
         ),
     },
     "kernel-map": {

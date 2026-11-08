@@ -60,6 +60,7 @@ OWNERS = {
         'compiler/tests/test_ir_roundtrip.py',
         'compiler/tests/test_isa_alu32.py',
         'compiler/tests/test_isa_alu64.py',
+        'compiler/tests/test_isa_atomic.py',
         'compiler/tests/test_isa_cpu.py',
         'compiler/tests/test_isa_cpu_refused.py',
         'compiler/tests/test_isa_jcc.py',
@@ -130,6 +131,7 @@ OWNERS = {
     'guest': (
         'tests/kernel/test_arch_portability.py',
         'tests/kernel/test_array_maps.py',
+        'tests/kernel/test_atomic_qual.py',
         'tests/kernel/test_cleanup.py',
         'tests/kernel/test_core_layouts.py',
         'tests/kernel/test_generalized_arrays.py',

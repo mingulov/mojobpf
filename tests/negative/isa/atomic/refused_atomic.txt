@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-atomic-shape corpus index for F-ISA/atomic/ops.
+#
+# The audit refuses every atomic construct; no admitted Mojo
+# emits atomics. The vectors live in
+# compiler/tests/test_isa_atomic.py (RED-first, pinning the
+# observed faces — see packet Amendment A1: entry MBPF319,
+# subprogram MBPF304, cmpxchg MBPF305). This file indexes
+# them so reviewers can audit coverage without reading the
+# test body. Every vector below is refused at the parsed
+# layer (check-target exits 4 with the named code); nothing
+# here reaches llc, the verifier, or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+#
+fence seq_cst (entry) | test_atomic_refused_shapes | exit 4, MBPF319 finite source subset
+atomicrmw add i64 seq_cst (entry) | test_atomic_refused_shapes | exit 4, MBPF319 finite source subset
+atomicrmw xchg i64 monotonic (entry) | test_atomic_refused_shapes | exit 4, MBPF319 finite source subset
+atomicrmw add i64 seq_cst (subprogram callee) | test_atomic_refused_subprog_shape | exit 4, MBPF304 atomic machinery outside the slice
+cmpxchg i64 (entry) | test_atomic_cmpxchg_aggregate_face | exit 4, MBPF305 aggregate type, first-and-only
+cmpxchg i64 (subprogram callee) | test_atomic_cmpxchg_subprog_aggregate_face | exit 4, MBPF305 aggregate type, first-and-only
+
+# Admitted anchor (same file, proving the MBPF319 gate keys
+# on the instruction, not the pointer): GEP-on-ctx
+# (test_atomic_admitted_companion, exit 0). The operand-free
+# fence vector agrees.
