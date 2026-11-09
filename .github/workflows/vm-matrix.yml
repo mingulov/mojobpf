@@ -125,6 +125,27 @@ jobs:
         # unit gate; a raw single-process pytest run GC-thrashes
         # past 30 minutes on this suite.
         run: python3 ci/test_lanes.py --lane unit
+      - name: diagnose failing modules
+        # The lane prints only a summary: on failure, rerun it
+        # into a kept directory and report per-module results so
+        # a red run names its module. Zero cost on green.
+        if: failure()
+        run: |
+          python3 - <<'EOF'
+          import importlib.util, json, os
+          spec = importlib.util.spec_from_file_location('lanes', 'ci/test_lanes.py')
+          lanes = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(lanes)
+          work = os.path.abspath('lane-debug')
+          os.makedirs(work, exist_ok=True)
+          lanes.run_lane('unit', work)
+          for i, module in enumerate(lanes.OWNERS['unit']):
+              try:
+                  rep = json.load(open(os.path.join(work, 'module-%d.json' % i)))
+                  print(('PASS ' if rep['exit'] == 0 else 'FAIL ') + module)
+              except OSError:
+                  print('NO-REPORT ' + module)
+          EOF
 
   contract:
     name: structural contract suites
