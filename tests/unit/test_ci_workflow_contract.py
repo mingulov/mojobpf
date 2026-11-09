@@ -89,6 +89,23 @@ def guarded(lanes, tmp_path, code):
     return result, marker
 
 
+def _link_clone_stdlib(workdir):
+    # A byte-copy of sys.executable only stays functional when
+    # its computed prefix offers the standard library. A fixed
+    # /usr install falls back to its build prefix, but a
+    # relocated build (python-build-standalone, a venv base)
+    # finds nothing and the clone dies before running. Link the
+    # running interpreter's library dirs next to the copy so the
+    # clone resolves stdlib (and the same site-packages) from
+    # its own prefix on every layout. The guard samples file
+    # digests, so sibling links are invisible to it.
+    home = Path(sys.base_prefix)
+    for name in ('lib', 'lib64'):
+        src = home / name
+        if src.is_dir():
+            os.symlink(src, Path(workdir) / name)
+
+
 def private_lane(tmp_path, modules):
     for name, text in modules.items():
         path = tmp_path / name
@@ -1630,6 +1647,7 @@ def test_relative_fixture_interpreter_resolves_spawn_cwd(lanes, tmp_path):
     interp = zone / 'rel-python3'
     interp.write_bytes(Path(sys.executable).read_bytes())
     interp.chmod(0o755)
+    _link_clone_stdlib(zone)
     fixture = zone / 'rel-fixture'
     fixture.write_text('#!rel-python3\nprint("rel-interp-ok")\n')
     fixture.chmod(0o755)
@@ -1765,6 +1783,7 @@ def test_propagated_install_ignores_replaced_candidate(lanes, tmp_path):
     planted = bindir / 'python3'
     planted.write_bytes(Path(sys.executable).read_bytes())
     planted.chmod(0o755)
+    _link_clone_stdlib(bindir)
     grandchild = ('import subprocess\n'
                   f'try: subprocess.run([{str(planted)!r}, "-c", "print(\\"CANDIDATE-RAN\\")"])\n'
                   'except PermissionError: print("REPLACED-REFUSED")\n')

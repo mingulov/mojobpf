@@ -1,20 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # MojoBPF continuous checks.
 #
-# The unit job runs anywhere (standard library plus pytest). Every
-# other job needs the qualified self-hosted runner: x86-64 Linux with
-# Python 3.11+, the Mojo/LLVM toolchain on PATH (see
-# toolchains.lock.json), and virtme-ng with both kernel images cached
-# (see ci/kernels.lock.json for the pinned runner and lane
-# artifacts). Guests run under software emulation; no host BPF is
-# ever loaded and no live hook is ever attached. A lane whose image
-# is absent fails the matrix job.
+# The unit job runs anywhere: pinned CPython plus hashed pytest and
+# the hashed jsonschema closure the tests/unit schema checks import.
+# When tests gain a dependency, extend the unit job's pinned block
+# the same commit (drift here caused the 2026-11-09 red: the runner
+# interpreter is bare, unlike developer machines).
+#
+# Every other job needs the qualified self-hosted runner AND the
+# repo variable MOJOBPF_VM_RUNNER=true; otherwise the jobs skip
+# visibly and the vm-status job says so in-run (a queued-forever
+# run signals nothing; a visible skip points at provisioning).
+# Runner spec: x86-64 Linux with Python 3.11+, the Mojo/LLVM
+# toolchain on PATH (see toolchains.lock.json), and virtme-ng with
+# both kernel images cached (see ci/kernels.lock.json for the pinned
+# runner and lane artifacts). Guests run under software emulation;
+# no host BPF is ever loaded and no live hook is ever attached. A
+# lane whose image is absent fails the matrix job.
 #
 # Supply chain: every Action is pinned to a full commit SHA (reviewed
 # 2026-10-09; the trailing comment names the major tag it resolves),
 # and every pytest install carries --require-hashes over a pinned
 # requirements block (pytest plus its Linux runtime closure, with
-# PyPI archive SHA-256 values). The unit job installs CPython
+# PyPI archive SHA-256 values; the unit block additionally pins
+# jsonschema 4.23.0 plus its closure). The unit job installs CPython
 # 3.11.17 from a digest-pinned python-build-standalone release: the
 # exact version plus the expected archive SHA-256, verified before
 # the archive is extracted or executed. No step downloads an
@@ -56,9 +65,22 @@ jobs:
           cat > "$RUNNER_TEMP/pytest-hashed.txt" <<'EOF'
           # Pinned 2026-10-09: pytest 9.0.2 plus its Linux runtime
           # closure. Hashes are the PyPI archive SHA-256 values.
+          # Added 2026-11-09: jsonschema 4.23.0 (the version the
+          # release lanes ran) plus its runtime closure for the
+          # tests/unit schema checks. rpds-py pins the sdist and
+          # the cp311 manylinux x86_64 wheel CI downloads.
+          attrs==24.2.0 \
+              --hash=sha256:5cfb1b9148b5b086569baec03f20d7b6bf3bcacc9a42bebf87ffaaca362f6346 \
+              --hash=sha256:81921eb96de3191c8258c199618104dd27ac608d9366f5e35d011eae1867ede2
           iniconfig==2.3.1 \
               --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7 \
               --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960
+          jsonschema==4.23.0 \
+              --hash=sha256:d71497fef26351a33265337fa77ffeb82423f3ea21283cd9467bb03999266bc4 \
+              --hash=sha256:fbadb6f8b144a8f8cf9f0b89ba94501d143e50411a1278633f56a7acf7fd5566
+          jsonschema-specifications==2024.10.1 \
+              --hash=sha256:0f38b83639958ce1152d02a7f062902c41c8fd20d558b0c34344292d417ae272 \
+              --hash=sha256:a09a0680616357d9a0ecf05c12ad234479f549239d0f5b55f3deea67475da9bf
           packaging==26.3 \
               --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c \
               --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79
@@ -71,13 +93,23 @@ jobs:
           pytest==9.0.2 \
               --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b \
               --hash=sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11
+          referencing==0.35.0 \
+              --hash=sha256:191e936b0c696d0af17ad7430a3dc68e88bc11be6514f4757dc890f04ab05889 \
+              --hash=sha256:8080727b30e364e5783152903672df9b6b091c926a146a759080b62ca3126cd6
+          rpds-py==0.20.0 \
+              --hash=sha256:d72a210824facfdaf8768cf2d7ca25a042c30320b3020de2fa04640920d4e121 \
+              --hash=sha256:5c1dc0f53856b9cc9a0ccca0a7cc61d3d20a7088201c0937f3f4048c1718a209
           EOF
           pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
       - name: unit suites
-        run: python3 -m pytest tests/unit -q
+        # The lane runner (module-per-process) is the declared
+        # unit gate; a raw single-process pytest run GC-thrashes
+        # past 30 minutes on this suite.
+        run: python3 ci/test_lanes.py --lane unit
 
   contract:
     name: structural contract suites
+    if: vars.MOJOBPF_VM_RUNNER == 'true'
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: unit
     steps:
@@ -113,6 +145,7 @@ jobs:
 
   packaging:
     name: packaging suites
+    if: vars.MOJOBPF_VM_RUNNER == 'true'
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: contract
     steps:
@@ -150,6 +183,7 @@ jobs:
 
   vm-matrix:
     name: VM matrix (pinned kernel lanes)
+    if: vars.MOJOBPF_VM_RUNNER == 'true'
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: packaging
     steps:
@@ -183,3 +217,17 @@ jobs:
         with:
           name: vm-matrix-report
           path: matrix-out/
+
+  vm-status:
+    name: VM runner status
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [unit, contract, packaging, vm-matrix]
+    steps:
+      - name: report which jobs ran
+        run: |
+          echo "unit=${{ needs.unit.result }} contract=${{ needs.contract.result }} packaging=${{ needs.packaging.result }} vm-matrix=${{ needs.vm-matrix.result }}"
+          test "${{ needs.unit.result }}" = "success"
+          if [ "${{ needs.vm-matrix.result }}" = "skipped" ]; then
+            echo "VM jobs skipped: provision the mojobpf-vm self-hosted runner and set repo variable MOJOBPF_VM_RUNNER=true (see workflow header)."
+          fi
