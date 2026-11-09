@@ -4,12 +4,12 @@
 
 The release regression anchor: the full matrix below ran
 green on the release tree. The 41x5 KVM matrix ran at
-`4042801e891bfada3671b4f6b06017742db696fa` with a clean
+`a7fa1a120e5782851889f8a93a2507c47c589947` with a clean
 tree (the runner refuses dirty trees and re-checks the
 commit mid-run); the 3.4 review fix-forward re-proved
-every affected suite at `bcc63650e3fb44845b2c096c29c070b2220abe1e`
+every affected suite at `ccf7490c9a0666e33c32c2a93873d67a4267d55f`
 (25/25 lane-suites, 0 failures); the confirm round's
-docs-only delta (`99ec890`) plus this release record
+docs-only delta (`e5d9d7d`) plus this release record
 landed afterwards as docs-only additions no suite
 executes (no `.py` under `tests/`, `src/`, or `ci/`
 references them and no suite reads `docs/` except the
@@ -19,9 +19,9 @@ confirm.
 
 Release commit: the commit carrying this document (the
 docs-only amendment of the matrix chain described above).
-Matrix commit: `4042801e891bfada3671b4f6b06017742db696fa`.
-Fix-forward commits: `912b009` (review findings),
-`bcc6365` (34-byte net boundary correction), `99ec890`
+Matrix commit: `a7fa1a120e5782851889f8a93a2507c47c589947`.
+Fix-forward commits: `3cf3260` (review findings),
+`ccf7490` (34-byte net boundary correction), `e5d9d7d`
 (review-confirm docs).
 
 ## Anchor board

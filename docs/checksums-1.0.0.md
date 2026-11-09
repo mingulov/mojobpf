@@ -7,7 +7,7 @@ not byte-reproducible (zip timestamps vary per build), but
 the extracted contents of same-tree rebuilds are byte-identical
 (`diff -r` clean). Verify the contents, not the container.
 
-Reference wheel build (from a clean clone of `99ec890` —
+Reference wheel build (from a clean clone of `e5d9d7d` —
 the docs carrying this release record do not enter the
 wheel, so these contents equal a build from the release
 tree; verified by rebuilding from the release tree and
