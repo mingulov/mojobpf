@@ -320,7 +320,7 @@ echo "== cpu =="
 grep -m1 'model name' /proc/cpuinfo
 python3 -c "open('<qs>/test-run/pkt.bin','wb').write(bytes(64))"
 echo "== load =="
-bpftool prog load <qs>/build/counter.bpf.o /sys/fs/bpf/qs-counter type xdp 2>/dev/null
+bpftool prog load <qs>/build/counter.bpf.o /sys/fs/bpf/qs-counter type xdp
 echo "== run x3 =="
 bpftool prog run pinned /sys/fs/bpf/qs-counter data_in <qs>/test-run/pkt.bin data_out <qs>/test-run/out.bin repeat 3
 echo "== map after x3 =="
@@ -342,6 +342,8 @@ vng --run v6.12 --user root --rwdir <qs> \
 == cpu ==
 model name	: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
 == load ==
+libbpf: elf: skipping unrecognized data section(17) .eh_frame
+libbpf: elf: skipping relo section(18) .rel.eh_frame for section(17) .eh_frame
 == run x3 ==
 Return value: 2, duration (average): 499ns
 == map after x3 ==
@@ -366,6 +368,9 @@ three runs and 8 after five more — the counter increments
 by exactly the repeat count. The CPU line names your
 host (a QEMU CPU here would mean TCG, not KVM) and
 durations vary run to run; everything else must match.
+The two libbpf lines are benign loader notes — frame
+sections the loader skips — kept visible so a real load
+failure can never pass silently.
 
 ## What can go wrong
 
