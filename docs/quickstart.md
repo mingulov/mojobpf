@@ -22,6 +22,8 @@ versions and the profile list below match the current tree.
   for the supported toolchain).
 * LLVM `llc` with the BPF backend, `bpftool`, and `vng`
   (virtme-ng) with a cached guest image for the kernel check.
+* A C++ compiler and CMake for the one-time lowering build
+  in step 1.
 
 ## 1. Build the wheel
 
@@ -43,6 +45,29 @@ wheel built from the same sources carries the same contents
 metadata may differ — even the container hash varies between
 same-tree builds. The 0.3.0a1 release contents are pinned
 separately in [checksums](checksums-0.3.0a1.md).)
+
+The counter lowers through the parsed route, which needs the
+`mojobpf-lower` binary (not shipped in the wheel). Build it
+once from the same source directory (prerequisites and detail:
+[installation](install.md#build-the-lowering-mojobpf-lower)):
+
+```bash
+cmake -S compiler -B build/lower -DCMAKE_BUILD_TYPE=Release
+cmake --build build/lower -j$(nproc)
+export MOJOBPF_LOWER=$PWD/build/lower/mojobpf-lower
+"$MOJOBPF_LOWER" --version
+```
+
+```text
+LLVM (http://llvm.org/):
+  LLVM version 22.1.8
+  Optimized build.
+```
+
+(CMake's own configure output is elided; only the version
+check is transcribed.) Keep `MOJOBPF_LOWER` exported for
+step 5 — without a lowering binary the build stops with
+`MBPF219`.
 
 ## 2. Install into a fresh environment
 
@@ -244,7 +269,7 @@ built from, not in the wheel; point at that file.)
 
 ```text
 mojobpf-verify-kernel: status=pass stage=done
-object: build/counter.bpf.o (sha256 b74df864b37a)
+object: build/counter.bpf.o (sha256 b74df864b37aaf41)
 lane: v6.12-tcg (release v6.12/tcg, expected kernel 6.12.0-061200-generic)
 guest: kernel=6.12.0-061200-generic btf=present prog_type=xdp supported=True
 load: attempted=True exit=0
@@ -260,6 +285,88 @@ reference transcript uses the named `v6.12-tcg` fallback lane;
 the pinned x86-64 lanes boot with KVM hardware acceleration
 (see [compatibility](compatibility.md)).
 
+On a KVM host the same command with `--accelerator kvm`
+uses the `v6.12-kvm` lane:
+
+```bash
+mojobpf verify --kernel --accelerator kvm --object build/counter.bpf.o \
+    --kernels-lock <sourcedir>/ci/kernels.lock.json
+```
+
+```text
+mojobpf-verify-kernel: status=pass stage=done
+object: build/counter.bpf.o (sha256 b74df864b37aaf41)
+lane: v6.12-kvm (release v6.12/kvm, expected kernel 6.12.0-061200-generic)
+guest: kernel=6.12.0-061200-generic btf=present prog_type=xdp supported=True
+load: attempted=True exit=0
+unload: attempted=True pin_absent=True
+staging: <tmpdir> (kept=False)
+guest commands: load/unload only; no attach, no test-run
+```
+
+## 8. Run it: packet counting on KVM
+
+`verify` proves load and unload. This step runs the counter
+against real packets in a KVM guest and checks the map.
+From the quickstart directory, with the guest runner on
+`PATH` and a lease exported (`export
+MOJOBPF_TARGET_LEASE=1`):
+
+```bash
+mkdir -p test-run
+cat > test-run/run.sh <<'EOF'
+set -e
+echo "== cpu =="
+grep -m1 'model name' /proc/cpuinfo
+python3 -c "open('<qs>/test-run/pkt.bin','wb').write(bytes(64))"
+echo "== load =="
+bpftool prog load <qs>/build/counter.bpf.o /sys/fs/bpf/qs-counter type xdp 2>/dev/null
+echo "== run x3 =="
+bpftool prog run pinned /sys/fs/bpf/qs-counter data_in <qs>/test-run/pkt.bin data_out <qs>/test-run/out.bin repeat 3
+echo "== map after x3 =="
+MAPID=$(bpftool -j map list | python3 -c "import json,sys; ms=json.load(sys.stdin); print([m['id'] for m in ms if m.get('name')=='mojobpf_map0'][0])")
+bpftool map dump id $MAPID
+echo "== run x5 =="
+bpftool prog run pinned /sys/fs/bpf/qs-counter data_in <qs>/test-run/pkt.bin data_out <qs>/test-run/out.bin repeat 5
+echo "== map after x5 =="
+bpftool map dump id $MAPID
+echo "== unload =="
+rm /sys/fs/bpf/qs-counter
+EOF
+chmod +x test-run/run.sh
+vng --run v6.12 --user root --rwdir <qs> \
+    --exec '/bin/bash <qs>/test-run/run.sh'
+```
+
+```text
+== cpu ==
+model name	: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
+== load ==
+== run x3 ==
+Return value: 2, duration (average): 499ns
+== map after x3 ==
+[{
+        "key": 0,
+        "value": 3
+    }
+]
+== run x5 ==
+Return value: 2, duration (average): 155ns
+== map after x5 ==
+[{
+        "key": 0,
+        "value": 8
+    }
+]
+== unload ==
+```
+
+Return value 2 is `XDP_PASS`; map entry 0 reads 3 after
+three runs and 8 after five more — the counter increments
+by exactly the repeat count. The CPU line names your
+host (a QEMU CPU here would mean TCG, not KVM) and
+durations vary run to run; everything else must match.
+
 ## What can go wrong
 
 * `mojobpf build` without `--lockfile` fails with `MBPF104`:
@@ -269,6 +376,9 @@ the pinned x86-64 lanes boot with KVM hardware acceleration
   with `MBPF104` as well.
 * A source without an SPDX header fails with `MBPF707`: add
   the header line (see step 4).
+* `mojobpf build` without a lowering binary fails with
+  `MBPF219`: build `mojobpf-lower` and export `MOJOBPF_LOWER`
+  (see step 1).
 * `mojobpf verify --kernel` without a guest runner fails with
   an environment report (exit 3), never a pass. Loader and
   verifier failures both exit 5, classified separately

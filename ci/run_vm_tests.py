@@ -1466,7 +1466,7 @@ def check_lane_cache(lane):
     return {"cache": cache, "debs": sorted(os.path.basename(p) for p in found)}
 
 
-# Structured result protocol (F-049): lane targets and suite
+# Structured result protocol: lane targets and suite
 # acceptance. The matrix authors the lane target manifest from
 # lock data, passes it (with the commit identity) to every
 # suite through the environment, and requires each suite to

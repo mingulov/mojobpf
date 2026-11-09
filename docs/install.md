@@ -76,6 +76,10 @@ cmake --build build/lower -j$(nproc)
 export MOJOBPF_LOWER=$PWD/build/lower/mojobpf-lower
 ```
 
+Configuration enables the test suites by default and fails
+without the Python 3.11 + `pytest` prerequisite above; pass
+`-DBUILD_TESTING=OFF` to configure a build-only tree.
+
 If CMake cannot find LLVM on your machine, point it at the
 configuration directory your LLVM install reports:
 
