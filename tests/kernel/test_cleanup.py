@@ -351,6 +351,10 @@ def verify_cli(extra_args, timeout=600):
         VNG_RELEASE,
         "--json",
     ] + list(extra_args)
+    lane_accelerator = os.environ.get(
+        guest_proc.VNG_ACCELERATOR_ENV, "")
+    if lane_accelerator:
+        argv += ["--accelerator", lane_accelerator]
     with guest_proc.consumed_arguments(
             argv, ("--object", "--data-in")) as consumed_argv:
         proc = run_step(consumed_argv, timeout=timeout,

@@ -189,11 +189,22 @@ def check_tools(*tools):
 
 def vng_release():
     release = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-    if not re.fullmatch(r"v\d+\.\d+", release):
+    if not re.fullmatch(r"v\d+\.\d+(\.\d+)?(-rc\d+)?", release):
         raise EnvironmentFailure(
             "MOJOBPF_VNG_RELEASE must look like v6.12, got %r" % release
         )
     return release
+
+
+def lane_accelerator():
+    """Accelerator for VerifyRequest: the matrix lane's, else TCG.
+
+    The matrix runner sets MOJOBPF_VNG_ACCELERATOR per lane from
+    the lock; standalone runs (variable absent) keep verify's
+    historical TCG default, so local runs behave as before.
+    """
+    return os.environ.get(
+        guest_proc.VNG_ACCELERATOR_ENV, "") or "tcg"
 
 
 def sha256_file(path):
@@ -1751,6 +1762,7 @@ def test_failsafe_map_preflight():
         VerifyRequest(
             object_path=pre["counter"],
             release=release,
+            accelerator=lane_accelerator(),
             prog_type="tracepoint",
             map_types=(UNKNOWN_MAP,),
         )
@@ -1794,6 +1806,7 @@ def test_failsafe_arena_lane_verdict():
         VerifyRequest(
             object_path=pre["counter"],
             release=release,
+            accelerator=lane_accelerator(),
             prog_type="tracepoint",
             map_types=(SPLIT_MAP,),
         )
@@ -1852,6 +1865,7 @@ def test_failsafe_event_preflight():
         VerifyRequest(
             object_path=pre["emitter"],
             release=release,
+            accelerator=lane_accelerator(),
             prog_type="tracepoint",
             map_types=("array", "ringbuf"),
             trace_event=TRACE_EVENT,
@@ -1887,6 +1901,7 @@ def test_failsafe_event_preflight():
             object_path=pre["counter"],
             release=release,
             prog_type="tracepoint",
+            accelerator=lane_accelerator(),
             trace_event=BOGUS_EVENT,
         )
     )

@@ -163,7 +163,7 @@ class EnvironmentFailure(Exception):
 
 def check_release():
     release = VNG_RELEASE
-    if not re.fullmatch(r"v6\.\d+", release or ""):
+    if not re.fullmatch(r"v\d+\.\d+(\.\d+)?(-rc\d+)?", release or ""):
         raise EnvironmentFailure(
             "MOJOBPF_VNG_RELEASE must look like v6.12, got %r" % release
         )

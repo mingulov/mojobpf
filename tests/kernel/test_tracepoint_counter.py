@@ -158,7 +158,7 @@ def check_tools(*tools):
 
 def vng_release():
     release = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-    if not re.fullmatch(r"v\d+\.\d+", release):
+    if not re.fullmatch(r"v\d+\.\d+(\.\d+)?(-rc\d+)?", release):
         raise EnvironmentFailure(
             "MOJOBPF_VNG_RELEASE must look like v6.12, got %r" % release
         )
