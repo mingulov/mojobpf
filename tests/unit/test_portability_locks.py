@@ -941,8 +941,15 @@ def test_ci_interpreter_install_is_digest_pinned():
     extract_at = _line_of("tar -xzf")
     path_at = _line_of("GITHUB_PATH")
     pip_at = _line_of("pip install")
-    pytest_at = _line_of("pytest tests/unit")
-    assert verify_at < extract_at < path_at < pip_at < pytest_at, (
+    # The unit step runs the lane runner (module-per-process),
+    # the declared unit gate anchored in docs/evidence-1.0.0.md:
+    # a raw single-process `pytest tests/unit` GC-thrashes past
+    # 30 minutes on this suite (measured 2026-11-09), so the
+    # workflow cannot run it literally. The lane executes the
+    # same tests/unit nodes through pytest; --check pins the
+    # file ownership.
+    run_at = _line_of("ci/test_lanes.py --lane unit")
+    assert verify_at < extract_at < path_at < pip_at < run_at, (
         "the expected archive digest must verify before the "
         "archive is extracted, installed, or executed"
     )

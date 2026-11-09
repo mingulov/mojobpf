@@ -1512,9 +1512,11 @@ def _back_up_predecessor(
             ) from None
         try:
             current = os.fstat(src_fd)
-            if (current.st_dev, current.st_ino) != (
-                observed.st_dev,
-                observed.st_ino,
+            if (
+                (current.st_dev, current.st_ino)
+                != (observed.st_dev, observed.st_ino)
+                or current.st_size != observed.st_size
+                or current.st_mtime_ns != observed.st_mtime_ns
             ) or not stat.S_ISREG(current.st_mode):
                 raise _publish_fail(
                     "cannot publish %r: predecessor %r changed "
@@ -1578,10 +1580,17 @@ def _recheck_predecessor(
                 "republish into a stable directory",
             )
         return
+    # Identity is (dev, ino, size, mtime_ns): (dev, ino) alone
+    # is blind to a same-inode replacement (ext4 reuses a freed
+    # inode immediately for a same-directory recreate; an
+    # in-place rewrite keeps it by definition). Same pattern as
+    # execution._check_open_image.
     if (
         current is None
         or (current.st_dev, current.st_ino)
         != (observed.st_dev, observed.st_ino)
+        or current.st_size != observed.st_size
+        or current.st_mtime_ns != observed.st_mtime_ns
         or stat.S_ISLNK(current.st_mode)
         or not stat.S_ISREG(current.st_mode)
     ):
@@ -1660,9 +1669,11 @@ def _capture_predecessor(
             final_path,
             "remove the swapped predecessor, then republish",
         )
-    if (current.st_dev, current.st_ino) != (
-        observed.st_dev,
-        observed.st_ino,
+    if (
+        (current.st_dev, current.st_ino)
+        != (observed.st_dev, observed.st_ino)
+        or current.st_size != observed.st_size
+        or current.st_mtime_ns != observed.st_mtime_ns
     ) or not stat.S_ISREG(current.st_mode):
         raise _publish_fail(
             "cannot publish %r: predecessor %r changed during "
@@ -1678,13 +1689,14 @@ def _hash_published(
     dir_fd: int,
     name: str,
     final_path: str,
-    expected: tuple[int, int],
+    expected: tuple[int, int, int, int],
 ) -> tuple[str, int]:
     """Hash the just-published file through the pinned descriptor.
 
     The read end re-verifies regularity without following links,
     and the opened file's identity must equal the staged
-    temporary's pre-rename identity ``expected``: a result
+    temporary's pre-rename identity ``expected``
+    ``(st_dev, st_ino, st_size, st_mtime_ns)``: a result
     swapped in after the rename is refused instead of hashed,
     so the reported digest always describes the staged bytes
     inside the pinned directory.
@@ -1718,7 +1730,12 @@ def _hash_published(
         # Compared on the open descriptor, not a re-stat of the
         # name, so no second lookup window remains.
         installed = os.fstat(fd)
-        if (installed.st_dev, installed.st_ino) != expected:
+        if (
+            installed.st_dev,
+            installed.st_ino,
+            installed.st_size,
+            installed.st_mtime_ns,
+        ) != expected:
             raise _publish_fail(
                 "cannot publish %r: published file %r changed "
                 "during publication; refusing a swapped result"
@@ -1981,7 +1998,7 @@ def publish_artifacts(
             out_dir,
             "publish each name once",
         )
-    admitted_sources: dict[str, tuple[int, int]] = {}
+    admitted_sources: dict[str, tuple[int, int, int, int]] = {}
     for name, staged_path, _role in triples:
         if not isinstance(staged_path, str):
             raise _publish_fail(
@@ -1997,7 +2014,12 @@ def publish_artifacts(
                 str(staged_path),
                 "restage the file before publishing",
             ) from None
-        admitted_sources[name] = (observed.st_dev, observed.st_ino)
+        admitted_sources[name] = (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+        )
         mode = observed.st_mode
         if stat.S_ISLNK(mode):
             raise _publish_fail(
@@ -2085,9 +2107,12 @@ def publish_artifacts(
                                 "restage the file before "
                                 "publishing",
                             )
-                        if (opened.st_dev, opened.st_ino) != (
-                            admitted_sources[name]
-                        ):
+                        if (
+                            opened.st_dev,
+                            opened.st_ino,
+                            opened.st_size,
+                            opened.st_mtime_ns,
+                        ) != (admitted_sources[name]):
                             raise _publish_fail(
                                 "cannot stage %r for publication: "
                                 "staged file changed during "
@@ -2195,7 +2220,12 @@ def publish_artifacts(
                         final_path,
                         "republish into a stable directory",
                     ) from None
-                expected = (staged.st_dev, staged.st_ino)
+                expected = (
+                    staged.st_dev,
+                    staged.st_ino,
+                    staged.st_size,
+                    staged.st_mtime_ns,
+                )
                 capture_name: str | None = None
                 if observed is not None:
                     # Atomic capture through the pin: the install

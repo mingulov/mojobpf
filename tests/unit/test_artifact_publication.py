@@ -3525,6 +3525,172 @@ def test_publish_second_file_recheck_failure_rolls_back_first():
         ] == []
 
 
+def test_publish_backup_regular_swap_rejected():
+    # A predecessor rewrite between classification and the
+    # backup open must be refused. The rewrite lands in place
+    # (same inode by construction, new size and mtime), so a
+    # (dev, ino)-only check is blind to it; the check also
+    # compares size and mtime. The backup never starts, so the
+    # post-swap bytes stay in place.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+
+        def swap_inode(_observed):
+            # In-place rewrite: same inode by construction (no
+            # allocator luck), new size and mtime.
+            with open(victim, "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"PLANTED!")
+                handle.truncate()
+
+        wrapper, fired, real_lstat = _swapping_lstat_factory(
+            victim, swap_inode, fire_on=1, order="after"
+        )
+        os.lstat = wrapper
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.lstat = real_lstat
+        assert fired, "swap never injected"
+        assert "changed" in exc.diagnostic.explanation
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"PLANTED!"
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
+def test_publish_capture_regular_swap_rejected():
+    # A predecessor rewrite between the final recheck and the
+    # capture rename must be refused at capture: the capture
+    # re-verifies the moved-aside entry with size and mtime as
+    # well as inode identity. Rollback restores the backup.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        def swap_inode(_observed):
+            with open(victim, "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"PLANTED!")
+                handle.truncate()
+
+        wrapper, fired, real_lstat = _swapping_lstat_factory(
+            victim, swap_inode, fire_on=2, order="after"
+        )
+        os.lstat = wrapper
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.lstat = real_lstat
+        assert fired, "swap never injected"
+        assert "changed" in exc.diagnostic.explanation
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"OLD"
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
+def test_publish_result_regular_swap_rejected():
+    # A rewrite of the installed result between the rename and
+    # the hash open must be refused: the hash binds the open
+    # descriptor to the staged temporary's size and mtime as
+    # well as inode, so substituted bytes cannot get the
+    # staged digest. Rollback restores the predecessor.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        def swap_inode(_observed):
+            with open(victim, "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"PLANTED!")
+                handle.truncate()
+
+        wrapper, fired, real_lstat = _swapping_lstat_factory(
+            victim, swap_inode, fire_on=3, order="after"
+        )
+        os.lstat = wrapper
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.lstat = real_lstat
+        assert fired, "swap never injected"
+        assert "changed" in exc.diagnostic.explanation
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"OLD"
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
+def test_publish_staged_regular_swap_rejected():
+    # A rewrite of the staged file between admission and the
+    # staged open must be refused: the open binds the
+    # descriptor to the admitted size and mtime as well as
+    # inode. The predecessor is untouched.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        def swap_inode(_observed):
+            with open(staged, "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"PLANTED!")
+                handle.truncate()
+
+        wrapper, fired, real_lstat = _swapping_lstat_factory(
+            staged, swap_inode, fire_on=1, order="after"
+        )
+        os.lstat = wrapper
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.lstat = real_lstat
+        assert fired, "swap never injected"
+        assert "changed" in exc.diagnostic.explanation
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"OLD"
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
 def test_publish_out_dir_swap_mid_flight_detected():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:

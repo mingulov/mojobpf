@@ -132,7 +132,7 @@ jobs:
         # its tests. Zero cost on green.
         if: failure()
         run: |
-          python3 - <<'EOF'
+          python3 - <<'PYEOF'
           import importlib.util, json, os, subprocess, sys
           spec = importlib.util.spec_from_file_location('lanes', 'ci/test_lanes.py')
           lanes = importlib.util.module_from_spec(spec)
@@ -160,7 +160,7 @@ jobs:
               print('=' * 20 + ' verbose ' + module)
               tail = (proc.stdout + proc.stderr).splitlines()
               print('\n'.join(tail[-60:]))
-          EOF
+          PYEOF
 
   contract:
     name: structural contract suites
