@@ -91,15 +91,15 @@ SHORT_LANE = {
 }
 # TC/socket test-run minimum on refusing releases: frames
 # shorter than this are kernel-refused (EINVAL). Probed on
-# 7.x: 14- and 15-byte frames refuse, 16-byte frames run.
-# XDP legs run 14-byte frames on the same kernels, so the
-# net boundary is two bytes higher.
-NET_REFUSE_LEN = 16
+# all 7.x lanes (7.0.14, 7.2, 7.4-rc1), TC and socket alike:
+# every length 14..33 refuses, 34 runs (full 16..64 sweep).
+# XDP legs run 14-byte frames on the same kernels.
+NET_REFUSE_LEN = 34
 VNG_TIMEOUT = 900
 
 
 def short_refused():
-    """1 when this release refuses sub-16-byte TC/socket runs.
+    """1 when this release refuses sub-34-byte TC/socket runs.
 
     7.x kernels refuse short test-run inputs with EINVAL
     (bpftool exit 234, no return-value line); 6.x runs

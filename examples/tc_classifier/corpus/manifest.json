@@ -29,6 +29,20 @@
       "sha256": "aafb9ce6158bb02e1811eb0c78cfb32fdb65a9bc0de2a021a999162eb3c61efb"
     },
     {
+      "file": "f0033_2b.bin",
+      "length": 33,
+      "byte14": 43,
+      "verdict": 2,
+      "sha256": "c78a0c79de74a67c92877712d703fbe6d4a72a68bd8d8175f904f6f40e4d0f2d"
+    },
+    {
+      "file": "f0034_2b.bin",
+      "length": 34,
+      "byte14": 43,
+      "verdict": 2,
+      "sha256": "005b7be801e63d5c94770f1794c2b4ca97a96dc3d98edbf7582db46d985ff2fe"
+    },
+    {
       "file": "f0064_2a.bin",
       "length": 64,
       "byte14": 42,
