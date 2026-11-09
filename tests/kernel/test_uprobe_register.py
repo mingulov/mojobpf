@@ -108,6 +108,46 @@ UPROBE_OBJECT_HASH_PARSED = (
 # behavior controls. Anything else fails loudly: a new route
 # must earn its own builder.
 GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+ADVCTX_MARKER_LANE = {
+    "v6.12": "dereference of modified ctx ptr R1 off=112000 disallowed",
+    "v6.6": "dereference of modified ctx ptr R1 off=112000 disallowed",
+    "v7.0.14": "dereference of modified ctx ptr R1 off=112000 disallowed",
+    "v7.2": "invalid bpf_context access off=112000 size=8",
+    "v7.4-rc1": "invalid bpf_context access off=112000 size=8",
+}
+VLOG_INSNS_LANE = {
+    ("parsed", "v6.12"): 33,
+    ("parsed", "v6.6"): 33,
+    ("parsed", "v7.0.14"): 41,
+    ("parsed", "v7.2"): 41,
+    ("parsed", "v7.4-rc1"): 41,
+    ("lane-a", "v6.12"): 42,
+    ("lane-a", "v6.6"): 42,
+    ("lane-a", "v7.0.14"): 41,
+    ("lane-a", "v7.2"): 41,
+    ("lane-a", "v7.4-rc1"): 41,
+}
+
+
+def advctx_marker():
+    try:
+        return ADVCTX_MARKER_LANE[vng_release()]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the advctx refusal marker for release %s with "
+            "evidence; refusing to guess" % vng_release()
+        )
+
+
+def vlog_want_insns():
+    try:
+        return VLOG_INSNS_LANE[(GUEST_ROUTE, vng_release())]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the vlog insn count for route %s release %s "
+            "with evidence; refusing to guess"
+            % (GUEST_ROUTE, vng_release())
+        )
 # Lowering model contract, pinned with
 # compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
 # loudly at spec parse, never as a silent mismatch.
@@ -726,7 +766,7 @@ echo "--- adv-ctx ---"
 "$BPFTOOL" prog load advctx.bpf.o /sys/fs/bpf/up_advctx type kprobe pinmaps /sys/fs/bpf/up_advctx_maps/ >/tmp/up-advctx.load 2>&1
 echo "advctx-load-exit: $?"
 cat /tmp/up-advctx.load
-grep -q "dereference of modified ctx ptr R1 off=112000 disallowed" /tmp/up-advctx.load || { echo "ADVCTX-MARKER-MISSING"; exit 1; }
+grep -q "__ADVCTX_MARKER__" /tmp/up-advctx.load || { echo "ADVCTX-MARKER-MISSING"; exit 1; }
 [ -e /sys/fs/bpf/up_advctx ] && { echo "ADVCTX-PIN-LEAKED"; exit 1; }
 rm -rf /sys/fs/bpf/up_advctx_maps
 echo "adv-ctx: rejected"
@@ -820,6 +860,7 @@ def executed():
         .replace("__TARGET_OFFSET__", offsets["probe_target"])
         .replace("__NEVER_OFFSET__", offsets["probe_never_called"])
         .replace("__BPFTOOL_PROLOGUE__", prologue)
+        .replace("__ADVCTX_MARKER__", advctx_marker())
     )
     with open(staged_script, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -1077,11 +1118,11 @@ def test_vlog_captured():
     assert "0: (79) r6 = *(u64 *)(r1 +112)" in output, (
         "verifier log must show the pinned context-word load"
     )
-    # The parsed backend emits tighter code than Lane-A (33
-    # verifier insns vs 42); the pinned load, the single
-    # function, and the stack depth agree on both routes.
-    want_insns = "processed 33 insns" if GUEST_ROUTE == "parsed" \
-        else "processed 42 insns"
+    # Per-route, per-release verifier count (VLOG_INSNS_LANE):
+    # the parsed backend emits tighter code than Lane-A on
+    # 6.x; 7.x verifiers process 41 on both routes. The pinned
+    # load, the single function, and the stack depth agree.
+    want_insns = "processed %d insns" % vlog_want_insns()
     assert want_insns in output, output[-2000:]
     assert "stack depth 16" in output, output[-2000:]
     print("PASS verifier log: ctx+112 load, %s, stack depth 16"

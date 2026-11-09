@@ -105,7 +105,7 @@ UNCHECKED_LOG_LINE = "invalid mem access 'map_value_or_null'"
 # kernel check) already uses. Unknown releases fail loudly: a new
 # kernel must earn its own expectation, never inherit one.
 SIX_X_RELEASES = ("v6.12", "v6.6")
-SEVEN_X_RELEASES = ("v7.0.14",)
+SEVEN_X_RELEASES = ("v7.0.14", "v7.2", "v7.4-rc1")
 
 
 def _unchecked_release_kind(release):

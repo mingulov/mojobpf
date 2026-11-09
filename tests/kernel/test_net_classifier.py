@@ -82,7 +82,49 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 # lane through MOJOBPF_VNG_RELEASE; standalone runs keep the
 # 6.12 default.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+SHORT_LANE = {
+    "v6.12": 0,
+    "v6.6": 0,
+    "v7.0.14": 1,
+    "v7.2": 1,
+    "v7.4-rc1": 1,
+}
+# TC/socket test-run minimum on refusing releases: frames
+# shorter than this are kernel-refused (EINVAL). XDP legs
+# run 14-byte frames on the same kernels; TC/socket refuse
+# them, so the net boundary is one byte higher.
+NET_REFUSE_LEN = 15
 VNG_TIMEOUT = 900
+
+
+def short_refused():
+    """1 when this release refuses sub-15-byte TC/socket runs.
+
+    7.x kernels refuse short test-run inputs with EINVAL
+    (bpftool exit 234, no return-value line); 6.x runs
+    them. Unpinned releases refuse to guess.
+    """
+    try:
+        return SHORT_LANE[VNG_RELEASE]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the short-input verdict for release %s with "
+            "evidence; refusing to guess" % VNG_RELEASE
+        )
+
+
+def net_frame_refused(length):
+    """True when a frame this long is refused on this release."""
+    return short_refused() == 1 and length < NET_REFUSE_LEN
+
+
+def _refused_frames(frames, prefix):
+    """Staged names this release's kernel refuses to test-run."""
+    return frozenset(
+        "%s_%s" % (prefix, entry["file"])
+        for entry in frames
+        if net_frame_refused(entry["length"])
+    )
 
 # IR adapter route under test (Lane-A default). The equivalence
 # matrix selects the parsed route through MOJOBPF_GUEST_ROUTE;
@@ -570,14 +612,18 @@ def parse_fields(body):
     return fields
 
 
-def parse_frame_verdicts(body, tag, count):
+def parse_frame_verdicts(body, tag, count, refused=()):
     """Return [(frame, verdict)] in run order for one leg.
 
     Each run section prints its marker line, one bpftool
     "Return value: N" line, and its run_exit line; anything else
     (missing marker, missing or doubled verdict lines, nonzero
-    run exit) refuses instead of guessing.
+    run exit) refuses instead of guessing. Frames in ``refused``
+    may instead carry the kernel-refusal shape (no return
+    line, run exit 234) and yield a None verdict; a refusal
+    anywhere else, or a listed frame the kernel ran, refuses.
     """
+    refused = frozenset(refused)
     sections = re.split(
         r"^--- %s run (\d+) (\S+) ---$" % re.escape(tag),
         body,
@@ -601,10 +647,23 @@ def parse_frame_verdicts(body, tag, count):
         found = re.findall(
             r"[Rr]eturn value:\s*(\d+)", section
         )
+        if len(found) == 0 and fname in refused:
+            if "run_exit_%s=234" % idx not in section:
+                raise AssertionError(
+                    "%s run %s: refused frame must exit 234, got %r"
+                    % (tag, idx, section[-200:])
+                )
+            verdicts.append((fname, None))
+            continue
         if len(found) != 1:
             raise AssertionError(
                 "%s run %s: expected exactly one return value, got %r"
                 % (tag, idx, found)
+            )
+        if fname in refused:
+            raise AssertionError(
+                "%s run %s: frame %s was listed refused but the "
+                "kernel ran it" % (tag, idx, fname)
             )
         if "run_exit_%s=0" % idx not in section:
             raise AssertionError(
@@ -639,13 +698,23 @@ def check_net_leg(tag, manifest_path, flip):
     if fields.get("unload_ok") != "1":
         raise AssertionError("%s: pin was not removed" % tag)
     frames = load_manifest(manifest_path)
-    verdicts = parse_frame_verdicts(body, tag, len(frames))
+    verdicts = parse_frame_verdicts(
+        body, tag, len(frames),
+        refused=_refused_frames(frames, "t"),
+    )
     for entry, (fname, observed) in zip(frames, verdicts):
         if fname != "t_%s" % entry["file"]:
             raise AssertionError(
                 "%s: frame order drift: ran %s, manifest has %s"
                 % (tag, fname, entry["file"])
             )
+        if observed is None:
+            if not net_frame_refused(entry["length"]):
+                raise AssertionError(
+                    "%s frame %s unexpectedly refused"
+                    % (tag, entry["file"])
+                )
+            continue
         want = entry["verdict"]
         if flip and entry["length"] >= 15:
             # The mutant flips only the bit test; the length
@@ -669,8 +738,10 @@ def test_tc_mutation_flips_verdicts():
     run = executed()
     mut_verdicts = check_net_leg("tc_mut", TC_MANIFEST, True)
     body = run["results"]["tc_base"]
+    frames = load_manifest(TC_MANIFEST)
     base_verdicts = parse_frame_verdicts(
-        body, "tc_base", len(mut_verdicts)
+        body, "tc_base", len(mut_verdicts),
+        refused=_refused_frames(frames, "t"),
     )
     base_values = [value for _, value in base_verdicts]
     mut_values = [value for _, value in mut_verdicts]
@@ -678,8 +749,14 @@ def test_tc_mutation_flips_verdicts():
         raise AssertionError(
             "rebuilt mutant must change the observed verdicts"
         )
-    frames = load_manifest(TC_MANIFEST)
     for entry, value in zip(frames, base_values):
+        if value is None:
+            if not net_frame_refused(entry["length"]):
+                raise AssertionError(
+                    "base frame %s unexpectedly refused"
+                    % entry["file"]
+                )
+            continue
         if value != entry["verdict"]:
             raise AssertionError(
                 "base must still observe its manifest verdicts"
@@ -691,7 +768,10 @@ def test_tc_stale_object_fails():
     run = executed()
     body = run["results"]["tc_stale"]
     frames = load_manifest(TC_MANIFEST)
-    verdicts = parse_frame_verdicts(body, "tc_stale", len(frames))
+    verdicts = parse_frame_verdicts(
+        body, "tc_stale", len(frames),
+        refused=_refused_frames(frames, "t"),
+    )
     for entry, (_, observed) in zip(frames, verdicts):
         if entry["length"] < 15:
             continue
@@ -781,22 +861,39 @@ def parse_attach_verdicts(body, tag, count):
     return runs
 
 
-def parse_store_out(body, tag, count):
+def parse_store_out(body, tag, count, refused=()):
     """Parse store-leg runs into (frame, retval, byte13hex).
 
     Each run section carries exactly one bpftool Return value
     line, a zero run exit, and one nonempty stored byte;
     anything else (missing/doubled lines, nonzero exit,
     out-of-order sections) refuses instead of guessing.
+    Frames in ``refused`` may instead carry the
+    kernel-refusal shape (no return line, run exit 234)
+    and yield (frame, None, None).
     """
+    refused = frozenset(refused)
     runs = []
     for idx, fname, section in _split_run_sections(body, tag):
         _require_ordered_section(runs, tag, idx)
         found = re.findall(r"[Rr]eturn value:\s*(\d+)", section)
+        if len(found) == 0 and fname in refused:
+            if "run_exit_%d=234" % idx not in section:
+                raise AssertionError(
+                    "%s run %d: refused frame must exit 234, got %r"
+                    % (tag, idx, section[-200:])
+                )
+            runs.append((fname, None, None))
+            continue
         if len(found) != 1:
             raise AssertionError(
                 "%s run %d: expected exactly one return value, got %r"
                 % (tag, idx, found)
+            )
+        if fname in refused:
+            raise AssertionError(
+                "%s run %d: frame %s was listed refused but the "
+                "kernel ran it" % (tag, idx, fname)
             )
         _require_zero_exit(section, tag, idx)
         stored = re.findall(r"^store_byte13=(\S*)\s*$", section, re.M)
@@ -814,22 +911,39 @@ def parse_store_out(body, tag, count):
     return runs
 
 
-def parse_map_readback(body, tag, count):
+def parse_map_readback(body, tag, count, refused=()):
     """Parse loadmap-leg runs into (frame, retval, map1).
 
     Each run section carries exactly one bpftool Return value
     line, a zero run exit, and one integer map readback;
     anything else (missing/doubled lines, nonzero exit,
     out-of-order sections) refuses instead of guessing.
+    Frames in ``refused`` may instead carry the
+    kernel-refusal shape (no return line, run exit 234)
+    and yield (frame, None, None).
     """
+    refused = frozenset(refused)
     runs = []
     for idx, fname, section in _split_run_sections(body, tag):
         _require_ordered_section(runs, tag, idx)
         found = re.findall(r"[Rr]eturn value:\s*(\d+)", section)
+        if len(found) == 0 and fname in refused:
+            if "run_exit_%d=234" % idx not in section:
+                raise AssertionError(
+                    "%s run %d: refused frame must exit 234, got %r"
+                    % (tag, idx, section[-200:])
+                )
+            runs.append((fname, None, None))
+            continue
         if len(found) != 1:
             raise AssertionError(
                 "%s run %d: expected exactly one return value, got %r"
                 % (tag, idx, found)
+            )
+        if fname in refused:
+            raise AssertionError(
+                "%s run %d: frame %s was listed refused but the "
+                "kernel ran it" % (tag, idx, fname)
             )
         _require_zero_exit(section, tag, idx)
         values = re.findall(r"^map1=(\S*)\s*$", section, re.M)
@@ -871,7 +985,10 @@ def test_socket_exec_runs():
     if fields.get("unload_ok") != "1":
         raise AssertionError("socket_exec: pin was not removed")
     frames = load_manifest(SOCK_MANIFEST)
-    verdicts = parse_frame_verdicts(body, "socket_exec", len(frames))
+    verdicts = parse_frame_verdicts(
+        body, "socket_exec", len(frames),
+        refused=_refused_frames(frames, "s"),
+    )
     for entry, (fname, observed) in zip(frames, verdicts):
         if fname != "s_%s" % entry["file"]:
             raise AssertionError(
@@ -879,7 +996,12 @@ def test_socket_exec_runs():
                 % (fname, entry["file"])
             )
     short = verdicts[0][1]
-    if short != 64:
+    if short is None:
+        if not net_frame_refused(frames[0]["length"]):
+            raise AssertionError(
+                "socket_exec: short frame unexpectedly refused"
+            )
+    elif short != 64:
         raise AssertionError(
             "socket_exec: short frame must take the status pass "
             "path (64), observed %d" % short
@@ -956,13 +1078,23 @@ def test_tc_store_packet_out():
     if fields.get("unload_ok") != "1":
         raise AssertionError("tc_store: pin was not removed")
     frames = load_manifest(TC_MANIFEST)
-    runs = parse_store_out(body, "tc_store", len(frames))
+    runs = parse_store_out(
+        body, "tc_store", len(frames),
+        refused=_refused_frames(frames, "t"),
+    )
     for entry, (fname, retval, byte13) in zip(frames, runs):
         if fname != "t_%s" % entry["file"]:
             raise AssertionError(
                 "tc_store: frame order drift: ran %s, manifest has %s"
                 % (fname, entry["file"])
             )
+        if retval is None:
+            if not net_frame_refused(entry["length"]):
+                raise AssertionError(
+                    "tc_store frame %s unexpectedly refused"
+                    % entry["file"]
+                )
+            continue
         if retval != 0:
             raise AssertionError(
                 "tc_store frame %s: expected return 0, observed %d"
@@ -989,13 +1121,23 @@ def test_tc_load_map_readback():
     if fields.get("unload_ok") != "1":
         raise AssertionError("tc_loadmap: pin was not removed")
     frames = load_manifest(TC_MANIFEST)
-    runs = parse_map_readback(body, "tc_loadmap", len(frames))
+    runs = parse_map_readback(
+        body, "tc_loadmap", len(frames),
+        refused=_refused_frames(frames, "t"),
+    )
     for entry, (fname, retval, map1) in zip(frames, runs):
         if fname != "t_%s" % entry["file"]:
             raise AssertionError(
                 "tc_loadmap: frame order drift: ran %s, manifest has %s"
                 % (fname, entry["file"])
             )
+        if retval is None:
+            if not net_frame_refused(entry["length"]):
+                raise AssertionError(
+                    "tc_loadmap frame %s unexpectedly refused"
+                    % entry["file"]
+                )
+            continue
         want_retval = 2 if entry["length"] < 15 else 0
         if retval != want_retval:
             raise AssertionError(
@@ -1044,6 +1186,15 @@ unload_ok=1
 === END tc_loadmap ===
 """
 
+FRAME_SAMPLE = """=== BEGIN tc_base ===
+load_exit=0
+--- tc_base run 0 t_f0015_2b.bin ---
+Return value: 2, duration: 1000ns
+run_exit_0=0
+unload_ok=1
+=== END tc_base ===
+"""
+
 
 def test_parse_attach_sample():
     runs = parse_attach_verdicts(ATTACH_SAMPLE, "socket_attach", 2)
@@ -1061,6 +1212,48 @@ def test_parse_store_sample():
 def test_parse_map_sample():
     runs = parse_map_readback(MAP_SAMPLE, "tc_loadmap", 1)
     assert runs == [("t_f0015_2a.bin", 0, 42)], runs
+
+
+def test_parse_frame_sample():
+    verdicts = parse_frame_verdicts(FRAME_SAMPLE, "tc_base", 1)
+    assert verdicts == [("t_f0015_2b.bin", 2)], verdicts
+
+
+def test_parse_frame_refused():
+    bad = FRAME_SAMPLE.replace(
+        "Return value: 2, duration: 1000ns\n", ""
+    ).replace("run_exit_0=0", "run_exit_0=234")
+    assert bad != FRAME_SAMPLE
+    verdicts = parse_frame_verdicts(
+        bad, "tc_base", 1, refused=("t_f0015_2b.bin",)
+    )
+    assert verdicts == [("t_f0015_2b.bin", None)], verdicts
+
+
+def test_parse_frame_refuses_unlisted_refusal():
+    bad = FRAME_SAMPLE.replace(
+        "Return value: 2, duration: 1000ns\n", ""
+    ).replace("run_exit_0=0", "run_exit_0=234")
+    assert bad != FRAME_SAMPLE
+    _refuses(parse_frame_verdicts, bad, "tc_base", 1)
+
+
+def test_parse_frame_refuses_wrong_exit():
+    bad = FRAME_SAMPLE.replace(
+        "Return value: 2, duration: 1000ns\n", ""
+    ).replace("run_exit_0=0", "run_exit_0=1")
+    assert bad != FRAME_SAMPLE
+    _refuses(
+        parse_frame_verdicts, bad, "tc_base", 1,
+        ("t_f0015_2b.bin",),
+    )
+
+
+def test_parse_frame_refuses_ran_listed():
+    _refuses(
+        parse_frame_verdicts, FRAME_SAMPLE, "tc_base", 1,
+        ("t_f0015_2b.bin",),
+    )
 
 
 def _refuses(func, *args):
@@ -1103,6 +1296,26 @@ def test_parse_store_refuses_out_of_order():
     _refuses(parse_store_out, bad, "tc_store", 1)
 
 
+def test_parse_store_refused():
+    # The stale stored byte stays in the sample: a refused
+    # run yields None without reading it.
+    bad = STORE_SAMPLE.replace(
+        "Return value: 0, duration: 1000ns\n", ""
+    ).replace("run_exit_0=0", "run_exit_0=234")
+    assert bad != STORE_SAMPLE
+    runs = parse_store_out(
+        bad, "tc_store", 1, refused=("t_f0064_2a.bin",)
+    )
+    assert runs == [("t_f0064_2a.bin", None, None)], runs
+
+
+def test_parse_store_refuses_ran_listed():
+    _refuses(
+        parse_store_out, STORE_SAMPLE, "tc_store", 1,
+        ("t_f0064_2a.bin",),
+    )
+
+
 def test_parse_map_refuses_nonzero_exit():
     bad = MAP_SAMPLE.replace("run_exit_0=0", "run_exit_0=17")
     assert bad != MAP_SAMPLE
@@ -1113,6 +1326,26 @@ def test_parse_map_refuses_missing_exit():
     bad = MAP_SAMPLE.replace("run_exit_0=0\n", "")
     assert bad != MAP_SAMPLE
     _refuses(parse_map_readback, bad, "tc_loadmap", 1)
+
+
+def test_parse_map_refused():
+    # The stale map readback stays in the sample: a refused
+    # run yields None without reading it.
+    bad = MAP_SAMPLE.replace(
+        "Return value: 0, duration: 1000ns\n", ""
+    ).replace("run_exit_0=0", "run_exit_0=234")
+    assert bad != MAP_SAMPLE
+    runs = parse_map_readback(
+        bad, "tc_loadmap", 1, refused=("t_f0015_2a.bin",)
+    )
+    assert runs == [("t_f0015_2a.bin", None, None)], runs
+
+
+def test_parse_map_refuses_ran_listed():
+    _refuses(
+        parse_map_readback, MAP_SAMPLE, "tc_loadmap", 1,
+        ("t_f0015_2a.bin",),
+    )
 
 
 def test_parse_attach_refuses_nonzero_exit():
@@ -1273,6 +1506,42 @@ CASE_INPUTS = {
         "objects": [], "corpus": [],
     },
     "test_parse_attach_refuses_missing_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_frame_sample": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_frame_refused": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_frame_refuses_unlisted_refusal": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_frame_refuses_wrong_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_frame_refuses_ran_listed": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_store_refused": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_store_refuses_ran_listed": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_map_refused": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_map_refuses_ran_listed": {
         "sources": [("impl", __file__)],
         "objects": [], "corpus": [],
     },

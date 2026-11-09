@@ -152,6 +152,30 @@ ADV_NULL_REJECT_CLASS = "invalid mem access"
 
 VNG_TIMEOUT = 1500
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+SHORT_TAGS = ("base-short", "mut-short")
+SHORT_LANE = {
+    "v6.12": 0,
+    "v6.6": 0,
+    "v7.0.14": 1,
+    "v7.2": 1,
+    "v7.4-rc1": 1,
+}
+
+
+def short_expect():
+    """Harness exit for sub-14-byte inputs: 0 on 6.x, else 1.
+
+    7.x kernels refuse short test-run inputs with EINVAL
+    (runtime exit 1); 6.x runs them. Unpinned releases
+    refuse to guess.
+    """
+    try:
+        return SHORT_LANE[VNG_RELEASE]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the short-input verdict for release %s with "
+            "evidence; refusing to guess" % VNG_RELEASE
+        )
 
 XDP_DROP = 1
 XDP_PASS = 2
@@ -635,12 +659,15 @@ def executed():
 
 def _case_record(tag):
     record = executed()["results"][tag]
+    expect = short_expect() if tag in SHORT_TAGS else 0
     guest_proc.check_harness_exit(
         tag, exit=record["_harness_exit"],
         classification=record.get("classification"),
         stage=record.get("stage"),
         contract_version=record.get("contract_version"),
-        note=record.get("note"), expect=0)
+        note=record.get("note"), expect=expect)
+    if expect == 1:
+        guest_proc.check_kernel_einval_refusal(tag, record)
     return record
 
 
@@ -668,10 +695,14 @@ def test_fixture_bytes():
 def test_base_packet_actions():
     observed = {}
     for tag in ("base-drop", "base-pass", "base-short"):
-        observed[tag] = _case_record(tag)["actual_action"]
+        record = _case_record(tag)
+        if record["_harness_exit"] == 1:
+            continue
+        observed[tag] = record["actual_action"]
     assert observed["base-drop"] == XDP_DROP, "drop fixture must drop"
     assert observed["base-pass"] == XDP_PASS, "pass fixture must pass"
-    assert observed["base-short"] == XDP_PASS, "short fixture must pass"
+    if "base-short" in observed:
+        assert observed["base-short"] == XDP_PASS, "short fixture must pass"
     assert observed["base-drop"] != observed["base-pass"], (
         "the two full-size fixtures must produce distinct actions"
     )
@@ -683,7 +714,8 @@ def test_mutation_changes_behavior():
         _case_record(tag)
     assert run["results"]["mut-drop"]["actual_action"] == XDP_PASS
     assert run["results"]["mut-pass"]["actual_action"] == XDP_DROP
-    assert run["results"]["mut-short"]["actual_action"] == XDP_PASS
+    if run["results"]["mut-short"]["_harness_exit"] == 0:
+        assert run["results"]["mut-short"]["actual_action"] == XDP_PASS
     assert run["results"]["mut-drop"]["actual_action"] != run["results"][
         "base-drop"
     ]["actual_action"], "rebuilt mutant must change the drop action"
@@ -778,12 +810,15 @@ def test_fd_lifecycle_and_residue():
     run = executed()
     for tag, _, _, _, want_exit in CASES:
         record = run["results"][tag]
+        want = short_expect() if tag in SHORT_TAGS else want_exit
         guest_proc.check_harness_exit(
             tag, exit=record["_harness_exit"],
             classification=record.get("classification"),
             stage=record.get("stage"),
             contract_version=record.get("contract_version"),
-            note=record.get("note"), expect=want_exit)
+            note=record.get("note"), expect=want)
+        if want == 1:
+            guest_proc.check_kernel_einval_refusal(tag, record)
         assert record.get("cleanup_ok") is True, (
             "%s: harness must report cleanup_ok" % tag
         )

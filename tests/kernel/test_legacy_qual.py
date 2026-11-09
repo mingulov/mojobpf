@@ -65,6 +65,23 @@ ABS_IND_MESSAGE = (
 )
 LEN_MESSAGE = "unknown opcode 80"
 MSH_MESSAGE = "BPF_LDX uses reserved fields"
+MSH_MESSAGE_LANE = {
+    "v6.12": MSH_MESSAGE,
+    "v6.6": MSH_MESSAGE,
+    "v7.0.14": MSH_MESSAGE,
+    "v7.2": "unknown opcode b1",
+    "v7.4-rc1": "unknown opcode b1",
+}
+
+
+def msh_message():
+    try:
+        return MSH_MESSAGE_LANE[VNG_RELEASE]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the msh refusal marker for release %s with "
+            "evidence; refusing to guess" % VNG_RELEASE
+        )
 
 # Byte-exact legacy words per staged object: (slot, word).
 LEGACY_WORDS = {
@@ -338,7 +355,7 @@ def test_legacy_len_refused():
 
 
 def test_legacy_msh_refused():
-    return guest_proc.combine_outcomes(_refused("msh", MSH_MESSAGE))
+    return guest_proc.combine_outcomes(_refused("msh", msh_message()))
 
 
 def test_legacy_guest_objects_carry_legacy():

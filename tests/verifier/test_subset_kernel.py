@@ -86,6 +86,29 @@ XDP_PASS = 2
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+SHORT_LANE = {
+    "v6.12": 0,
+    "v6.6": 0,
+    "v7.0.14": 1,
+    "v7.2": 1,
+    "v7.4-rc1": 1,
+}
+
+
+def short_expect():
+    """Harness exit for guard (10-byte) inputs: 0 on 6.x, else 1.
+
+    7.x kernels refuse short test-run inputs with EINVAL
+    (runtime exit 1); 6.x runs them. Unpinned releases
+    refuse to guess.
+    """
+    try:
+        return SHORT_LANE[VNG_RELEASE]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the short-input verdict for release %s with "
+            "evidence; refusing to guess" % VNG_RELEASE
+        )
 VNG_TIMEOUT = 900
 MASK64 = (1 << 64) - 1
 
@@ -97,6 +120,9 @@ MASK64 = (1 << 64) - 1
 LOOP_SUM_LANE = {
     "v6.12": "pass",
     "v6.6": "reject",
+    "v7.0.14": "pass",
+    "v7.2": "pass",
+    "v7.4-rc1": "pass",
 }
 LOOP_SUM_REJECT_LOG = "back-edge from insn 18 to 19"
 
@@ -544,12 +570,17 @@ def check_shape(shape):
         assert case_shape == shape
         expected = classify(shape, run["packets"][key])
         record = run["results"][tag]
+        expect = short_expect() if tag in GUARD_TAGS else 0
         guest_proc.check_harness_exit(
             tag, exit=record["_harness_exit"],
             classification=record.get("classification"),
             stage=record.get("stage"),
             contract_version=record.get("contract_version"),
-            note=record.get("note"), expect=0)
+            note=record.get("note"), expect=expect)
+        if expect == 1:
+            guest_proc.check_kernel_einval_refusal(tag, record)
+            matched += 1
+            continue
         assert record.get("actual_action") == expected, (
             "%s: observed %r, predicted %r"
             % (tag, record.get("actual_action"), expected)

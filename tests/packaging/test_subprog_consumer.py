@@ -118,6 +118,29 @@ XDP_PASS = 2
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+SHORT_LANE = {
+    "v6.12": 0,
+    "v6.6": 0,
+    "v7.0.14": 1,
+    "v7.2": 1,
+    "v7.4-rc1": 1,
+}
+
+
+def short_expect():
+    """Harness exit for sub-14-byte inputs: 0 on 6.x, else 1.
+
+    7.x kernels refuse short test-run inputs with EINVAL
+    (runtime exit 1); 6.x runs them. Unpinned releases
+    refuse to guess.
+    """
+    try:
+        return SHORT_LANE[VNG_RELEASE]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the short-input verdict for release %s with "
+            "evidence; refusing to guess" % VNG_RELEASE
+        )
 VNG_TIMEOUT = 900
 
 _FIXTURE = {}
@@ -2099,14 +2122,21 @@ def test_consumer_exact_kernel_result():
         "run_drop_exit",
         "run_pass_exit",
         "run_zero_exit",
-        "run_short_exit",
     ):
         assert fields.get(key) == "0", "%s=%r" % (key, fields.get(key))
+    if short_expect() == 1:
+        assert fields.get("run_short_exit") == "234", (
+            "run_short_exit=%r" % fields.get("run_short_exit")
+        )
+    else:
+        assert fields.get("run_short_exit") == "0", (
+            "run_short_exit=%r" % fields.get("run_short_exit")
+        )
+        assert parse_run_action(body, "run-short ---") == XDP_PASS
     assert fields.get("unload_ok") == "1", "pin was not removed"
     assert parse_run_action(body, "run-drop ---") == XDP_DROP
     assert parse_run_action(body, "run-pass ---") == XDP_PASS
     assert parse_run_action(body, "run-zero ---") == XDP_PASS
-    assert parse_run_action(body, "run-short ---") == XDP_PASS
 
 
 def test_consumer_standard_runner_passes():
@@ -2125,12 +2155,16 @@ def test_consumer_standard_runner_passes():
                 "%s: harness did not emit JSON:\n%s"
                 % (tag, record["body"][-500:])
             )
+        harness_expect = short_expect() if tag == "sub-short" else 0
         guest_proc.check_harness_exit(
             tag, exit=record["exit"],
             classification=doc.get("classification"),
             stage=doc.get("stage"),
             contract_version=doc.get("contract_version"),
-            note=doc.get("note"), expect=0)
+            note=doc.get("note"), expect=harness_expect)
+        if harness_expect == 1:
+            guest_proc.check_kernel_einval_refusal(tag, doc)
+            continue
         assert doc.get("contract_version") == 2, (tag, doc)
         assert doc.get("status") == "pass", (tag, doc)
         assert doc.get("stage") == "run", (tag, doc)

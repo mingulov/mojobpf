@@ -113,6 +113,37 @@ WANT_WORD = (29, 0x5A000001B4)
 # the load stderr).
 STORE_REL_MESSAGE = "BPF_ATOMIC uses invalid atomic opcode 110"
 LOAD_ACQ_MESSAGE = "BPF_ATOMIC uses invalid atomic opcode 100"
+ACQREL_LANE = {
+    "v6.12": "refuse",
+    "v6.6": "refuse",
+    "v7.0.14": "accept",
+    "v7.2": "accept",
+    "v7.4-rc1": "accept",
+}
+
+
+def acqrel_mode():
+    """Recorded acq/rel verdict: refuse on 6.x, accept on 7.x.
+
+    7.x verifiers accept the release/acquire atomic opcodes
+    (observed: the refused object loads and runs, returning
+    2); 6.x refuses them with the pinned opcode messages.
+    Unpinned releases refuse to guess.
+    """
+    try:
+        return ACQREL_LANE[VNG_RELEASE]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the acqrel verdict for release %s with "
+            "evidence; refusing to guess" % VNG_RELEASE
+        )
+
+
+def _acqrel_case(tag, obj):
+    """CASES row for an acq/rel leg on this release."""
+    if acqrel_mode() == "accept":
+        return (tag, obj, XDP_PASS, 0, "pkt_zero64.bin")
+    return (tag, obj, XDP_ABORTED, 4, "pkt_zero64.bin")
 
 CASES = [
     ("c-zero", "cref.bpf.o", XDP_PASS, 0, "pkt_zero64.bin"),
@@ -120,8 +151,8 @@ CASES = [
     ("oll-zero", "oll.bpf.o", XDP_PASS, 0, "pkt_zero64.bin"),
     ("oll-mixed", "oll.bpf.o", XDP_DROP, 0, "pkt_mixed64.bin"),
     ("oasm", "oasm.bpf.o", OASM_ACTION, 0, "pkt_zero64.bin"),
-    ("acqrel", "refused.bpf.o", XDP_ABORTED, 4, "pkt_zero64.bin"),
-    ("acqonly", "acqonly.bpf.o", XDP_ABORTED, 4, "pkt_zero64.bin"),
+    _acqrel_case("acqrel", "refused.bpf.o"),
+    _acqrel_case("acqonly", "acqonly.bpf.o"),
     ("mut-zero", "mutated.bpf.o", XDP_ABORTED, 0, "pkt_zero64.bin"),
     ("stale", "cref.bpf.o", XDP_DROP, 1, "pkt_zero64.bin"),
 ]
@@ -527,6 +558,17 @@ def test_atomic_acqrel_refused():
     for tag, message in (("acqrel", STORE_REL_MESSAGE),
                          ("acqonly", LOAD_ACQ_MESSAGE)):
         record = run["results"][tag]
+        if acqrel_mode() == "accept":
+            hints.append(guest_proc.check_harness_exit(
+                tag, exit=record["_harness_exit"],
+                classification=record.get("classification"),
+                stage=record.get("stage"),
+                contract_version=record.get("contract_version"),
+                note=record.get("note"), expect=0))
+            assert record["actual_action"] == XDP_PASS, (
+                "%s: accepted acq/rel leg must return XDP_PASS, "
+                "observed %r" % (tag, record["actual_action"]))
+            continue
         hints.append(guest_proc.check_harness_exit(
             tag, exit=record["_harness_exit"],
             classification=record.get("classification"),
@@ -686,13 +728,17 @@ def test_guest_provenance():
 
 
 CASE_DENIALS = {
-    "test_atomic_acqrel_refused": (
-        "test_atomic_oracles_execute", "VERIFY"
-    ),
     "test_atomic_stale_object_fails": (
         "test_atomic_mutation_aborts", "RUNTIME"
     ),
 }
+if acqrel_mode() == "refuse":
+    # The verifier denial exists only on refusing releases;
+    # on accepting releases the leg is positive (a denial
+    # entry would reject its PASS observation).
+    CASE_DENIALS["test_atomic_acqrel_refused"] = (
+        "test_atomic_oracles_execute", "VERIFY"
+    )
 
 CASE_INPUTS = {
     "test_fixture_bytes": {

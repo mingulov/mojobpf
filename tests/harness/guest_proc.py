@@ -1909,6 +1909,38 @@ def _availability_from_note(note):
     return "UNKNOWN"
 
 
+def check_kernel_einval_refusal(tag, record):
+    """Assert a 7.x short-input kernel refusal (test-run EINVAL).
+
+    7.x kernels refuse ``bpf_prog_test_run`` inputs shorter than
+    the per-type minimum with EINVAL (bpftool exits 234 =
+    256-errno); 6.x runs them. ``record`` is the consumed
+    bpf_test_run record, already exit-checked. Fails closed:
+    anything but exactly one test-run command exiting 234
+    with an invalid-argument diagnostic is an AssertionError,
+    never a pass.
+    """
+    runs = [
+        command for command in record.get("commands", [])
+        if "prog" in command.get("argv", [])
+        and "run" in command.get("argv", [])
+    ]
+    assert len(runs) == 1, (
+        "%s: expected one test-run command, got %d"
+        % (tag, len(runs))
+    )
+    assert runs[0].get("exit_code") == 234, (
+        "%s: expected bpftool exit 234 (EINVAL), got %r"
+        % (tag, runs[0].get("exit_code"))
+    )
+    assert "invalid argument" in (
+        runs[0].get("stderr") or ""
+    ).lower(), (
+        "%s: expected an invalid-argument diagnostic, got %r"
+        % (tag, runs[0].get("stderr"))
+    )
+
+
 def check_harness_exit(tag, *, exit, classification, stage,
                        contract_version=None, note=None, expect=0,
                        expect_environment=False):

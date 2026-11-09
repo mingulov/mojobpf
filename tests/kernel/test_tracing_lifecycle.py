@@ -137,6 +137,9 @@ SPLIT_MAP = "arena"
 SPLIT_MAP_LANE = {
     "v6.12": True,
     "v6.6": False,
+    "v7.0.14": True,
+    "v7.2": True,
+    "v7.4-rc1": True,
 }
 
 GUEST_TIMEOUT = 900
@@ -1704,10 +1707,25 @@ def assert_no_never_tokens(commands, where):
             )
 
 
+def _release_major_minor(name):
+    """(major, minor) from a lane release or kernel version stem.
+
+    Lane releases (v6.12, v7.0.14, v7.4-rc1) and kernel
+    version stems (6.12.0, 7.4.0) compare by major.minor:
+    every pinned lane has a unique pair, so equality is
+    lane identity without overfitting patch/rc spellings.
+    """
+    stem = name[1:] if name.startswith("v") else name
+    parts = stem.split(".")
+    return (int(parts[0]), int(re.sub(r"\D.*$", "", parts[1])))
+
+
 def assert_guest_lane(record, where):
     release = vng_release()
     kernel = (record.get("guest") or {}).get("kernel") or ""
-    assert kernel.startswith(release[1:] + "."), (
+    release_pair = _release_major_minor(release)
+    kernel_pair = _release_major_minor("v" + kernel.split("-")[0])
+    assert release_pair == kernel_pair, (
         "%s: guest kernel %r does not match lane %s"
         % (where, kernel, release)
     )
