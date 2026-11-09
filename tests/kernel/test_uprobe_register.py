@@ -148,6 +148,26 @@ def vlog_want_insns():
             "with evidence; refusing to guess"
             % (GUEST_ROUTE, vng_release())
         )
+
+
+STACK_DEPTH_LANE = {
+    "v6.12": "stack depth 16",
+    "v6.6": "stack depth 16",
+    "v7.0.14": "stack depth 16",
+    "v7.2": "stack depth 16",
+    "v7.4-rc1": "stack depth max 16",
+}
+
+
+def stack_depth_line():
+    """Pinned verifier stack-depth line on this release."""
+    try:
+        return STACK_DEPTH_LANE[vng_release()]
+    except KeyError:
+        raise EnvironmentFailure(
+            "pin the stack-depth line for release %s with "
+            "evidence; refusing to guess" % vng_release()
+        )
 # Lowering model contract, pinned with
 # compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
 # loudly at spec parse, never as a silent mismatch.
@@ -176,10 +196,6 @@ ADV_MUTANT = (
     ),
     "getelementptr inbounds i64, ptr %0, i32 14000",
 )
-ADV_CTX_REJECT_LINE = (
-    "dereference of modified ctx ptr R1 off=112000 disallowed"
-)
-
 PROFILE = "linux-bpfel-v3-uprobe"
 MATCH_N = 1000
 MISMATCH_M = 500
@@ -1103,7 +1119,7 @@ def test_verifier_rejects_oob_context():
     )
     assert "adv-ctx: rejected" in output
     assert "advctx-load-exit: 255" in output, output[-2000:]
-    assert ADV_CTX_REJECT_LINE in output
+    assert advctx_marker() in output, output[-2000:]
     print("PASS verifier rejects the out-of-bounds context read")
 
 
@@ -1121,12 +1137,14 @@ def test_vlog_captured():
     # Per-route, per-release verifier count (VLOG_INSNS_LANE):
     # the parsed backend emits tighter code than Lane-A on
     # 6.x; 7.x verifiers process 41 on both routes. The pinned
-    # load, the single function, and the stack depth agree.
+    # load, the single function, and the stack depth value
+    # agree; only the 7.4-rc1 depth wording differs.
     want_insns = "processed %d insns" % vlog_want_insns()
     assert want_insns in output, output[-2000:]
-    assert "stack depth 16" in output, output[-2000:]
-    print("PASS verifier log: ctx+112 load, %s, stack depth 16"
-          % want_insns)
+    want_depth = stack_depth_line()
+    assert want_depth in output, output[-2000:]
+    print("PASS verifier log: ctx+112 load, %s, %s"
+          % (want_insns, want_depth))
 
 
 def test_no_residue():

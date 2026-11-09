@@ -467,12 +467,19 @@ def test_guest_provenance():
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
     for tag, _, _, _, want_exit in CASES:
         record = run["results"][tag]
+        want = (
+            short_expect()
+            if tag in ("base-short", "mut-short")
+            else want_exit
+        )
         guest_proc.check_harness_exit(
             tag, exit=record["_harness_exit"],
             classification=record.get("classification"),
             stage=record.get("stage"),
             contract_version=record.get("contract_version"),
-            note=record.get("note"), expect=want_exit)
+            note=record.get("note"), expect=want)
+        if tag in ("base-short", "mut-short") and want == 1:
+            guest_proc.check_kernel_einval_refusal(tag, record)
         assert record.get("cleanup_ok") is True, (
             "%s: harness must report cleanup_ok" % tag
         )

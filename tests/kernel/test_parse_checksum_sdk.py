@@ -746,7 +746,12 @@ def test_checksum_exactness():
 
 
 def test_guard_paths():
-    """Truncated frames prove the guard paths: DROP with too few bytes."""
+    """Truncated frames prove the guard paths: DROP with too few bytes.
+
+    On 7.x, sub-14-byte guard frames are kernel-refused
+    (EINVAL) before the guard logic runs; the refusal pins
+    fail-closed at the kernel boundary instead.
+    """
     run = executed()
     needs = {
         "parse_eth": 14,
@@ -756,17 +761,21 @@ def test_guard_paths():
     for tag in GUARD_TAGS:
         shape, key = CASES[tag]
         record = run["results"][tag]
+        size = len(run["packets"][key])
+        expect = short_expect() if size < 14 else 0
         guest_proc.check_harness_exit(
             tag, exit=record["_harness_exit"],
             classification=record.get("classification"),
             stage=record.get("stage"),
             contract_version=record.get("contract_version"),
-            note=record.get("note"), expect=0)
-        assert record["actual_action"] == XDP_DROP, (
-            "%s: guard path must fail closed to DROP, got %r"
-            % (tag, record.get("actual_action"))
-        )
-        size = len(run["packets"][key])
+            note=record.get("note"), expect=expect)
+        if expect == 1:
+            guest_proc.check_kernel_einval_refusal(tag, record)
+        else:
+            assert record["actual_action"] == XDP_DROP, (
+                "%s: guard path must fail closed to DROP, got %r"
+                % (tag, record.get("actual_action"))
+            )
         if shape == "parse_trunc":
             if tag == "trunc-short10":
                 assert size < 14, (
@@ -805,12 +814,17 @@ def test_guest_provenance():
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
     for tag in sorted(CASES):
         record = run["results"][tag]
+        _shape, key = CASES[tag]
+        size, _patches = FRAMES[key]
+        expect = short_expect() if size < 14 else 0
         guest_proc.check_harness_exit(
             tag, exit=record["_harness_exit"],
             classification=record.get("classification"),
             stage=record.get("stage"),
             contract_version=record.get("contract_version"),
-            note=record.get("note"), expect=0)
+            note=record.get("note"), expect=expect)
+        if expect == 1:
+            guest_proc.check_kernel_einval_refusal(tag, record)
         assert record.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )

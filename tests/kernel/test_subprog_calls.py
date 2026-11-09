@@ -817,7 +817,7 @@ def test_fd_lifecycle_and_residue():
             stage=record.get("stage"),
             contract_version=record.get("contract_version"),
             note=record.get("note"), expect=want)
-        if want == 1:
+        if tag in SHORT_TAGS and want == 1:
             guest_proc.check_kernel_einval_refusal(tag, record)
         assert record.get("cleanup_ok") is True, (
             "%s: harness must report cleanup_ok" % tag

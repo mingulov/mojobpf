@@ -617,7 +617,15 @@ SUITE_CASES = {
         "test_parse_map_refuses_nonzero_exit "
         "test_parse_map_refuses_missing_exit "
         "test_parse_attach_refuses_nonzero_exit "
-        "test_parse_attach_refuses_missing_exit"
+        "test_parse_attach_refuses_missing_exit "
+        "test_parse_frame_sample test_parse_frame_refused "
+        "test_parse_frame_refuses_unlisted_refusal "
+        "test_parse_frame_refuses_wrong_exit "
+        "test_parse_frame_refuses_ran_listed "
+        "test_parse_store_refused "
+        "test_parse_store_refuses_ran_listed "
+        "test_parse_map_refused "
+        "test_parse_map_refuses_ran_listed"
     ).split(),
     "kernel-lru": (
         "test_decode_bpftool_lru_dump_shape  "
@@ -815,6 +823,29 @@ SUITE_DENIALS = {
         ),
         "test_unchecked_rejected_by_verifier": (
             "test_lifecycle_init_run_observe", "VERIFY"
+        ),
+    },
+}
+
+# Lane-scoped denial overrides: (suite_id, lane release) ->
+# the denial map the emitted plan must carry instead of the
+# SUITE_DENIALS entry. 7.x verifiers accept release/acquire
+# atomics, so the acqrel refusal denial exists only on 6.x
+# lanes; the suite's CASE_DENIALS mirrors this table.
+SUITE_DENIAL_OVERRIDES = {
+    ("kernel-isa-atomic", "v7.0.14"): {
+        "test_atomic_stale_object_fails": (
+            "test_atomic_mutation_aborts", "RUNTIME"
+        ),
+    },
+    ("kernel-isa-atomic", "v7.2"): {
+        "test_atomic_stale_object_fails": (
+            "test_atomic_mutation_aborts", "RUNTIME"
+        ),
+    },
+    ("kernel-isa-atomic", "v7.4-rc1"): {
+        "test_atomic_stale_object_fails": (
+            "test_atomic_mutation_aborts", "RUNTIME"
         ),
     },
 }
@@ -2340,6 +2371,10 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
             )
         )
         return record
+    expected_denials = SUITE_DENIAL_OVERRIDES.get(
+        (suite_id, lane["release"]),
+        SUITE_DENIALS.get(suite_id, {}),
+    )
     outcome, note, detail = accept_suite_output(
         suite_id,
         expected_cases,
@@ -2348,7 +2383,7 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
         commit,
         target_manifest,
         suite_sha256,
-        SUITE_DENIALS.get(suite_id, {}),
+        expected_denials,
     )
     record["outcome"] = outcome
     record["verdict"] = detail["verdict"]

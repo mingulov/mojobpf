@@ -90,15 +90,16 @@ SHORT_LANE = {
     "v7.4-rc1": 1,
 }
 # TC/socket test-run minimum on refusing releases: frames
-# shorter than this are kernel-refused (EINVAL). XDP legs
-# run 14-byte frames on the same kernels; TC/socket refuse
-# them, so the net boundary is one byte higher.
-NET_REFUSE_LEN = 15
+# shorter than this are kernel-refused (EINVAL). Probed on
+# 7.x: 14- and 15-byte frames refuse, 16-byte frames run.
+# XDP legs run 14-byte frames on the same kernels, so the
+# net boundary is two bytes higher.
+NET_REFUSE_LEN = 16
 VNG_TIMEOUT = 900
 
 
 def short_refused():
-    """1 when this release refuses sub-15-byte TC/socket runs.
+    """1 when this release refuses sub-16-byte TC/socket runs.
 
     7.x kernels refuse short test-run inputs with EINVAL
     (bpftool exit 234, no return-value line); 6.x runs
@@ -773,6 +774,13 @@ def test_tc_stale_object_fails():
         refused=_refused_frames(frames, "t"),
     )
     for entry, (_, observed) in zip(frames, verdicts):
+        if observed is None:
+            if not net_frame_refused(entry["length"]):
+                raise AssertionError(
+                    "stale frame %s unexpectedly refused"
+                    % entry["file"]
+                )
+            continue
         if entry["length"] < 15:
             continue
         flipped = 0 if entry["verdict"] == 2 else 2
