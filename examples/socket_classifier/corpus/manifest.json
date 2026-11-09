@@ -22,6 +22,13 @@
       "sha256": "f29c8404bcecdc5225fdcb539e62a93c53a4cddae15d1da14f3495c99be37a98"
     },
     {
+      "file": "f0016_2b.bin",
+      "length": 16,
+      "byte14": 43,
+      "verdict": 0,
+      "sha256": "aafb9ce6158bb02e1811eb0c78cfb32fdb65a9bc0de2a021a999162eb3c61efb"
+    },
+    {
       "file": "f0064_2a.bin",
       "length": 64,
       "byte14": 42,

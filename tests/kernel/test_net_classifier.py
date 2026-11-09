@@ -649,11 +649,7 @@ def parse_frame_verdicts(body, tag, count, refused=()):
             r"[Rr]eturn value:\s*(\d+)", section
         )
         if len(found) == 0 and fname in refused:
-            if "run_exit_%s=234" % idx not in section:
-                raise AssertionError(
-                    "%s run %s: refused frame must exit 234, got %r"
-                    % (tag, idx, section[-200:])
-                )
+            _require_refused_exit(section, tag, idx)
             verdicts.append((fname, None))
             continue
         if len(found) != 1:
@@ -666,10 +662,7 @@ def parse_frame_verdicts(body, tag, count, refused=()):
                 "%s run %s: frame %s was listed refused but the "
                 "kernel ran it" % (tag, idx, fname)
             )
-        if "run_exit_%s=0" % idx not in section:
-            raise AssertionError(
-                "%s run %s: bpftool prog run must exit 0" % (tag, idx)
-            )
+        _require_zero_exit(section, tag, idx)
         verdicts.append((fname, int(found[0])))
     if len(verdicts) != count:
         raise AssertionError(
@@ -823,10 +816,28 @@ def _require_ordered_section(runs, tag, idx):
         )
 
 
+def _exit_values(section, idx):
+    """All run-exit values recorded for one run section, in order."""
+    return re.findall(
+        r"^run_exit_%d=(\d+)\s*$" % int(idx), section, re.M
+    )
+
+
 def _require_zero_exit(section, tag, idx):
-    if "run_exit_%d=0" % idx not in section:
+    found = _exit_values(section, idx)
+    if found != ["0"]:
         raise AssertionError(
-            "%s run %d: frame command must exit 0" % (tag, idx)
+            "%s run %s: frame command must exit 0 exactly once, "
+            "got %r" % (tag, idx, found)
+        )
+
+
+def _require_refused_exit(section, tag, idx):
+    found = _exit_values(section, idx)
+    if found != ["234"]:
+        raise AssertionError(
+            "%s run %s: refused frame must exit 234 exactly once, "
+            "got %r" % (tag, idx, found)
         )
 
 
@@ -886,11 +897,7 @@ def parse_store_out(body, tag, count, refused=()):
         _require_ordered_section(runs, tag, idx)
         found = re.findall(r"[Rr]eturn value:\s*(\d+)", section)
         if len(found) == 0 and fname in refused:
-            if "run_exit_%d=234" % idx not in section:
-                raise AssertionError(
-                    "%s run %d: refused frame must exit 234, got %r"
-                    % (tag, idx, section[-200:])
-                )
+            _require_refused_exit(section, tag, idx)
             runs.append((fname, None, None))
             continue
         if len(found) != 1:
@@ -936,11 +943,7 @@ def parse_map_readback(body, tag, count, refused=()):
         _require_ordered_section(runs, tag, idx)
         found = re.findall(r"[Rr]eturn value:\s*(\d+)", section)
         if len(found) == 0 and fname in refused:
-            if "run_exit_%d=234" % idx not in section:
-                raise AssertionError(
-                    "%s run %d: refused frame must exit 234, got %r"
-                    % (tag, idx, section[-200:])
-                )
+            _require_refused_exit(section, tag, idx)
             runs.append((fname, None, None))
             continue
         if len(found) != 1:
@@ -1264,6 +1267,25 @@ def test_parse_frame_refuses_ran_listed():
     )
 
 
+def test_parse_frame_refuses_contradictory_exit():
+    bad = FRAME_SAMPLE.replace(
+        "Return value: 2, duration: 1000ns\n", ""
+    ).replace("run_exit_0=0\n", "run_exit_0=0\nrun_exit_0=234\n")
+    assert bad != FRAME_SAMPLE
+    _refuses(
+        parse_frame_verdicts, bad, "tc_base", 1,
+        ("t_f0015_2b.bin",),
+    )
+
+
+def test_parse_frame_refuses_duplicate_exit():
+    bad = FRAME_SAMPLE.replace(
+        "run_exit_0=0\n", "run_exit_0=0\nrun_exit_0=0\n"
+    )
+    assert bad != FRAME_SAMPLE
+    _refuses(parse_frame_verdicts, bad, "tc_base", 1)
+
+
 def _refuses(func, *args):
     try:
         func(*args)
@@ -1534,6 +1556,14 @@ CASE_INPUTS = {
         "objects": [], "corpus": [],
     },
     "test_parse_frame_refuses_ran_listed": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_frame_refuses_contradictory_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_frame_refuses_duplicate_exit": {
         "sources": [("impl", __file__)],
         "objects": [], "corpus": [],
     },

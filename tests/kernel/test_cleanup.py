@@ -1527,6 +1527,71 @@ def test_owned_runner_classification():
     print("PASS owned-runner classification pinned (stage/foreign)")
 
 
+def test_stable_resources_ignores_loaded_at_clock():
+    """Normalization drops only wall-clock lines.
+
+    Two snapshots differing solely in loaded_at readings --
+    including the observed 6.6 year-2611 clock flip and a
+    tab-indented line -- compare equal after normalization,
+    but not before (the test exercises the strip).
+    """
+    before = (
+        "1: xdp  name mojobpf  tag abc123  gpl\n"
+        "\tloaded_at 2026-11-09T06:00:00+00:00 uid 0\n"
+        "2: xdp  name other  tag def456  gpl\n"
+        "loaded_at 2026-11-09T06:00:00+00:00 uid 0\n"
+    )
+    after = (
+        "1: xdp  name mojobpf  tag abc123  gpl\n"
+        "\tloaded_at 2611-03-14T09:00:07+00:00 uid 0\n"
+        "2: xdp  name other  tag def456  gpl\n"
+        "loaded_at 2026-11-09T06:00:09+00:00 uid 0\n"
+    )
+    assert before != after, "fixtures must differ before normalization"
+    assert _stable_resources(before) == _stable_resources(after), (
+        "clock-only drift must compare equal"
+    )
+
+
+def test_stable_resources_detects_added_program():
+    """Normalization keeps the leak signal: an added program still fails."""
+    before = (
+        "1: xdp  name mojobpf  tag abc123  gpl\n"
+        "\tloaded_at 2026-11-09T06:00:00+00:00 uid 0\n"
+    )
+    after = (
+        "1: xdp  name mojobpf  tag abc123  gpl\n"
+        "\tloaded_at 2026-11-09T06:00:07+00:00 uid 0\n"
+        "2: xdp  name leaked  tag 999999  gpl\n"
+        "\tloaded_at 2026-11-09T06:00:07+00:00 uid 0\n"
+    )
+    stable_before = _stable_resources(before)
+    stable_after = _stable_resources(after)
+    assert stable_before != stable_after, (
+        "an added program must still fail the census compare"
+    )
+    assert "name leaked" in stable_after, (
+        "the added program must survive normalization"
+    )
+
+
+def test_stable_resources_detects_removed_program():
+    """Normalization keeps the removal signal: a dropped pin still fails."""
+    before = (
+        "1: xdp  name mojobpf  tag abc123  gpl\n"
+        "\tloaded_at 2026-11-09T06:00:00+00:00 uid 0\n"
+        "2: xdp  name pinned  tag 777777  gpl\n"
+        "\tloaded_at 2026-11-09T06:00:00+00:00 uid 0\n"
+    )
+    after = (
+        "1: xdp  name mojobpf  tag abc123  gpl\n"
+        "\tloaded_at 2026-11-09T06:00:07+00:00 uid 0\n"
+    )
+    assert _stable_resources(before) != _stable_resources(after), (
+        "a removed program must still fail the census compare"
+    )
+
+
 # The loader/verifier classification cases are denials: they
 # expect the wire-derived FAIL at LOAD/VERIFY and pass only
 # their own cell when the rejection is observed with evidence.
@@ -1622,6 +1687,21 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_owned_runner_classification": {
+        "sources": [("impl", __file__)],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stable_resources_ignores_loaded_at_clock": {
+        "sources": [("impl", __file__)],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stable_resources_detects_added_program": {
+        "sources": [("impl", __file__)],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stable_resources_detects_removed_program": {
         "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],

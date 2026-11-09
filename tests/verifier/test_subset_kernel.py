@@ -551,6 +551,11 @@ def guest_run():
 
 _EXECUTED = None
 
+# (actions, verified refusals) per check_shape call, in call
+# order; main() sums them for the lane summary. Unused under
+# pytest (main never runs there).
+_SHAPE_SPLITS = []
+
 
 def executed():
     global _EXECUTED
@@ -563,6 +568,7 @@ def check_shape(shape):
     run = executed()
     prefix = SHAPE_TAGS[shape][0]
     matched = 0
+    refused = 0
     for tag in sorted(CASES):
         if not tag.startswith(prefix):
             continue
@@ -579,7 +585,7 @@ def check_shape(shape):
             note=record.get("note"), expect=expect)
         if expect == 1:
             guest_proc.check_kernel_einval_refusal(tag, record)
-            matched += 1
+            refused += 1
             continue
         assert record.get("actual_action") == expected, (
             "%s: observed %r, predicted %r"
@@ -590,9 +596,14 @@ def check_shape(shape):
                 "%s: guard path must fail closed" % tag
             )
         matched += 1
-    assert matched > 0, "no cases matched shape %s" % shape
-    print("PASS %s: %d/%d predicted==observed" % (shape, matched, matched))
-    return matched
+    total = matched + refused
+    assert total > 0, "no cases matched shape %s" % shape
+    print(
+        "PASS %s: %d/%d actions, %d/%d verified refusals"
+        % (shape, matched, matched, refused, refused)
+    )
+    _SHAPE_SPLITS.append((matched, refused))
+    return total
 
 
 def check_rejected(shape, log_line):
@@ -715,6 +726,19 @@ def test_guest_provenance():
         assert record.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
+        shape, _key = CASES[tag]
+        if (
+            shape == "subset_loop_sum"
+            and LOOP_SUM_LANE.get(VNG_RELEASE) == "reject"
+        ):
+            assert record.get("cleanup_ok") is None, (
+                "%s: load-refused shape must leave cleanup_ok unset"
+                % tag
+            )
+        else:
+            assert record.get("cleanup_ok") is True, (
+                "%s: harness must report cleanup_ok" % tag
+            )
     names = (
         ["bpf_test_run.py"]
         + [shape + ".bpf.o" for shape in list(SHAPES) + [neg[0] for neg in NEGATIVES]]
@@ -912,16 +936,27 @@ def main():
             matched += 1
     if failures or unavailable_seen:
         return _finish(rec, unavailable_seen)
+    actions = sum(split[0] for split in _SHAPE_SPLITS)
+    refused = sum(split[1] for split in _SHAPE_SPLITS)
+    total = actions + refused
     if LOOP_SUM_LANE.get(VNG_RELEASE) == "reject":
+        assert total == 17, (
+            "reject lane must account 17 shape cases, got %d" % total
+        )
         print(
-            "subset kernel: %d tests green, 17/17 predicted==observed, "
+            "subset kernel: %d tests green, 17/17 accounted "
+            "(%d actions, %d verified refusals), "
             "4/4 verifier rejections (3 loop_sum lane pins + oob)"
-            % matched
+            % (matched, actions, refused)
         )
     else:
+        assert total == 20, (
+            "pass lane must account 20 shape cases, got %d" % total
+        )
         print(
-            "subset kernel: %d tests green, 20/20 predicted==observed, "
-            "1/1 verifier rejection" % matched
+            "subset kernel: %d tests green, 20/20 accounted "
+            "(%d actions, %d verified refusals), "
+            "1/1 verifier rejection" % (matched, actions, refused)
         )
     return _finish(rec, unavailable_seen)
 

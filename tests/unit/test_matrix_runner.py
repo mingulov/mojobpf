@@ -2614,11 +2614,47 @@ def test_accept_satisfied_denial_needs_workload():
     assert "no-op workload" in note, note
 
 
+def _lock_releases():
+    with open(
+        os.path.join(REPO_ROOT, "ci", "kernels.lock.json"),
+        encoding="utf-8",
+    ) as handle:
+        lock = json.load(handle)
+    return sorted({lane["release"] for lane in lock["lanes"]})
+
+
+def _effective_suite_denials(relpath, release):
+    """Import the suite file fresh with VNG_RELEASE=release.
+
+    Returns the effective CASE_DENIALS for that release,
+    honoring any release-conditional entries the suite
+    computes at import.
+    """
+    prev = os.environ.get("MOJOBPF_VNG_RELEASE")
+    os.environ["MOJOBPF_VNG_RELEASE"] = release
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "suite_denials_probe",
+            os.path.join(REPO_ROOT, relpath),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return dict(module.CASE_DENIALS)
+    finally:
+        if prev is None:
+            del os.environ["MOJOBPF_VNG_RELEASE"]
+        else:
+            os.environ["MOJOBPF_VNG_RELEASE"] = prev
+
+
 def test_suite_denial_pins_sync():
     # The matrix denial pins are the independent expectation:
     # they must equal each suite's CASE_DENIALS, so changing a
     # suite's obligations without updating the pin fails loudly
-    # instead of silently redefining the verdict.
+    # instead of silently redefining the verdict. Suites with
+    # lane-scoped overrides pin a different effective map per
+    # release; those are validated per locked release instead
+    # of against the static literal.
     runner = _load_runner()
     by_id = {
         suite_id: relpath
@@ -2627,7 +2663,32 @@ def test_suite_denial_pins_sync():
     assert set(by_id) == set(runner.SUITE_DENIALS), (
         sorted(set(by_id) ^ set(runner.SUITE_DENIALS))
     )
+    releases = _lock_releases()
+    assert releases, "kernels lock lists no releases"
+    override_suites = set()
+    for suite_id, release in runner.SUITE_DENIAL_OVERRIDES:
+        assert suite_id in by_id, (suite_id, "orphan override")
+        assert release in releases, (suite_id, release)
+        override_suites.add(suite_id)
     for suite_id, relpath in sorted(by_id.items()):
+        if suite_id in override_suites:
+            for release in releases:
+                effective = _effective_suite_denials(
+                    relpath, release
+                )
+                want = runner.SUITE_DENIAL_OVERRIDES.get(
+                    (suite_id, release),
+                    runner.SUITE_DENIALS[suite_id],
+                )
+                assert want == effective, (suite_id, release)
+                for denial, (denies, _stage) in effective.items():
+                    assert denial in runner.SUITE_CASES[suite_id], (
+                        suite_id, release, denial,
+                    )
+                    assert denies in runner.SUITE_CASES[suite_id], (
+                        suite_id, release, denies,
+                    )
+            continue
         with open(
             os.path.join(REPO_ROOT, relpath), encoding="utf-8"
         ) as handle:

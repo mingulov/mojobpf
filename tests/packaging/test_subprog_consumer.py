@@ -2164,6 +2164,15 @@ def test_consumer_standard_runner_passes():
             note=doc.get("note"), expect=harness_expect)
         if harness_expect == 1:
             guest_proc.check_kernel_einval_refusal(tag, doc)
+            assert doc.get("contract_version") == 2, (tag, doc)
+            assert doc.get("status") == "fail", (tag, doc)
+            assert doc.get("stage") == "run", (tag, doc)
+            assert doc.get("classification") == "runtime", (tag, doc)
+            assert doc.get("actual_action") is None, (tag, doc)
+            assert doc.get("cleanup_ok") is True, (tag, doc)
+            assert doc.get("object", {}).get("sha256") == run["host_shas"][
+                "subscriber.bpf.o"
+            ], (tag, doc)
             continue
         assert doc.get("contract_version") == 2, (tag, doc)
         assert doc.get("status") == "pass", (tag, doc)
