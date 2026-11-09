@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mojobpf"
-version = "0.3.0a1"
+version = "1.0.0"
 description = "Mojo-authored Linux eBPF programs compiled to standard BPF ELF"
 readme = "README.md"
 requires-python = ">=3.11"

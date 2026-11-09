@@ -46,7 +46,7 @@ From a wheel file, offline:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install --no-index mojobpf-0.3.0a1-py3-none-any.whl
+pip install --no-index mojobpf-1.0.0-py3-none-any.whl
 mojobpf doctor
 ```
 
@@ -59,7 +59,7 @@ package is needed):
 ```bash
 pip install "setuptools>=61"
 pip wheel . --no-deps --no-build-isolation -w dist
-pip install --no-index dist/mojobpf-0.3.0a1-py3-none-any.whl
+pip install --no-index dist/mojobpf-1.0.0-py3-none-any.whl
 ```
 
 ## Build the lowering (`mojobpf-lower`)

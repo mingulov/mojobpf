@@ -34,8 +34,8 @@ pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
 ```text
-Building wheel for mojobpf (pyproject.toml): finished with status 'done'
-Created wheel for mojobpf: filename=mojobpf-0.3.0a1-py3-none-any.whl size=474639 sha256=1bcbc7fdbab3e973f6fe6348f399faac6123fe9850c5befbb2be2a202febd1aa
+  Building wheel for mojobpf (pyproject.toml): finished with status 'done'
+  Created wheel for mojobpf: filename=mojobpf-1.0.0-py3-none-any.whl size=497232 sha256=c338159473d844e7ba1b5e855f700783aeea62736d78355e9b55c4bbf3327bfc
 Successfully built mojobpf
 ```
 
@@ -43,8 +43,11 @@ Successfully built mojobpf
 wheel built from the same sources carries the same contents
 (pinned by `tests/packaging/test_wheel_contents.py`), but zip
 metadata may differ — even the container hash varies between
-same-tree builds. The 0.3.0a1 release contents are pinned
-separately in [checksums](checksums-0.3.0a1.md).)
+same-tree builds. The release contents are pinned
+separately in the checksums record (the alpha record is
+[checksums-0.3.0a1.md](checksums-0.3.0a1.md); the 1.0.0
+record lands with the release artifacts). pip's
+`Stored in directory` cache line is elided.)
 
 The counter lowers through the parsed route, which needs the
 `mojobpf-lower` binary (not shipped in the wheel). Build it
@@ -75,12 +78,13 @@ From a new, unrelated directory:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install --no-index <path-to>/mojobpf-0.3.0a1-py3-none-any.whl
+.venv/bin/pip install --no-index <path-to>/mojobpf-1.0.0-py3-none-any.whl
 export PATH="$PWD/.venv/bin:$PATH"
 ```
 
 ```text
-Successfully installed mojobpf-0.3.0a1
+Installing collected packages: mojobpf
+Successfully installed mojobpf-1.0.0
 ```
 
 ## 3. Check the toolchain
@@ -92,7 +96,7 @@ mojobpf doctor
 ```text
 mojobpf doctor
 informational discovery only: pins are qualified by check/build with --lockfile, never here
-mojobpf 0.3.0a1 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
+mojobpf 1.0.0 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
 platform: linux/x86_64
 tool mojo: present Mojo 1.1.0 (8189361e) at <mojo-on-PATH>
 tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>
@@ -222,7 +226,7 @@ mojobpf build --manifest mojobpf.toml --out-dir build \
 
 ```text
 built <qs>/build/counter.bpf.o (3480 bytes, sha256 b74df864b37aaf41b1f7628b36859fe035e27cff7bf853f1e325ce9b6dae946e)
-built <qs>/build/counter.evidence.json (4804 bytes, sha256 64e63747419f4d49143c6a341ed352e24174077772054fda4dbd486bf56433c7)
+built <qs>/build/counter.evidence.json (4800 bytes, sha256 48ebae7ff2a3fe93a97dd8891649840e320e20a6e135706c679f8281b11891ec)
 ```
 
 The directory holds the object plus its evidence sidecar; see

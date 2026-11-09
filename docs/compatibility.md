@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF compatibility (0.3.0a1)
+# MojoBPF compatibility (1.0.0)
 
 What this release is proven with, what it is proven to refuse,
 and what it does not claim. Supported here means observed in
