@@ -40,7 +40,10 @@ on:
 jobs:
   unit:
     name: unit suites
-    runs-on: ubuntu-latest
+    # Pinned OS: ubuntu-latest floated 24.04 -> 26.04 under us
+    # (2026-11-09) and broke the apt fixture pin. Re-pin
+    # deliberately like every other input.
+    runs-on: ubuntu-24.04
     env:
       PYTHON_VERSION: "3.11.17"
       PYTHON_SHA256: "035b0ccfe7f3d38ab3ddab505290d200c6a265b95fbd5fac76c358751d6bb6a8"
@@ -236,7 +239,7 @@ jobs:
 
   vm-status:
     name: VM runner status
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: always()
     needs: [unit, contract, packaging, vm-matrix]
     steps:
