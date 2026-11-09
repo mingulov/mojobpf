@@ -118,9 +118,11 @@ ADVCTX_MARKER_LANE = {
 VLOG_INSNS_LANE = {
     ("parsed", "v6.12"): 33,
     ("parsed", "v6.6"): 33,
-    ("parsed", "v7.0.14"): 41,
-    ("parsed", "v7.2"): 41,
-    ("parsed", "v7.4-rc1"): 41,
+    # No parsed/7.x entries: the parsed route cannot run in this
+    # environment (adapter MBPF202), so no 7.x parsed count is
+    # observed; unpinned releases refuse to guess. The 6.x
+    # route gap (33 vs 42) gives no basis to copy the lane-a
+    # 7.x count across.
     ("lane-a", "v6.12"): 42,
     ("lane-a", "v6.6"): 42,
     ("lane-a", "v7.0.14"): 41,
@@ -1136,9 +1138,9 @@ def test_vlog_captured():
     )
     # Per-route, per-release verifier count (VLOG_INSNS_LANE):
     # the parsed backend emits tighter code than Lane-A on
-    # 6.x; 7.x verifiers process 41 on both routes. The pinned
-    # load, the single function, and the stack depth value
-    # agree; only the 7.4-rc1 depth wording differs.
+    # 6.x; 7.x Lane-A verifiers process 41. The pinned load,
+    # the single function, and the stack depth value agree;
+    # only the 7.4-rc1 depth wording differs.
     want_insns = "processed %d insns" % vlog_want_insns()
     assert want_insns in output, output[-2000:]
     want_depth = stack_depth_line()
