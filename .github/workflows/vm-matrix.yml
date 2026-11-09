@@ -26,9 +26,10 @@
 # jsonschema 4.23.0 plus its closure). The unit job installs CPython
 # 3.11.17 from a digest-pinned python-build-standalone release: the
 # exact version plus the expected archive SHA-256, verified before
-# the archive is extracted or executed. No step downloads an
-# unhashed executable. Re-pin deliberately, never by re-floating a
-# major tag or manifest.
+# the archive is extracted or executed. The one exception is the
+# bwrap fixture (version-pinned apt install, bits verified by
+# apt's signed archive metadata, never executed). Re-pin
+# deliberately, never by re-floating a major tag or manifest.
 name: vm-matrix
 
 on:
@@ -101,6 +102,21 @@ jobs:
               --hash=sha256:5c1dc0f53856b9cc9a0ccca0a7cc61d3d20a7088201c0937f3f4048c1718a209
           EOF
           pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
+      - name: install the bwrap fixture
+        # The guard's bwrap-refusal tests need the real system
+        # binary resolvable (an unowned path; a tmp fixture
+        # would be admitted by the owned-fixture rules, and an
+        # unresolvable name takes the no-screening path). It is
+        # never executed: every test asserts pre-exec refusal.
+        # Pinned 2026-11-09 to the noble version (apt's signed
+        # archive metadata verifies the bits); re-pin
+        # deliberately when noble supersedes it.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y bubblewrap=0.9.0-1ubuntu0.3
+          command -v bwrap
+          test "$(bwrap --version)" = "bubblewrap 0.9.0"
       - name: unit suites
         # The lane runner (module-per-process) is the declared
         # unit gate; a raw single-process pytest run GC-thrashes
