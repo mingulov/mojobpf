@@ -1012,8 +1012,9 @@ def main():
         shape, key = CASES[tag]
         predicted = classify(shape, run["packets"][key])
         observed = run["results"][tag]["actual_action"]
-        print("  %-24s shape=%-15s predicted=%d observed=%d"
-              % (tag, shape, predicted, observed))
+        seen = "refused" if observed is None else "%d" % observed
+        print("  %-24s shape=%-15s predicted=%d observed=%s"
+              % (tag, shape, predicted, seen))
     print("checksum digests (oracle, exact match required):")
     for tag in CKSUM_DROP_TAGS:
         _shape, key = CASES[tag]

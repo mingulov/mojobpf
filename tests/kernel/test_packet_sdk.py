@@ -1106,8 +1106,9 @@ def main():
         shape, key = CASES[tag]
         predicted = classify(shape, run["packets"][key])
         observed = run["results"][tag]["actual_action"]
-        print("  %-16s shape=%-18s predicted=%d observed=%d"
-              % (tag, shape, predicted, observed))
+        seen = "refused" if observed is None else "%d" % observed
+        print("  %-16s shape=%-18s predicted=%d observed=%s"
+              % (tag, shape, predicted, seen))
     print("packet sdk: guest behavior and guard-path checks passed")
     print("guest stage: %s (removed after the run)" % run["stage"])
     return _finish(rec, unavailable_seen)
