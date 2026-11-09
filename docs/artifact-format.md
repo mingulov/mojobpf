@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF artifact format (0.2.0)
+# MojoBPF artifact format (0.3.0a1)
 
 What `mojobpf build` emits: a standard BPF ELF object plus a
 JSON evidence sidecar. Both layouts below are transcribed from
 the [quickstart](quickstart.md) counter build
-(`counter.bpf.o`, 1896 bytes); the stated invariants are
+(`counter.bpf.o`, 3480 bytes); the stated invariants are
 pinned by the cited tests.
 
 ## The object: standard BPF ELF
@@ -28,7 +28,7 @@ inspect` on the actual bytes:
 
 ```text
 object build/counter.bpf.o (profile linux-bpfel-v3): ok
-observation: sections in order: , .strtab, .text, .BTF, .rel.BTF, xdp, .relxdp, license, .maps, .eh_frame, .rel.eh_frame, .symtab
+observation: sections in order: , .strtab, .text, xdp, .relxdp, license, .maps, .debug_abbrev, .debug_info, .rel.debug_info, .debug_str, .debug_pubnames, .rel.debug_pubnames, .debug_pubtypes, .rel.debug_pubtypes, .BTF, .rel.BTF, .eh_frame, .rel.eh_frame, .debug_line, .symtab
 observation section:license: license payload: b'Apache-2.0 WITH LLVM-exception\x00'
 observation: empty executable sections: .text
 observation: defined functions: xdp_entry
@@ -50,7 +50,7 @@ The pinned invariants:
   and cross-checked against unmodified `bpftool btf dump`
   (`tests/elf/test_map_btf.py`).
 
-The counter's BTF, as dumped by unmodified `bpftool 7.7.0`
+The counter's BTF, as dumped by unmodified `bpftool v7.6.0`
 from the built object:
 
 ```text
@@ -59,24 +59,23 @@ from the built object:
 [3] ARRAY '(anon)' type_id=2 index_type_id=4 nr_elems=2
 [4] INT '__ARRAY_SIZE_TYPE__' size=4 bits_offset=0 nr_bits=32 encoding=(none)
 [5] PTR '(anon)' type_id=6
-[6] ARRAY '(anon)' type_id=2 index_type_id=4 nr_elems=4
+[6] ARRAY '(anon)' type_id=2 index_type_id=4 nr_elems=1
 [7] PTR '(anon)' type_id=8
-[8] ARRAY '(anon)' type_id=2 index_type_id=4 nr_elems=8
+[8] INT 'UInt32' size=4 bits_offset=0 nr_bits=32 encoding=(none)
 [9] PTR '(anon)' type_id=10
-[10] ARRAY '(anon)' type_id=2 index_type_id=4 nr_elems=1
-[11] STRUCT 'mojobpf_map_def' size=32 vlen=4
+[10] INT 'UInt64' size=8 bits_offset=0 nr_bits=64 encoding=(none)
+[11] STRUCT 'mojobpf_array_map' size=32 vlen=4
 	'type' type_id=1 bits_offset=0
-	'key_size' type_id=5 bits_offset=64
-	'value_size' type_id=7 bits_offset=128
-	'max_entries' type_id=9 bits_offset=192
+	'max_entries' type_id=5 bits_offset=64
+	'key' type_id=7 bits_offset=128
+	'value' type_id=9 bits_offset=192
 [12] VAR 'mojobpf_map0' type_id=11, linkage=global
 [13] DATASEC '.maps' size=0 vlen=1
 	type_id=12 offset=0 size=32 (VAR 'mojobpf_map0')
 ```
 
-The four array bounds read `(type 2, key_size 4, value_size
-8, max_entries 1)`: a one-entry `ARRAY` map with `u32` keys
-and `u64` values. On this object BTF covers map metadata only;
+The map record reads `(type 2, max_entries 1, key UInt32,
+value UInt64)`: a one-entry `ARRAY` map. On this object BTF covers map metadata only;
 no function records and no `.BTF.ext` are emitted (only the
 core-profile CO-RE probe object carries relocation records;
 see [compatibility](compatibility.md)).
@@ -94,14 +93,14 @@ sidecar's top level:
 
 ```text
 schema_version = 4
-tool_version = 0.2.0
-sdk_version = 1.1
+tool_version = 0.3.0a1
+sdk_version = 1.8
 profile_id = linux-bpfel-v3
 source_license = Apache-2.0 WITH LLVM-exception
 kernel_license = Apache-2.0 WITH LLVM-exception
 license_mapping_version = 1
 success = True
-transforms = ["mojo-frontend", "ir-adapter(lane-a)", "llc-backend"]
+transforms = ["mojo-frontend", "ir-adapter(parsed)", "llc-backend"]
 ```
 
 The adapter entry names the route that produced the IR:
@@ -122,9 +121,10 @@ objects and identical sidecars
 (`tests/kernel/test_cleanup.py::test_reproducible_two_paths`).
 Across different environments only the environment seal
 differs — a SHA-256 of `PATH`, never the path itself — as
-observed when the quickstart counter was built from two
-separate virtual environments (same object
-`b2679151…`, sidecars differing only in that seal).
+observed when the quickstart counter was rebuilt in
+place (identical sidecars) and across separate checkouts
+(same object `b74df864…`, sidecars differing in their
+input seals).
 
 The tool and SDK versions join the cache key (key version
 6), so objects built under different versions never share a

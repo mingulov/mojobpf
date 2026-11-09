@@ -208,8 +208,10 @@ the pinned toolchain (Mojo 1.1.0 `8189361e`, LLVM 22.1.8):
 rebuilding these exact sources reproduces the same object
 bytes (`tests/kernel/test_cleanup.py::test_reproducible_two_paths`).
 The evidence line is illustrative — `counter.evidence.json`
-binds the exact toolchain and adapter inputs, so its bytes
-and hash vary run to run; only the object line is pinned.
+seals the exact toolchain, adapter, and environment inputs:
+rebuilding in place reproduces both files byte for byte, but
+any input or environment difference changes the sidecar; only
+the object line is pinned.
 
 ## 6. Inspect
 

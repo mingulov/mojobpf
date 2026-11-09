@@ -135,7 +135,9 @@ python3 tools/lock_refresh.py generate --kind toolchains \
 The inventory exits nonzero naming what is missing when any of
 `mojo`, `llc`, `bpftool`, `clang`, `llvm-config`, or `python3`
 is absent or fails; generation then refuses rather than
-inventing pins, and writes neither output on failure. The
+inventing pins for a missing required tool, records omissions
+of optional tools as limitations notes, and writes neither
+output on failure. The
 generated lock carries status `bootstrap`: builds match its pins
 like any lock, but it is not a reviewed `release-approved` pin.
 Copy the lock together with the `pixi.lock` beside it into your
