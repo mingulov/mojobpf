@@ -196,17 +196,20 @@ mojobpf build --manifest mojobpf.toml --out-dir build \
 ```
 
 ```text
-built <qs>/build/counter.bpf.o (1896 bytes, sha256 b26791510be38c737fe52a7236ee4484df2e7dbb4f5fffc007175532c6122a60)
-built <qs>/build/counter.evidence.json (4796 bytes, sha256 fb24cd5eb6429d18b9f9e5381e849b7b78a88b69982312359ae421a6927325fb)
+built <qs>/build/counter.bpf.o (3480 bytes, sha256 b74df864b37aaf41b1f7628b36859fe035e27cff7bf853f1e325ce9b6dae946e)
+built <qs>/build/counter.evidence.json (4804 bytes, sha256 64e63747419f4d49143c6a341ed352e24174077772054fda4dbd486bf56433c7)
 ```
 
 The directory holds the object plus its evidence sidecar; see
 [artifact-format](artifact-format.md) for both layouts. The
 build above used an independently installed Mojo 1.1.0 with
-no repository paths, and the object is byte-identical to the
-0.2.0 quickstart object; rebuilding these exact sources
-anywhere produces the same object bytes
-(`tests/kernel/test_cleanup.py::test_reproducible_two_paths`).
+no repository paths. The object bytes are deterministic for
+the pinned toolchain (Mojo 1.1.0 `8189361e`, LLVM 22.1.8):
+rebuilding these exact sources reproduces the same object
+bytes (`tests/kernel/test_cleanup.py::test_reproducible_two_paths`).
+The evidence line is illustrative — `counter.evidence.json`
+binds the exact toolchain and adapter inputs, so its bytes
+and hash vary run to run; only the object line is pinned.
 
 ## 6. Inspect
 
@@ -218,7 +221,7 @@ mojobpf inspect --object build/counter.bpf.o \
 
 ```text
 object build/counter.bpf.o (profile linux-bpfel-v3): ok
-observation: sections in order: , .strtab, .text, .BTF, .rel.BTF, xdp, .relxdp, license, .maps, .eh_frame, .rel.eh_frame, .symtab
+observation: sections in order: , .strtab, .text, xdp, .relxdp, license, .maps, .debug_abbrev, .debug_info, .rel.debug_info, .debug_str, .debug_pubnames, .rel.debug_pubnames, .debug_pubtypes, .rel.debug_pubtypes, .BTF, .rel.BTF, .eh_frame, .rel.eh_frame, .debug_line, .symtab
 observation section:license: license payload: b'Apache-2.0 WITH LLVM-exception\x00'
 observation: empty executable sections: .text
 observation: defined functions: xdp_entry
@@ -239,7 +242,7 @@ built from, not in the wheel; point at that file.)
 
 ```text
 mojobpf-verify-kernel: status=pass stage=done
-object: build/counter.bpf.o (sha256 b26791510be38c73)
+object: build/counter.bpf.o (sha256 b74df864b37a)
 lane: v6.12-tcg (release v6.12/tcg, expected kernel 6.12.0-061200-generic)
 guest: kernel=6.12.0-061200-generic btf=present prog_type=xdp supported=True
 load: attempted=True exit=0
