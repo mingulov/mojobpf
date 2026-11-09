@@ -1345,6 +1345,10 @@ def _spawn_wrapper(object_path, extra_args):
         "--object",
         object_path,
     ] + list(extra_args)
+    lane_accelerator = os.environ.get(
+        guest_proc.VNG_ACCELERATOR_ENV, "")
+    if lane_accelerator:
+        argv += ["--accelerator", lane_accelerator]
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.DEVNULL,
