@@ -83,7 +83,7 @@ retained implementation without claiming the kind.
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
 | Loader/observer | `bpftool` 7.6.0 with libbpf 1.6, unmodified |
 | Guest runner | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration on x86-64; one named TCG fallback lane (`v6.12-tcg`) for the no-KVM spot-proof only |
-| Guest kernels | none claimed (pending, see below). Candidate lanes in `ci/kernels.lock.json`: 6.12.0-061200-generic, 6.6.0-060600-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc1-generic (Ubuntu mainline builds, pinned by hash) |
+| Guest kernels | five claimed (see below). Lanes in `ci/kernels.lock.json`: 6.12.0-061200-generic, 6.6.0-060600-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc1-generic (Ubuntu mainline builds, pinned by hash) |
 
 Full binary hashes live in `toolchains.lock.json` (host tools)
 and `ci/kernels.lock.json` (guest runner plus the pinned
@@ -98,11 +98,16 @@ registers 41 suites: the 28 release-matrix suites plus the 12
 (`ci/run_vm_tests.py` `SUITES`,
 `tests/unit/test_portability_locks.py::test_x86_matrix_shape_unchanged`).
 
-No kernel is claimed by the current tree. A kernel is claimed
-only when the full 41-suite matrix passes on its lane; those
-runs are pending, so every candidate kernel above is
-unclaimed until its matrix verdict lands. The historical
-alpha runs do not qualify the current tree.
+Five kernels are claimed by the current tree: 6.6.0-060600-generic,
+6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic,
+and 7.4.0-070400rc1-generic. A kernel is claimed only when the
+full 41-suite matrix passes on its lane; the v1.0 matrix passes
+197/205 cells with 0 red and 0 unexplained (see
+[evidence-1.0.0.md](evidence-1.0.0.md)). Two ruled cell groups stay
+out of claim: the joint suite (needs libbpf-mojo inputs,
+labelled experimental) and 7.x task-struct layouts (1.x CO-RE
+work). The historical alpha runs do not qualify the current
+tree.
 
 Every behavior section below outside the named portability
 lanes records the 0.3.0a1 alpha qualification on the tested
@@ -110,8 +115,8 @@ combination at the time (LLVM 22.1.8, bpftool 7.6.0 with
 libbpf 1.6, QEMU 10.2.2, software emulation) in both alpha
 lanes; see [evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the
 anchor board. Those observations stand as the alpha record;
-the current tree re-proves them in the pending release
-matrix, and no kernel is claimed until that matrix passes.
+the current tree re-proved them in the v1.0 release matrix
+(see [evidence-1.0.0.md](evidence-1.0.0.md)).
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
