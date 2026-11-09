@@ -127,24 +127,39 @@ jobs:
         run: python3 ci/test_lanes.py --lane unit
       - name: diagnose failing modules
         # The lane prints only a summary: on failure, rerun it
-        # into a kept directory and report per-module results so
-        # a red run names its module. Zero cost on green.
+        # into a kept directory, report per-module results, and
+        # rerun each failing module verbosely so a red run names
+        # its tests. Zero cost on green.
         if: failure()
         run: |
           python3 - <<'EOF'
-          import importlib.util, json, os
+          import importlib.util, json, os, subprocess, sys
           spec = importlib.util.spec_from_file_location('lanes', 'ci/test_lanes.py')
           lanes = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(lanes)
           work = os.path.abspath('lane-debug')
           os.makedirs(work, exist_ok=True)
           lanes.run_lane('unit', work)
+          fails = []
           for i, module in enumerate(lanes.OWNERS['unit']):
               try:
                   rep = json.load(open(os.path.join(work, 'module-%d.json' % i)))
-                  print(('PASS ' if rep['exit'] == 0 else 'FAIL ') + module)
+                  ok = rep['exit'] == 0
+                  print(('PASS ' if ok else 'FAIL ') + module)
+                  if not ok:
+                      fails.append(module)
               except OSError:
                   print('NO-REPORT ' + module)
+          for module in fails:
+              env = dict(os.environ)
+              env['PYTHONPATH'] = str(lanes.ROOT / 'src') + os.pathsep + env.get('PYTHONPATH', '')
+              proc = subprocess.run(
+                  [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short',
+                   '-p', 'no:cacheprovider', '-o', 'addopts=', module],
+                  cwd=str(lanes.ROOT), env=env, capture_output=True, text=True)
+              print('=' * 20 + ' verbose ' + module)
+              tail = (proc.stdout + proc.stderr).splitlines()
+              print('\n'.join(tail[-60:]))
           EOF
 
   contract:
