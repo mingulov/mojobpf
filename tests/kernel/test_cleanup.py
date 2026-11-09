@@ -781,6 +781,22 @@ def test_reproducible_manifest_build():
             shutil.rmtree(root, ignore_errors=True)
 
 
+def _stable_resources(text):
+    """Drop volatile wall-clock lines from a resource snapshot.
+
+    ``bpftool prog list`` prints a loaded_at wall-clock reading
+    per program; the 6.6 virtme guest clock occasionally
+    renders garbage (observed year-2611 flips between
+    snapshots), so exact before/after comparison must exclude
+    them. Leak signal (progs, maps, links, pins, pids) passes
+    through untouched.
+    """
+    return "\n".join(
+        line for line in text.splitlines()
+        if not line.strip().startswith("loaded_at ")
+    )
+
+
 def test_verify_load_unload_pass():
     """Positive control: the wrapper loads and unloads, then proves it."""
     fix = fixture()
@@ -818,11 +834,11 @@ def test_verify_load_unload_pass():
     res_after = record["resources"]["after"] or ""
     assert "mojobpf" not in res_before, res_before
     assert "mojobpf" not in res_after, res_after
-    if res_before != res_after:
+    if _stable_resources(res_before) != _stable_resources(res_after):
         diff = "".join(
             difflib.unified_diff(
-                res_before.splitlines(True),
-                res_after.splitlines(True),
+                _stable_resources(res_before).splitlines(True),
+                _stable_resources(res_after).splitlines(True),
                 "res-before",
                 "res-after",
             )
@@ -1304,11 +1320,11 @@ def test_repeated_load_unload_no_leak():
     res_after = after_block.group(1)
     assert "mojobpf" not in res_before, res_before
     assert "mojobpf" not in res_after, res_after
-    if res_before != res_after:
+    if _stable_resources(res_before) != _stable_resources(res_after):
         diff = "".join(
             difflib.unified_diff(
-                res_before.splitlines(True),
-                res_after.splitlines(True),
+                _stable_resources(res_before).splitlines(True),
+                _stable_resources(res_after).splitlines(True),
                 "res-before",
                 "res-after",
             )
