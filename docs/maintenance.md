@@ -7,9 +7,10 @@ snapshots.
 
 ## Scope
 
-The v1.0 line covers the six target profiles
-(`linux-bpfel-v3`, `-core`, `-hash`, `-reserve`, `-subprog`,
-`-uprobe`), the ten supported helpers, the four map families,
+The v1.0 line covers the eight target profiles
+(`linux-bpfel-v3`, `-core`, `-hash`, `-lru`, `-net`, `-reserve`,
+`-subprog`, `-uprobe`), the ten supported helpers, the four map
+families,
 and the tracepoint, ring-buffer, and uprobe observers exactly
 as `docs/compatibility.md` claims them. Everything that page
 lists as a non-claim (AArch64 support beyond the portability
@@ -20,7 +21,7 @@ result) stays a non-claim until its own gate passes.
 ## Pin discipline
 
 Toolchain, kernel-lane, and lock updates require a full anchor
-re-proof (fast suites, both x86 matrix lanes, the three
+re-proof (fast suites, all five x86 KVM matrix lanes, the three
 portability lanes, feasibility, quickstart, revision equality)
 before promotion. Investigational lanes and pins never leak
 into the release pins or the release documentation.
@@ -41,7 +42,7 @@ covered file changes.
 Every product commit re-runs the fast suites
 (unit, IR, compile, core, ELF, verifier, differential,
 packaging). Releases re-run the full anchor plus the five
-external-consumer suites on both lanes. A dirty tree never
+external-consumer suites on all five lanes. A dirty tree never
 anchors: the matrix and feasibility gates refuse it.
 
 ## Residuals
