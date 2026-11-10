@@ -1,34 +1,69 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # MojoBPF continuous checks.
 #
-# The unit job runs anywhere: pinned CPython plus hashed pytest and
-# the hashed jsonschema closure the tests/unit schema checks import.
-# When tests gain a dependency, extend the unit job's pinned block
-# the same commit (drift here caused the 2026-11-09 red: the runner
-# interpreter is bare, unlike developer machines).
+# Job map (every lane-owned module executes in exactly one job):
+# unit runs ci/test_lanes.py --lane unit (25 modules, anywhere);
+# compiler runs --lane compiler (84 modules: compiler/tests,
+# tests/elf|ir|compile|differential, tests/core, codegen_cost,
+# compiler-owned tests/unit and tests/packaging files); package
+# runs --lane package (sdist + wheel contents); vm-matrix runs
+# the 41 guest-owned suites per lane (6 shards, one per lane);
+# vm-merge joins the 6 shard boards; vm-status gates the run.
+# tests/unit/test_ci_workflow_contract.py pins this shape (job
+# selections, shard lane coverage, downstream assertions).
 #
-# Every other job needs the qualified self-hosted runner AND the
-# repo variable MOJOBPF_VM_RUNNER=true; otherwise the jobs skip
-# visibly and the vm-status job says so in-run (a queued-forever
-# run signals nothing; a visible skip points at provisioning).
-# Runner spec: x86-64 Linux with Python 3.11+, the Mojo/LLVM
-# toolchain on PATH (see toolchains.lock.json), and virtme-ng with
-# both kernel images cached (see ci/kernels.lock.json for the pinned
-# runner and lane artifacts). Guests run under software emulation;
-# no host BPF is ever loaded and no live hook is ever attached. A
-# lane whose image is absent fails the matrix job.
+# Every job except unit and vm-merge/vm-status needs the qualified
+# self-hosted runner AND the repo variable MOJOBPF_VM_RUNNER=true;
+# otherwise the jobs skip visibly and the vm-status job says so
+# in-run (a queued-forever run signals nothing; a visible skip
+# points at provisioning). The merge job runs on GitHub-hosted
+# Ubuntu but still gates on the variable (nothing to merge when
+# the shards skipped).
 #
-# Supply chain: every Action is pinned to a full commit SHA (reviewed
-# 2026-10-09; the trailing comment names the major tag it resolves),
-# and every pytest install carries --require-hashes over a pinned
+# Runner spec: x86-64 Linux with Python 3.11+, pixi, CMake 3.20+,
+# a C++17 compiler, system LLVM 22.1.8 (llc plus the CMake package
+# configuration), bwrap, and virtme-ng with the 6 pinned lanes'
+# kernel images cached (see ci/kernels.lock.json for the pinned
+# runner and lane artifacts). 5 lanes run under KVM and
+# v6.12-tcg is the named software-emulation fallback; no host
+# BPF is ever loaded and no live hook is ever attached. A lane
+# whose image is absent fails its shard. The runner exports
+# MOJOBPF_TARGET_LEASE=1 (guest boots) and
+# MOJOBPF_CONSUMER_GUEST_LEASE=1 (consumer guest checks); the
+# matrix never synthesizes a lease, so a shard without the
+# target lease fails fast before booting anything.
+#
+# Toolchain trust: `pixi install` resolves Mojo 1.1.0 from the
+# committed pixi.lock (pixi verifies the locked hashes); the
+# lane's toolchain admission then verifies every tool against
+# toolchains.lock.json before compiling. Mojo runs through the
+# project pixi environment (MODULAR_HOME set, never bare-PATH).
+# The lowering binary builds from compiler/ via CMake, which
+# requires exactly LLVM 22.1.8. The runner's pixi, cmake, C++
+# compiler and llc are provisioning prerequisites, documented
+# here rather than pinned: the locks above verify their output.
+#
+# arm64 has no CI lane: ci/kernels.arm64.lock.json is
+# investigational until an arm64 runner is provisioned, and
+# tests/kernel/test_arch_portability.py stays out of the 41
+# matrix suites (pinned by the contract test) until then.
+#
+# Supply chain: every Action is pinned to a full commit SHA (the
+# trailing comment names the major tag it resolves), and every
+# pytest install carries --require-hashes over a pinned
 # requirements block (pytest plus its Linux runtime closure, with
 # PyPI archive SHA-256 values; the unit block additionally pins
 # jsonschema 4.23.0 plus its closure). The unit job installs CPython
 # 3.11.17 from a digest-pinned python-build-standalone release: the
 # exact version plus the expected archive SHA-256, verified before
-# the archive is extracted or executed. The one exception is the
-# bwrap fixture (version-pinned apt install, bits verified by
-# apt's signed archive metadata, never executed). Re-pin
+# the archive is extracted or executed. Self-hosted jobs install
+# pytest plus setuptools (pinned 84.2.1 wheel hash; the sdist and
+# installed-build proofs build wheels with --no-build-isolation)
+# into a fresh venv (the runner's system Python refuses ambient
+# installs under PEP 668). The one exception is the
+# bwrap fixture (version-pinned apt install on the unit job,
+# runner-provided on self-hosted jobs; bits verified by apt's
+# signed archive metadata on Ubuntu, never executed). Re-pin
 # deliberately, never by re-floating a major tag or manifest.
 name: vm-matrix
 
@@ -36,6 +71,13 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-matrix-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
@@ -104,7 +146,7 @@ jobs:
               --hash=sha256:d72a210824facfdaf8768cf2d7ca25a042c30320b3020de2fa04640920d4e121 \
               --hash=sha256:5c1dc0f53856b9cc9a0ccca0a7cc61d3d20a7088201c0937f3f4048c1718a209
           EOF
-          pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
+          python3 -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
       - name: install the bwrap fixture
         # The guard's bwrap-refusal tests need the real system
         # binary resolvable (an unowned path; a tmp fixture
@@ -117,23 +159,28 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y bubblewrap=0.9.0-1ubuntu0.3
+          sudo apt-get install -y --no-install-recommends bubblewrap=0.9.0-1ubuntu0.3
           command -v bwrap
-          test "$(bwrap --version)" = "bubblewrap 0.9.0"
+          test "$(dpkg-query -W -f='${Version}' bubblewrap)" = "0.9.0-1ubuntu0.3"
       - name: unit suites
         # The lane runner (module-per-process) is the declared
         # unit gate; a raw single-process pytest run GC-thrashes
-        # past 30 minutes on this suite.
-        run: python3 ci/test_lanes.py --lane unit
+        # past 30 minutes on this suite. --guard-tools engages
+        # the lane-level tool supervision the runner declares
+        # for the unit lane.
+        run: python3 ci/test_lanes.py --lane unit --guard-tools
       - name: diagnose failing modules
         # The lane prints only a summary: on failure, rerun it
         # into a kept directory, report per-module results, and
-        # rerun each failing module verbosely so a red run names
-        # its tests. Zero cost on green.
+        # rerun each failing module through the lane's own
+        # pytest entry so the verbose output agrees with the
+        # lane verdict. Diagnose-only: the rerun verdict is
+        # ignored on purpose (the job is already red); it only
+        # names the failing tests. Zero cost on green.
         if: failure()
         run: |
           python3 - <<'PYEOF'
-          import importlib.util, json, os, subprocess, sys
+          import importlib.util, json, os
           spec = importlib.util.spec_from_file_location('lanes', 'ci/test_lanes.py')
           lanes = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(lanes)
@@ -151,26 +198,25 @@ jobs:
               except OSError:
                   print('NO-REPORT ' + module)
           for module in fails:
-              env = dict(os.environ)
-              env['PYTHONPATH'] = str(lanes.ROOT / 'src') + os.pathsep + env.get('PYTHONPATH', '')
-              proc = subprocess.run(
-                  [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short',
-                   '-p', 'no:cacheprovider', '-o', 'addopts=', module],
-                  cwd=str(lanes.ROOT), env=env, capture_output=True, text=True)
+              report = os.path.join(work, 'verbose.json')
+              state = lanes._run_pytest([module], report, work)
               print('=' * 20 + ' verbose ' + module)
-              tail = (proc.stdout + proc.stderr).splitlines()
+              tail = (state['proc_stdout'] + state['proc_stderr']).splitlines()
               print('\n'.join(tail[-60:]))
           PYEOF
 
-  contract:
-    name: structural contract suites
+  compiler:
+    name: compiler suites
     if: vars.MOJOBPF_VM_RUNNER == 'true'
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: unit
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: install pytest
+      - name: install pytest into a venv
+        # The runner's system Python refuses ambient installs
+        # (PEP 668); the venv holds the hashed closure only.
         run: |
+          set -euo pipefail
           cat > "$RUNNER_TEMP/pytest-hashed.txt" <<'EOF'
           # Pinned 2026-10-09: pytest 9.0.2 plus its Linux runtime
           # closure. Hashes are the PyPI archive SHA-256 values.
@@ -189,24 +235,50 @@ jobs:
           pytest==9.0.2 \
               --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b \
               --hash=sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11
+          setuptools==84.2.1 \
+              --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
           EOF
-          python3 -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
-      - name: contract suites
-        timeout-minutes: 120
-        run: >-
-          python3 -m pytest
-          tests/elf tests/ir tests/compile tests/verifier tests/differential
-          -q
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: install the pinned Mojo toolchain
+        # pixi resolves Mojo 1.1.0 from the committed pixi.lock
+        # (locked hashes verified by pixi itself); the lane's
+        # toolchain admission re-verifies every tool against
+        # toolchains.lock.json before compiling.
+        run: |
+          set -euo pipefail
+          command -v pixi
+          pixi install --frozen
+          test -x .pixi/envs/default/bin/mojo
+          test "$(.pixi/envs/default/bin/mojo --version)" = "Mojo 1.1.0 (8189361e)"
+      - name: build the lowering binary
+        # compiler/CMakeLists.txt requires exactly LLVM 22.1.8
+        # and fails the configure loudly without it.
+        run: |
+          set -euo pipefail
+          cmake -S compiler -B build/lower -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build/lower -j"$(nproc)"
+          test -x build/lower/mojobpf-lower
+      - name: export the toolchain environment
+        run: |
+          echo "$PWD/.pixi/envs/default/bin" >> "$GITHUB_PATH"
+          echo "MODULAR_HOME=$PWD/.pixi/envs/default/share/max" >> "$GITHUB_ENV"
+          echo "MOJOBPF_LOWER=$PWD/build/lower/mojobpf-lower" >> "$GITHUB_ENV"
+      - name: compiler suites
+        timeout-minutes: 240
+        run: python3 ci/test_lanes.py --lane compiler
 
-  packaging:
+  package:
     name: packaging suites
     if: vars.MOJOBPF_VM_RUNNER == 'true'
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
-    needs: contract
+    needs: unit
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: install pytest
+      - name: install pytest into a venv
         run: |
+          set -euo pipefail
           cat > "$RUNNER_TEMP/pytest-hashed.txt" <<'EOF'
           # Pinned 2026-10-09: pytest 9.0.2 plus its Linux runtime
           # closure. Hashes are the PyPI archive SHA-256 values.
@@ -225,22 +297,44 @@ jobs:
           pytest==9.0.2 \
               --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b \
               --hash=sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11
+          setuptools==84.2.1 \
+              --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
           EOF
-          python3 -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: assert the bwrap fixture
+        # The sdist sandbox proofs need the real system binary
+        # resolvable; fail fast here instead of mid-lane.
+        run: |
+          set -euo pipefail
+          command -v bwrap
       - name: packaging suites
         timeout-minutes: 120
-        run: >-
-          python3 -m pytest
-          tests/packaging/test_wheel_contents.py
-          tests/packaging/test_installed_build.py
-          tests/packaging/test_sdk_compat.py
-          -q
+        # The sdist and wheel-content proofs need pip/setuptools
+        # plus venv in the lane interpreter (no Mojo toolchain).
+        run: python3 ci/test_lanes.py --lane package
 
   vm-matrix:
-    name: VM matrix (pinned kernel lanes)
+    name: VM matrix shard (${{ matrix.lane }})
     if: vars.MOJOBPF_VM_RUNNER == 'true'
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
-    needs: packaging
+    needs: [compiler, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        # One shard per lane in ci/kernels.lock.json (5 KVM plus
+        # the named v6.12-tcg fallback); 41 suites per shard, each
+        # with its own timeout. Serialized on a single runner the
+        # shards still each hold a full budget, which the old
+        # single 240-minute cap could never fit.
+        lane:
+          - v6.12-kvm
+          - v6.6-kvm
+          - v7.0.14-kvm
+          - v7.2-kvm
+          - v7.4-rc1-kvm
+          - v6.12-tcg
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: check the worktree is clean
@@ -249,40 +343,123 @@ jobs:
             echo "dirty worktree; the matrix needs committed bits";
             exit 2;
           }
-      - name: run the pinned-lane matrix
-        timeout-minutes: 240
+      - name: assert the target lease is provisioned
+        # The matrix never synthesizes a lease: without the
+        # runner-exported MOJOBPF_TARGET_LEASE=1 every guest
+        # suite reports required-unavailable, so fail fast here
+        # with the provisioning pointer instead of burning the
+        # shard budget suite by suite.
+        run: |
+          test "${MOJOBPF_TARGET_LEASE:-}" = "1" || {
+            echo "MOJOBPF_TARGET_LEASE=1 is not exported by the qualified runner (see workflow header); refusing to boot guests";
+            exit 2;
+          }
+      - name: install the pinned Mojo toolchain
+        run: |
+          set -euo pipefail
+          command -v pixi
+          pixi install --frozen
+          test -x .pixi/envs/default/bin/mojo
+          test "$(.pixi/envs/default/bin/mojo --version)" = "Mojo 1.1.0 (8189361e)"
+      - name: build the lowering binary
+        run: |
+          set -euo pipefail
+          cmake -S compiler -B build/lower -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build/lower -j"$(nproc)"
+          test -x build/lower/mojobpf-lower
+      - name: export the toolchain environment
+        run: |
+          echo "$PWD/.pixi/envs/default/bin" >> "$GITHUB_PATH"
+          echo "MODULAR_HOME=$PWD/.pixi/envs/default/share/max" >> "$GITHUB_ENV"
+          echo "MOJOBPF_LOWER=$PWD/build/lower/mojobpf-lower" >> "$GITHUB_ENV"
+      - name: run the pinned-lane shard
+        timeout-minutes: 360
         env:
-          # Target lease for the consumer suites' guest boots: this
-          # step runs on the qualified disposable-guest runner, so
-          # the consumer guest checks boot here. Without the lease
-          # they report required-unavailable instead of booting.
+          # Lease for the consumer suites' guest checks on this
+          # qualified disposable-guest runner (see header).
+          # Without it they report required-unavailable.
           MOJOBPF_CONSUMER_GUEST_LEASE: '1'
         # The qualified runner exports MOJOBPF_CONSUMER_TOOLCHAIN_BIN
         # (independent toolchain for the consumer suite's isolation
         # gate). Without it the consumer lane-suite fails loudly.
         run: >-
-          python3 ci/run_vm_tests.py --out-dir matrix-out
+          python3 ci/run_vm_tests.py --lane ${{ matrix.lane }}
+          --out-dir matrix-out-${{ matrix.lane }}
           ${MOJOBPF_CONSUMER_TOOLCHAIN_BIN:+--consumer-path
           "$MOJOBPF_CONSUMER_TOOLCHAIN_BIN"}
-      - name: show the matrix board
+      - name: show the shard board
         if: always()
-        run: cat matrix-out/matrix-report.json
+        # Tolerant cat: a setup failure exits before any report
+        # exists, and the board must not mask that exit.
+        run: cat matrix-out-${{ matrix.lane }}/matrix-report.json 2>/dev/null || echo "no shard board (see the shard step above)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: vm-matrix-shard-${{ matrix.lane }}
+          path: matrix-out-${{ matrix.lane }}/
+          if-no-files-found: warn
+
+  vm-merge:
+    name: merge the matrix boards
+    if: vars.MOJOBPF_VM_RUNNER == 'true'
+    runs-on: ubuntu-24.04
+    needs: vm-matrix
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: vm-matrix-shard-*
+          path: shards
+      - name: merge the shard boards
+        # The merge refuses on any shard disagreement (commit,
+        # runner, interpreter, consumer path), lane overlap, or
+        # missing shard, and fails when any lane-suite did not
+        # pass. The expected set mirrors the shard matrix above.
+        run: >-
+          python3 ci/run_vm_tests.py --merge
+          shards/*/matrix-report.json
+          --expect-lanes v6.12-kvm,v6.6-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc1-kvm,v6.12-tcg
+          --out-dir matrix-out
+      - name: show the merged board
+        if: always()
+        run: cat matrix-out/matrix-report.json 2>/dev/null || echo "no merged board (see the merge step above)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: vm-matrix-report
           path: matrix-out/
+          if-no-files-found: warn
 
   vm-status:
     name: VM runner status
     runs-on: ubuntu-24.04
     if: always()
-    needs: [unit, contract, packaging, vm-matrix]
+    needs: [unit, compiler, package, vm-matrix, vm-merge]
     steps:
       - name: report which jobs ran
+        # Every needed result asserts explicitly: a downstream
+        # failure must never hide behind a green unit run, and a
+        # skip counts only when the VM gate variable is off (a
+        # needs-failure skip with the variable on is a failure).
+        # The provisioning hint prints only for gate-off skips.
         run: |
-          echo "unit=${{ needs.unit.result }} contract=${{ needs.contract.result }} packaging=${{ needs.packaging.result }} vm-matrix=${{ needs.vm-matrix.result }}"
-          test "${{ needs.unit.result }}" = "success"
-          if [ "${{ needs.vm-matrix.result }}" = "skipped" ]; then
+          echo "unit=${{ needs.unit.result }} compiler=${{ needs.compiler.result }} package=${{ needs.package.result }} vm-matrix=${{ needs.vm-matrix.result }} vm-merge=${{ needs.vm-merge.result }}"
+          fail=0
+          for result in "${{ needs.unit.result }}" "${{ needs.compiler.result }}" "${{ needs.package.result }}" "${{ needs.vm-matrix.result }}" "${{ needs.vm-merge.result }}"; do
+            case "$result" in
+              success) ;;
+              skipped)
+                if [ "${{ vars.MOJOBPF_VM_RUNNER }}" = "true" ]; then
+                  fail=1
+                fi
+                ;;
+              *) fail=1 ;;
+            esac
+          done
+          if [ "$fail" != "0" ]; then
+            echo "CI failed: see the job results above"
+            exit 1
+          fi
+          if [ "${{ needs.vm-matrix.result }}" = "skipped" ] && [ "${{ vars.MOJOBPF_VM_RUNNER }}" != "true" ]; then
             echo "VM jobs skipped: provision the mojobpf-vm self-hosted runner and set repo variable MOJOBPF_VM_RUNNER=true (see workflow header)."
           fi

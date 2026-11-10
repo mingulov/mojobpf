@@ -18,6 +18,68 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SELECTOR = ROOT / 'ci/test_lanes.py'
+WORKFLOW = ROOT / '.github' / 'workflows' / 'vm-matrix.yml'
+
+
+def _workflow_text():
+    assert WORKFLOW.is_file(), 'CI workflow is missing'
+    return WORKFLOW.read_text(encoding='utf-8')
+
+
+def test_workflow_runs_every_lane_through_the_runner():
+    # Each lane-owned module executes in exactly one CI job, and
+    # every suite runs through the lane runner (module-per-process,
+    # skip-refusing, plugin-scrubbed): no raw pytest invocation
+    # may run suites in CI.
+    text = _workflow_text()
+    assert 'ci/test_lanes.py --lane unit' in text
+    assert 'ci/test_lanes.py --lane compiler' in text
+    assert 'ci/test_lanes.py --lane package' in text
+    assert 'python3 -m pytest' not in text
+    assert 'python -m pytest' not in text
+
+
+def test_workflow_runs_no_guest_suite_outside_the_matrix():
+    # The two guest-owned verifier suites run only as matrix
+    # suites (with a target lease); naming them in the workflow
+    # outside run_vm_tests.py would duplicate matrix coverage
+    # on the wrong harness.
+    text = _workflow_text()
+    assert 'tests/verifier/test_subset_kernel.py' not in text
+    assert 'tests/verifier/test_helper_licenses.py' not in text
+
+
+def test_workflow_shards_cover_every_locked_lane():
+    lock = json.loads(
+        (ROOT / 'ci' / 'kernels.lock.json').read_text(encoding='utf-8')
+    )
+    text = _workflow_text()
+    assert len(lock['lanes']) == 6, lock['lanes']
+    for lane in lock['lanes']:
+        assert ('- %s' % lane['id']) in text, lane['id']
+
+
+def test_workflow_status_asserts_every_job():
+    text = _workflow_text()
+    for job in ('unit', 'compiler', 'package', 'vm-matrix', 'vm-merge'):
+        assert ('needs.%s.result' % job) in text, job
+
+
+def test_workflow_matrix_requires_a_provisioned_target_lease():
+    # The matrix never synthesizes a lease: the shard must fail
+    # fast when the runner exports none.
+    assert 'MOJOBPF_TARGET_LEASE' in _workflow_text()
+
+
+def test_arch_portability_stays_out_of_the_matrix(lanes):
+    # Documented deferral: no arm64 CI lane exists until an
+    # arm64 runner is provisioned, so the guest-owned suite
+    # stays out of the matrix (and out of every pytest job)
+    # instead of failing red by construction.
+    suites = lanes.matrix_suites()
+    paths = [path for _name, path, _timeout in suites]
+    assert 'tests/kernel/test_arch_portability.py' not in paths
+    assert 'arm64' in _workflow_text()
 
 # Trust inputs snapshotted at import (collection, before any test
 # runs): every guarded child installs from these, so a test that

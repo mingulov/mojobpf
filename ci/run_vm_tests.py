@@ -873,6 +873,148 @@ class SetupFailure(Exception):
     """The matrix cannot run honestly (exit 2)."""
 
 
+def _load_shard_report(path):
+    """Load one per-shard board, or refuse it as malformed."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise SetupFailure(
+            "cannot load shard report %s: %s" % (path, exc)
+        )
+    if not isinstance(report, dict) or report.get("tool") != "run_vm_tests":
+        raise SetupFailure(
+            "shard report %s is not a run_vm_tests board" % path
+        )
+    for key in ("commit", "python", "consumer_path", "runner",
+                "lanes", "results"):
+        if key not in report:
+            raise SetupFailure(
+                "shard report %s lacks %r" % (path, key)
+            )
+    if not report["lanes"] or not report["results"]:
+        raise SetupFailure(
+            "shard report %s carries no lanes or no results; "
+            "a vacuous shard never merges" % path
+        )
+    return report
+
+
+def merge_reports(paths, out_dir, expect_lanes=None):
+    """Merge per-shard boards into one; return the process exit code.
+
+    Every shard must test the same commit under the same runner,
+    interpreter and consumer path, and lane ids must be disjoint
+    across shards: anything else refuses (exit 2) instead of
+    blending runs that never shared their bits. When
+    ``expect_lanes`` names the full lane set, the merged lanes
+    must equal it exactly: a missing shard refuses instead of
+    merging a silent subset. The merged board keeps the shared
+    blocks verbatim, concatenates lanes and results in input
+    order, and records ``merged_from``. A non-pass outcome
+    anywhere fails the merge (exit 1).
+    """
+    if not paths:
+        raise SetupFailure("merge needs at least one shard report")
+    shards = [_load_shard_report(path) for path in paths]
+    first = shards[0]
+    for path, shard in zip(paths[1:], shards[1:]):
+        for key in ("commit", "python", "consumer_path", "runner"):
+            if shard[key] != first[key]:
+                raise SetupFailure(
+                    "shard %s disagrees on %r; shards must share "
+                    "their commit, runner, interpreter and "
+                    "consumer path" % (path, key)
+                )
+    seen_lanes = set()
+    lanes = []
+    for path, shard in zip(paths, shards):
+        for lane in shard["lanes"]:
+            lane_id = lane.get("id", "?")
+            if lane_id in seen_lanes:
+                raise SetupFailure(
+                    "lane %r is covered by more than one shard "
+                    "(%s repeats it)" % (lane_id, path)
+                )
+            seen_lanes.add(lane_id)
+            lanes.append(lane)
+    seen_cases = set()
+    results = []
+    for path, shard in zip(paths, shards):
+        for item in shard["results"]:
+            case = (item.get("lane"), item.get("suite"))
+            if case in seen_cases:
+                raise SetupFailure(
+                    "lane-suite %s/%s is covered by more than one "
+                    "shard (%s repeats it)"
+                    % (case[0], case[1], path)
+                )
+            seen_cases.add(case)
+            results.append(item)
+    if expect_lanes is not None:
+        missing = set(expect_lanes) - seen_lanes
+        extra = seen_lanes - set(expect_lanes)
+        if missing or extra:
+            raise SetupFailure(
+                "merged lanes %s do not cover the expected set "
+                "(missing %s, extra %s); refusing a partial merge"
+                % (
+                    sorted(seen_lanes),
+                    sorted(missing),
+                    sorted(extra),
+                )
+            )
+    os.makedirs(out_dir, exist_ok=True)
+    merged = {
+        "tool": "run_vm_tests",
+        "commit": first["commit"],
+        "python": first["python"],
+        "consumer_path": first["consumer_path"],
+        "runner": first["runner"],
+        "lanes": lanes,
+        "results": results,
+        "merged_from": list(paths),
+        "elapsed_secs": round(
+            sum(float(shard.get("elapsed_secs", 0)) for shard in shards),
+            1,
+        ),
+    }
+    report_path = os.path.join(out_dir, "matrix-report.json")
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(merged, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print("matrix board (commit %s, merged %d shards):"
+          % (merged["commit"], len(shards)))
+    for lane in lanes:
+        row = []
+        for item in results:
+            if item.get("lane") == lane.get("id"):
+                row.append(
+                    "%s=%s" % (item.get("suite"), item.get("outcome"))
+                )
+        print("  %s: %s" % (lane.get("id"), " ".join(row)))
+    print("matrix report: %s" % report_path)
+    bad = [item for item in results if item.get("outcome") != "pass"]
+    if bad:
+        print(
+            "matrix: %d/%d lane-suites failed (%s)"
+            % (
+                len(bad),
+                len(results),
+                ", ".join(
+                    "%s/%s=%s"
+                    % (item.get("lane"), item.get("suite"),
+                       item.get("outcome"))
+                    for item in bad
+                ),
+            )
+        )
+        return EXIT_FAILURE
+    print("matrix: %d/%d lane-suites passed"
+          % (len(results), len(results)))
+    return EXIT_OK
+
+
 def sha256_file(path):
     import hashlib
 
@@ -2434,6 +2576,21 @@ def build_parser():
         help="directory prepended to PATH for the consumer suite only "
         "(independent toolchain outside the checkout)",
     )
+    parser.add_argument(
+        "--merge",
+        nargs="+",
+        default=None,
+        metavar="REPORT",
+        help="merge per-shard matrix-report.json files into one board "
+        "(writes --out-dir/matrix-report.json); no suites run",
+    )
+    parser.add_argument(
+        "--expect-lanes",
+        default=None,
+        metavar="LANES",
+        help="comma-separated lane ids the merge must cover exactly "
+        "(a missing shard refuses instead of merging silently)",
+    )
     return parser
 
 
@@ -2444,6 +2601,32 @@ def _remove_farm(farm_dir):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.merge:
+        if args.lane or args.suite or args.timeout:
+            sys.stderr.write(
+                "run_vm_tests: --merge takes no --lane/--suite/--timeout\n"
+            )
+            return EXIT_SETUP
+        out_dir = args.out_dir
+        if not out_dir:
+            out_dir = tempfile.mkdtemp(prefix="mojobpf-matrix-merged-")
+        expect = None
+        if args.expect_lanes:
+            expect = [
+                lane.strip()
+                for lane in args.expect_lanes.split(",")
+                if lane.strip()
+            ]
+        try:
+            return merge_reports(args.merge, out_dir, expect)
+        except SetupFailure as exc:
+            sys.stderr.write("run_vm_tests: %s\n" % exc)
+            return EXIT_SETUP
+    if args.expect_lanes:
+        sys.stderr.write(
+            "run_vm_tests: --expect-lanes needs --merge\n"
+        )
+        return EXIT_SETUP
     try:
         lock = load_lock(args.lock)
         commit = git_head()
