@@ -361,6 +361,30 @@ def test_render_guest_mount_missing_path_mounts_then_refuses():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_render_harness_flags_refuse_trailing_backslash():
+    # A trailing backslash would escape the closing double
+    # quote and corrupt every following guest argument.
+    try:
+        tool_admission.render_harness_flags(
+            _direct_pins(), pin_path="$pin",
+            owned_root="/sys/fs/bpf", ownership_token="xdp-$tag\\",
+        )
+    except tool_admission.ToolAdmissionError as exc:
+        assert "trailing backslash" in str(exc), exc
+    else:
+        raise AssertionError("trailing backslash admitted")
+
+
+def test_render_prologue_uses_absolute_checker_paths():
+    # The guest script pins no PATH: bare sha256sum/realpath
+    # would trust unauthenticated checker bytes.
+    prologue = tool_admission.render_prologue(_launcher_pins())
+    assert "/usr/bin/sha256sum -c -" in prologue, prologue
+    assert "$(/usr/bin/realpath " in prologue, prologue
+    assert "| sha256sum" not in prologue, prologue
+    assert '"$(realpath ' not in prologue, prologue
+
+
 def test_stage_missing_path_is_tool_missing_admission():
     assert issubclass(
         tool_admission.ToolMissingError,
@@ -391,6 +415,12 @@ def test_stage_missing_path_is_tool_missing_admission():
             assert "staging PATH" in str(exc), exc
         else:
             raise AssertionError("missing bpftool admitted")
+        try:
+            tool_admission.stage_tool_pins({})
+        except tool_admission.ToolMissingError as exc:
+            assert "no PATH" in str(exc), exc
+        else:
+            raise AssertionError("PATH-less staging admitted")
     finally:
         if saved is None:
             os.environ.pop(tool_admission.BPFTOOL_PINS_ENV, None)

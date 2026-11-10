@@ -443,8 +443,26 @@ def install_sealed(dirfd, name, data, seal):
     ``data`` plus the snapshot of the verified inode,
     so callers adopt their baseline from the
     installer-held inode rather than a later pathname
-    read (A1M6-1).
+    read (A1M6-1). ``name`` must be a plain basename: empty
+    names and names carrying ``/``, NUL, ``.``/``..`` or a
+    leading dot refuse before any descriptor opens, since
+    dirfd-relative unlink/linkat/open would otherwise let a
+    hostile name escape the intended entry.
     """
+    if not isinstance(name, str) or not name:
+        raise ValueError(
+            "sealed install refused: names must be non-empty strings"
+        )
+    if (
+        "/" in name
+        or "\x00" in name
+        or name in (".", "..")
+        or name.startswith(".")
+    ):
+        raise ValueError(
+            "sealed install refused: %r is not a plain basename"
+            % (name,)
+        )
     watch = NameWatch("/proc/self/fd/%d" % dirfd)
     try:
         try:

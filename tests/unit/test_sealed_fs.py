@@ -57,6 +57,26 @@ def test_install_sealed_publishes_expected_bytes_with_seal():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_install_sealed_refuses_non_basename():
+    # A '/'-bearing (or dot, or empty) name would escape the
+    # intended entry through dirfd-relative calls; it refuses
+    # before any descriptor opens.
+    root, _identity = _owned_dir()
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for bad in ("", "sub/evil", "..", ".", ".hidden", "a\x00b"):
+                with pytest.raises(ValueError):
+                    sealed_fs.install_sealed(
+                        dirfd, bad, b"captured-bytes", 0o444
+                    )
+        finally:
+            os.close(dirfd)
+        assert os.listdir(root) == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_install_sealed_replaces_without_following():
     # A1M4-1: publishing over a planted symlink replaces the
     # link itself; the link target is never followed or adopted.

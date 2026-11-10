@@ -1429,6 +1429,8 @@ SCREEN_POSITIVES = [
     ('negation', '#!/bin/sh\n! false\necho neg-ok\n', 'neg-ok'),
     ('brace-group', '#!/bin/sh\n{ echo grouped; }\n', 'grouped'),
     ('pipeline', '#!/bin/sh\necho line | grep line\necho pipe-ok\n', 'pipe-ok'),
+    ('hash-word', '#!/bin/sh\necho a#b\n', 'a#b'),
+    ('hash-after-splice', '#!/bin/sh\necho a\\\n#b\n', 'a#b'),
 ]
 
 
@@ -1483,6 +1485,10 @@ SCREEN_REFUSALS = [
     ('function-def', '#!/bin/sh\nfoo() { echo hi; }\n', 'owned-fixture-subshell'),
     ('subst-inner-path', '#!/bin/sh\nout=$(/usr/bin/cc --version)\n', 'owned-fixture-path-head'),
     ('subst-inner-head', '#!/bin/sh\nout=$(nosuchtool_xyz arg)\n', 'owned-fixture-command-head'),
+    ('hash-subst', '#!/bin/sh\necho a#$(nosuchtool_xyz arg)\n', 'owned-fixture-command-head'),
+    ('hash-backtick', '#!/bin/sh\necho a#`id`\n', 'owned-fixture-backtick'),
+    ('hash-pipe', '#!/bin/sh\necho a#|nosuchtool_xyz\n', 'owned-fixture-command-head'),
+    ('hash-splice-subst', '#!/bin/sh\necho a\\\n#$(nosuchtool_xyz)\n', 'owned-fixture-command-head'),
 ]
 
 
@@ -1707,6 +1713,52 @@ def test_exec_wrapper_argument_conventions(lanes, tmp_path, kind):
     assert not marker.exists()
 
 
+@pytest.mark.parametrize('kind', ['spawnv', 'spawnve', 'spawnvp', 'spawnvpe',
+                                  'spawnl', 'spawnle', 'spawnlp', 'spawnlpe'])
+def test_spawn_wrapper_argument_conventions(lanes, tmp_path, kind):
+    # spawn* take (mode, path/file, argv-or-args[, env]); the e
+    # variants forward their supplied env (never os.environ).
+    if not hasattr(os, kind):
+        pytest.skip('os.%s unavailable' % kind)
+    code = ('import os,sys\n'
+            f'kind = {kind!r}\n'
+            'payload = "import os; print(\\"MARK=%s\\" % os.environ.get(\\"GUARD_SPAWN_MARK\\"))"\n'
+            'env = {"GUARD_SPAWN_MARK": "spawn-ok", "PATH": os.environ["PATH"]}\n'
+            'exe = sys.executable\n'
+            'argv = [exe, "-c", payload]\n'
+            'if kind == "spawnv": rc = os.spawnv(os.P_WAIT, exe, argv)\n'
+            'elif kind == "spawnve": rc = os.spawnve(os.P_WAIT, exe, argv, env)\n'
+            'elif kind == "spawnvp": rc = os.spawnvp(os.P_WAIT, exe, argv)\n'
+            'elif kind == "spawnvpe": rc = os.spawnvpe(os.P_WAIT, exe, argv, env)\n'
+            'elif kind == "spawnl": rc = os.spawnl(os.P_WAIT, exe, exe, "-c", payload)\n'
+            'elif kind == "spawnle": rc = os.spawnle(os.P_WAIT, exe, exe, "-c", payload, env)\n'
+            'elif kind == "spawnlp": rc = os.spawnlp(os.P_WAIT, exe, exe, "-c", payload)\n'
+            'else: rc = os.spawnlpe(os.P_WAIT, exe, exe, "-c", payload, env)\n'
+            'print("SPAWN-RC", rc)\n')
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert 'SPAWN-RC 0' in result.stdout, (result.stdout, result.stderr)
+    if kind in ('spawnv', 'spawnvp', 'spawnl', 'spawnlp'):
+        assert 'MARK=None' in result.stdout, (result.stdout, result.stderr)
+    else:
+        assert 'MARK=spawn-ok' in result.stdout, (result.stdout, result.stderr)
+    assert not marker.exists()
+
+
+def test_spawn_forbidden_name_refuses(lanes, tmp_path):
+    # The spawn entry points route through check(): a FORBIDDEN
+    # name refuses with a journal entry, never a raw exit code.
+    if not hasattr(os, 'spawnvp'):
+        pytest.skip('os.spawnvp unavailable')
+    result, marker = guarded(lanes, tmp_path,
+        'import os\ntry: os.spawnvp(os.P_WAIT, "cc", ["cc", "--version"])\n'
+        'except PermissionError: print("SPAWN-REFUSED")')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'SPAWN-REFUSED' in result.stdout, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'forbidden-name' in marker.read_text()
+
+
 def test_audit_hook_refuses_rewrite_it_cannot_apply(lanes, tmp_path):
     # A Popen initializer cached before installation bypasses
     # the wrapper; the audit hook sees the unrewritten python
@@ -1869,6 +1921,49 @@ def test_awk_flags_with_operands_run(lanes, tmp_path):
         'input="v\\n", capture_output=True, text=True, check=True)\nprint("AWK-OUT", p.stdout.strip())')
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert 'AWK-OUT Tv' in result.stdout
+    assert not marker.exists()
+
+
+def test_awk_division_slash_cannot_hide_system(lanes, tmp_path):
+    # '/' after an operand is division, not a regex literal: the
+    # two slashes must not pair up and strip the live system()
+    # call between them. (gawk executes a/system("id")/b as
+    # division around a real call.)
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/usr/bin/awk", "BEGIN{a/system(\\"id\\")/b}"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'command-pipe' in marker.read_text()
+
+
+def test_awk_division_slash_cannot_hide_pipe(lanes, tmp_path):
+    # Same pairing hazard for '|': print a/"6" | "sort"/b pipes
+    # under gawk, so the slashes must stay visible.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/usr/bin/awk", "{print a/\\"6\\" | \\"sort\\"/b}"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'command-pipe' in marker.read_text()
+
+
+def test_awk_bare_getline_word_is_refused(lanes, tmp_path):
+    # getline without a pipe still reads files; no lane filter
+    # uses it, so the bare word refuses even with no '|' left.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/usr/bin/awk", "BEGIN{getline line < \\"/dev/null\\"}"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'command-pipe' in marker.read_text()
+
+
+def test_awk_division_runs(lanes, tmp_path):
+    # Division slashes stay in the screened text but must not
+    # refuse: a plain arithmetic filter still runs.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\np = subprocess.run(["/usr/bin/awk", "{print $1/2}"], input="4\\n", '
+        'capture_output=True, text=True, check=True)\nprint("AWK-OUT", p.stdout.strip())')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert 'AWK-OUT 2' in result.stdout
     assert not marker.exists()
 
 

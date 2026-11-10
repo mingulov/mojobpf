@@ -7116,6 +7116,125 @@ def test_vng_accelerator_argv_reads_process_env():
             os.environ[helper.VNG_ACCELERATOR_ENV] = saved
 
 
+def test_cleanup_input_alias_removes_through_pinned_parent():
+    helper = _load_helper()
+    workdir = tempfile.mkdtemp(prefix="cleanup-alias-")
+    try:
+        root = os.path.join(workdir, "consumed-dir")
+        os.mkdir(root)
+        created = os.stat(root, follow_symlinks=False)
+        identity = (created.st_dev, created.st_ino)
+        parent_fd = os.open(
+            workdir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            parent = os.fstat(parent_fd)
+            parent_identity = (parent.st_dev, parent.st_ino)
+            directory_fd = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+            )
+            try:
+                helper._cleanup_input_alias(
+                    root, directory_fd, identity, None,
+                    parent_fd=parent_fd,
+                    parent_identity=parent_identity,
+                )
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(parent_fd)
+        assert not os.path.exists(root)
+        print("PASS cleanup removes through pinned parent")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_cleanup_input_alias_refuses_swapped_occupant():
+    helper = _load_helper()
+    workdir = tempfile.mkdtemp(prefix="cleanup-alias-")
+    try:
+        root = os.path.join(workdir, "consumed-dir")
+        os.mkdir(root)
+        created = os.stat(root, follow_symlinks=False)
+        identity = (created.st_dev, created.st_ino)
+        parent_fd = os.open(
+            workdir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            parent = os.fstat(parent_fd)
+            parent_identity = (parent.st_dev, parent.st_ino)
+            directory_fd = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+            )
+            try:
+                os.rmdir(root)
+                os.mkdir(root)
+                try:
+                    helper._cleanup_input_alias(
+                        root, directory_fd, identity, None,
+                        parent_fd=parent_fd,
+                        parent_identity=parent_identity,
+                    )
+                except helper.HarnessEnvironment as exc:
+                    assert "moved or replaced" in str(exc), str(exc)
+                else:
+                    raise AssertionError(
+                        "swapped occupant must refuse"
+                    )
+                assert os.path.isdir(root)
+                print("PASS cleanup refuses swapped occupant")
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_cleanup_input_alias_refuses_swapped_parent():
+    helper = _load_helper()
+    workdir = tempfile.mkdtemp(prefix="cleanup-alias-")
+    try:
+        root = os.path.join(workdir, "consumed-dir")
+        os.mkdir(root)
+        created = os.stat(root, follow_symlinks=False)
+        identity = (created.st_dev, created.st_ino)
+        parent_fd = os.open(
+            workdir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            directory_fd = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+            )
+            try:
+                try:
+                    helper._cleanup_input_alias(
+                        root, directory_fd, identity, None,
+                        parent_fd=parent_fd,
+                        parent_identity=(0, 0),
+                    )
+                except helper.HarnessEnvironment as exc:
+                    assert "parent" in str(exc), str(exc)
+                else:
+                    raise AssertionError(
+                        "swapped parent must refuse"
+                    )
+                assert os.path.isdir(root)
+                print("PASS cleanup refuses swapped parent")
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _direct_names():
     return sorted(
         name

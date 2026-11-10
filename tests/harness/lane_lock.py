@@ -83,17 +83,23 @@ def expected_kernel_release(repo_root, release, arch=""):
 def booted_kernel_from_output(output):
     """Return the guest-reported ``guest-kernel`` value.
 
-    The last ``guest-kernel:`` line wins, matching the suites'
-    historical parse loops. Raises :class:`LaneLockError` when the
-    guest reported no kernel line.
+    Every ``guest-kernel:`` line must agree: a trailing line
+    that disagrees refuses instead of overriding the true
+    reading. Raises :class:`LaneLockError` when the guest
+    reported no kernel line, or conflicting lines.
     """
-    kernel = ""
+    seen = []
     for line in output.splitlines():
         if line.startswith("guest-kernel:"):
-            kernel = line.split("guest-kernel:", 1)[1].strip()
-    if not kernel:
+            seen.append(line.split("guest-kernel:", 1)[1].strip())
+    if not seen:
         raise LaneLockError("guest reported no guest-kernel line")
-    return kernel
+    if len(set(seen)) > 1:
+        raise LaneLockError(
+            "guest reported conflicting guest-kernel lines: %r"
+            % (seen,)
+        )
+    return seen[0]
 
 
 def check_booted_kernel(observed, repo_root, release, arch=""):
@@ -112,11 +118,21 @@ def check_booted_kernel(observed, repo_root, release, arch=""):
 
 
 def sha256_file(path):
-    """Return the hex SHA-256 of a file."""
+    """Return the hex SHA-256 of a file.
+
+    Read failures raise :class:`LaneLockError` naming the file,
+    never a bare :class:`OSError`: callers translate only the
+    lock vocabulary into suite verdicts.
+    """
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise LaneLockError(
+            "cannot hash lane file %r: %s" % (path, exc)
+        )
     return digest.hexdigest()
 
 
@@ -181,9 +197,10 @@ def check_guest_root(root_dir, repo_root, release, arch=""):
     Lanes without a ``rootfs`` pin (the x86-64 lanes boot the host
     root) return ``None`` unchecked. Lanes with a pin require the
     unpacked root's ``etc/os-release`` to identify the locked release
-    codename, and verify the locked tarball hash and size when the
-    tarball sits next to the unpacked root. Returns the observed
-    identity mapping for suite boards.
+    codename, and require the locked tarball next to the unpacked
+    root with its locked hash and size: a codename string alone
+    never binds the root. Returns the observed identity mapping
+    for suite boards.
     """
     lane = lane_for_release(repo_root, release, arch)
     pin = lane.get("rootfs")
@@ -222,22 +239,39 @@ def check_guest_root(root_dir, repo_root, release, arch=""):
             )
         )
     observed = {"codename": codename}
+    if not pin.get("image"):
+        raise LaneLockError(
+            "lane %s rootfs pin names no image; the guest root "
+            "cannot bind to the locked tarball"
+            % (lane.get("id", release),)
+        )
     tarball = os.path.join(
-        os.path.dirname(os.path.abspath(root_dir)), pin.get("image", "")
+        os.path.dirname(os.path.abspath(root_dir)), pin["image"]
     )
-    if pin.get("image") and os.path.isfile(tarball):
+    if not os.path.isfile(tarball):
+        raise LaneLockError(
+            "lane %s rootfs tarball %r is absent; a codename "
+            "string alone never binds the guest root"
+            % (lane.get("id", release), tarball)
+        )
+    try:
         size = os.path.getsize(tarball)
-        if size != pin.get("bytes", -1):
-            raise LaneLockError(
-                "lane %s rootfs tarball size %d is not the locked %d"
-                % (lane.get("id", release), size, pin.get("bytes", -1))
-            )
-        digest = sha256_file(tarball)
-        if digest != pin.get("sha256", ""):
-            raise LaneLockError(
-                "lane %s rootfs tarball hash mismatch (observed %s)"
-                % (lane.get("id", release), digest)
-            )
-        observed["tarball"] = tarball
-        observed["tarball_sha256"] = digest
+    except OSError as exc:
+        raise LaneLockError(
+            "cannot stat lane %s rootfs tarball %r: %s"
+            % (lane.get("id", release), tarball, exc)
+        )
+    if size != pin.get("bytes", -1):
+        raise LaneLockError(
+            "lane %s rootfs tarball size %d is not the locked %d"
+            % (lane.get("id", release), size, pin.get("bytes", -1))
+        )
+    digest = sha256_file(tarball)
+    if digest != pin.get("sha256", ""):
+        raise LaneLockError(
+            "lane %s rootfs tarball hash mismatch (observed %s)"
+            % (lane.get("id", release), digest)
+        )
+    observed["tarball"] = tarball
+    observed["tarball_sha256"] = digest
     return observed

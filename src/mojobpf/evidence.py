@@ -1517,6 +1517,7 @@ def _back_up_predecessor(
                 != (observed.st_dev, observed.st_ino)
                 or current.st_size != observed.st_size
                 or current.st_mtime_ns != observed.st_mtime_ns
+                or current.st_ctime_ns != observed.st_ctime_ns
             ) or not stat.S_ISREG(current.st_mode):
                 raise _publish_fail(
                     "cannot publish %r: predecessor %r changed "
@@ -1580,17 +1581,21 @@ def _recheck_predecessor(
                 "republish into a stable directory",
             )
         return
-    # Identity is (dev, ino, size, mtime_ns): (dev, ino) alone
-    # is blind to a same-inode replacement (ext4 reuses a freed
-    # inode immediately for a same-directory recreate; an
-    # in-place rewrite keeps it by definition). Same pattern as
-    # execution._check_open_image.
+    # Identity is (dev, ino, size, mtime_ns, ctime_ns):
+    # (dev, ino) alone is blind to a same-inode replacement
+    # (ext4 reuses a freed inode immediately for a same-directory
+    # recreate; an in-place rewrite keeps it by definition),
+    # and mtime alone is blind to an in-place rewrite with a
+    # utimens-restored mtime. ctime moves on every write and
+    # cannot be set back, so it is the unforgeable leg. Same
+    # pattern as execution._check_open_image.
     if (
         current is None
         or (current.st_dev, current.st_ino)
         != (observed.st_dev, observed.st_ino)
         or current.st_size != observed.st_size
         or current.st_mtime_ns != observed.st_mtime_ns
+        or current.st_ctime_ns != observed.st_ctime_ns
         or stat.S_ISLNK(current.st_mode)
         or not stat.S_ISREG(current.st_mode)
     ):
@@ -1669,6 +1674,12 @@ def _capture_predecessor(
             final_path,
             "remove the swapped predecessor, then republish",
         )
+    # ctime is deliberately excluded here: the capture rename
+    # above moves the inode's ctime by design, so comparing it
+    # against the pre-rename observation would always fail. The
+    # recheck immediately before the rename already bound the
+    # full five-leg identity; this compare catches a swap in the
+    # rename itself.
     if (
         (current.st_dev, current.st_ino)
         != (observed.st_dev, observed.st_ino)
@@ -1699,7 +1710,12 @@ def _hash_published(
     ``(st_dev, st_ino, st_size, st_mtime_ns)``: a result
     swapped in after the rename is refused instead of hashed,
     so the reported digest always describes the staged bytes
-    inside the pinned directory.
+    inside the pinned directory. ctime is deliberately
+    excluded: the install rename moves it by design, so only
+    the four rename-stable legs compare. Residual: an in-place
+    rewrite with a utimens-restored mtime inside the
+    rename-to-hash window (same-uid only, microseconds) would
+    still hash; the digest then describes those actual bytes.
     """
     try:
         observed = os.lstat(name, dir_fd=dir_fd)
@@ -1998,7 +2014,7 @@ def publish_artifacts(
             out_dir,
             "publish each name once",
         )
-    admitted_sources: dict[str, tuple[int, int, int, int]] = {}
+    admitted_sources: dict[str, tuple[int, int, int, int, int]] = {}
     for name, staged_path, _role in triples:
         if not isinstance(staged_path, str):
             raise _publish_fail(
@@ -2019,6 +2035,7 @@ def publish_artifacts(
             observed.st_ino,
             observed.st_size,
             observed.st_mtime_ns,
+            observed.st_ctime_ns,
         )
         mode = observed.st_mode
         if stat.S_ISLNK(mode):
@@ -2112,6 +2129,7 @@ def publish_artifacts(
                             opened.st_ino,
                             opened.st_size,
                             opened.st_mtime_ns,
+                            opened.st_ctime_ns,
                         ) != (admitted_sources[name]):
                             raise _publish_fail(
                                 "cannot stage %r for publication: "

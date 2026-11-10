@@ -1512,22 +1512,79 @@ def _input_cleanup_failure(message):
     )
 
 
-def _cleanup_input_alias(root, directory_fd, identity, name):
-    """Retire our entry without recursively removing a mutable pathname."""
+def _rmdir_pinned_occupant(root, parent_fd, parent_identity, identity):
+    """Remove the verified occupant through the pinned parent.
+
+    Mirrors ``sealed_fs.rmtree_owned``: the parent verifies by
+    identity, the occupant re-opens under the parent without
+    following links and verifies against ``identity``, and only
+    then does the descriptor-bound rmdir run. A swapped-in
+    foreign occupant refuses before any removal.
+    """
+    parent_now = os.fstat(parent_fd)
+    if parent_identity != (parent_now.st_dev, parent_now.st_ino):
+        raise OSError(
+            "owned input parent directory was moved or replaced"
+        )
+    base = os.path.basename(root)
+    try:
+        child = os.open(
+            base,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        raise OSError(
+            "owned input directory is absent: %r" % (root,)
+        ) from None
+    try:
+        pinned = os.fstat(child)
+        if identity != (pinned.st_dev, pinned.st_ino):
+            raise OSError("owned input directory was moved or replaced")
+        os.rmdir(base, dir_fd=parent_fd)
+        # A replacement can race the removal. Prove removal of
+        # the original directory while its descriptor is held.
+        if os.fstat(child).st_nlink != 0:
+            raise OSError(
+                "owned input directory removal could not be established"
+            )
+    finally:
+        try:
+            os.close(child)
+        except OSError:
+            pass
+
+
+def _cleanup_input_alias(root, directory_fd, identity, name,
+                         parent_fd=None, parent_identity=None):
+    """Retire our entry without recursively removing a mutable pathname.
+
+    With a pinned parent the occupant verifies by identity and
+    removes through the parent descriptor, so no pathname
+    TOCTOU can aim the rmdir at a foreign directory. Without
+    one (setup failed before the pin) the legacy pathname
+    check applies and any doubt refuses.
+    """
     try:
         if name is not None and directory_fd is not None:
             try:
                 os.unlink(name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
-        current = os.stat(root, follow_symlinks=False)
-        if identity != (current.st_dev, current.st_ino):
-            raise OSError("owned input directory was moved or replaced")
-        os.rmdir(root)
-        # A replacement can race the pathname check. Prove removal of
-        # the original directory while its descriptor is still held.
-        if directory_fd is None or os.fstat(directory_fd).st_nlink != 0:
-            raise OSError("owned input directory removal could not be established")
+        if parent_fd is not None and parent_identity is not None:
+            _rmdir_pinned_occupant(
+                root, parent_fd, parent_identity, identity
+            )
+        else:
+            current = os.stat(root, follow_symlinks=False)
+            if identity != (current.st_dev, current.st_ino):
+                raise OSError("owned input directory was moved or replaced")
+            os.rmdir(root)
+            # A replacement can race the pathname check. Prove removal of
+            # the original directory while its descriptor is still held.
+            if directory_fd is None or os.fstat(directory_fd).st_nlink != 0:
+                raise OSError("owned input directory removal could not be established")
     except OSError as exc:
         raise _input_cleanup_failure(
             "input directory cleanup unresolved for %r: %s" % (root, exc)
@@ -1588,9 +1645,19 @@ def consumed_path(path, *, preserve_name=False):
         if preserve_name:
             root = tempfile.mkdtemp(prefix="mojobpf-consumed-")
             directory_fd, identity, published = None, None, None
+            parent_fd, parent_identity = None, None
             try:
                 created = os.stat(root, follow_symlinks=False)
                 identity = (created.st_dev, created.st_ino)
+                parent_fd = os.open(
+                    os.path.dirname(os.path.abspath(root)),
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                )
+                parent_pinned = os.fstat(parent_fd)
+                parent_identity = (
+                    parent_pinned.st_dev, parent_pinned.st_ino
+                )
                 directory_fd = os.open(
                     root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
                 pinned = os.fstat(directory_fd)
@@ -1614,7 +1681,11 @@ def consumed_path(path, *, preserve_name=False):
                         ) from exc
             finally:
                 try:
-                    _cleanup_input_alias(root, directory_fd, identity, published)
+                    _cleanup_input_alias(
+                        root, directory_fd, identity, published,
+                        parent_fd=parent_fd,
+                        parent_identity=parent_identity,
+                    )
                 finally:
                     if directory_fd is not None:
                         try:
@@ -1622,6 +1693,13 @@ def consumed_path(path, *, preserve_name=False):
                         except OSError as exc:
                             raise _input_cleanup_failure(
                                 "input directory descriptor teardown failed: %s" % exc
+                            ) from exc
+                    if parent_fd is not None:
+                        try:
+                            os.close(parent_fd)
+                        except OSError as exc:
+                            raise _input_cleanup_failure(
+                                "input parent descriptor teardown failed: %s" % exc
                             ) from exc
         else:
             yield descriptor

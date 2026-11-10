@@ -94,12 +94,25 @@ def test_missing_kernel_line_fails():
         raise AssertionError("missing guest-kernel line must fail")
 
 
-def test_last_kernel_line_wins():
+def test_conflicting_kernel_lines_fail():
+    try:
+        lane_lock.booted_kernel_from_output(
+            "guest-kernel: 6.6.0-060600-generic\n"
+            "guest-kernel: 6.12.0-061200-generic\n"
+        )
+    except lane_lock.LaneLockError as exc:
+        assert "conflicting" in str(exc), str(exc)
+        print("PASS conflicting kernel lines fail")
+    else:
+        raise AssertionError("conflicting guest-kernel lines must fail")
+
+
+def test_repeated_kernel_line_agrees():
     assert lane_lock.booted_kernel_from_output(
-        "guest-kernel: 6.6.0-060600-generic\n"
+        "guest-kernel: 6.12.0-061200-generic\n"
         "guest-kernel: 6.12.0-061200-generic\n"
     ) == "6.12.0-061200-generic"
-    print("PASS last kernel line wins")
+    print("PASS repeated kernel line agrees")
 
 
 def test_arm64_lock_selected():
@@ -198,6 +211,92 @@ def test_guest_root_codename_checked():
             print("PASS guest root codename checked")
         else:
             raise AssertionError("wrong root codename must fail")
+
+
+def test_cache_unreadable_deb_fails_typed():
+    # A broken symlink (or denied file) must surface as
+    # LaneLockError naming the file, never a bare OSError.
+    with (
+        tempfile.TemporaryDirectory(prefix="lane-lock-") as root,
+        tempfile.TemporaryDirectory(prefix="lane-home-") as home,
+    ):
+        path = os.path.join(home, ".cache", "virtme-ng", "v9.99", "amd64")
+        os.makedirs(path)
+        os.symlink(
+            os.path.join(path, "absent-target.deb"),
+            os.path.join(path, "kernel-amd64.deb"),
+        )
+        write_lock(root, "kernels.lock.json", [
+            {"id": "v9.99-tcg", "release": "v9.99",
+             "kernel_release": "9.99.0-x",
+             "kernel_debs": [{"file": "kernel-amd64.deb",
+                              "sha256": "0" * 64}]},
+        ])
+        with patch.object(lane_lock.os.path, "expanduser", return_value=home):
+            try:
+                lane_lock.check_kernel_cache(root, "v9.99")
+            except lane_lock.LaneLockError as exc:
+                assert "kernel-amd64.deb" in str(exc), str(exc)
+                print("PASS cache unreadable deb fails typed")
+            else:
+                raise AssertionError("unreadable cache DEB must fail")
+
+
+def test_guest_root_absent_tarball_fails():
+    # A matching codename with no adjacent tarball never
+    # binds: the cryptographic leg is required, not optional.
+    with (
+        tempfile.TemporaryDirectory(prefix="lane-lock-") as root,
+        tempfile.TemporaryDirectory(prefix="lane-root-") as stage,
+    ):
+        write_lock(root, "kernels.arm64.lock.json", [
+            {"id": "v9.99-arm64-tcg", "release": "v9.99",
+             "arch": "arm64",
+             "kernel_release": "9.99.0-x",
+             "kernel_debs": [],
+             "rootfs": {"image": "img.tar.xz", "release": "resolute",
+                        "bytes": 4, "sha256": "0" * 64}},
+        ])
+        guest = os.path.join(stage, "guest")
+        os.makedirs(os.path.join(guest, "etc"))
+        with open(os.path.join(guest, "etc", "os-release"), "w") as h:
+            h.write('NAME="Ubuntu"\nVERSION_CODENAME=resolute\n')
+        try:
+            lane_lock.check_guest_root(guest, root, "v9.99", "arm64")
+        except lane_lock.LaneLockError as exc:
+            assert "absent" in str(exc), str(exc)
+            print("PASS guest root absent tarball fails")
+        else:
+            raise AssertionError("tarball-less guest root must fail")
+
+
+def test_guest_root_matching_tarball_binds():
+    with (
+        tempfile.TemporaryDirectory(prefix="lane-lock-") as root,
+        tempfile.TemporaryDirectory(prefix="lane-root-") as stage,
+    ):
+        payload = b"fake-rootfs-bytes"
+        write_lock(root, "kernels.arm64.lock.json", [
+            {"id": "v9.99-arm64-tcg", "release": "v9.99",
+             "arch": "arm64",
+             "kernel_release": "9.99.0-x",
+             "kernel_debs": [],
+             "rootfs": {"image": "img.tar.xz", "release": "resolute",
+                        "bytes": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest()}},
+        ])
+        guest = os.path.join(stage, "guest")
+        os.makedirs(os.path.join(guest, "etc"))
+        with open(os.path.join(guest, "etc", "os-release"), "w") as h:
+            h.write('NAME="Ubuntu"\nVERSION_CODENAME=resolute\n')
+        with open(os.path.join(stage, "img.tar.xz"), "wb") as h:
+            h.write(payload)
+        observed = lane_lock.check_guest_root(
+            guest, root, "v9.99", "arm64"
+        )
+        assert observed["codename"] == "resolute", observed
+        assert observed["tarball"].endswith("img.tar.xz"), observed
+        print("PASS guest root matching tarball binds")
 
 
 def test_guest_root_absent_without_pin():

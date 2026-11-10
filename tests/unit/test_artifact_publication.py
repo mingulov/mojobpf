@@ -3480,6 +3480,61 @@ def test_publish_predecessor_change_before_replace_rejected():
         ] == []
 
 
+def test_publish_recheck_restored_mtime_rewrite_rejected():
+    # An in-place rewrite with a utimens-restored mtime keeps
+    # (dev, ino, size, mtime) identical: only the ctime leg can
+    # see it. The rewrite lands before the recheck's own lstat
+    # (second observation), so the recheck must refuse on ctime
+    # alone; rollback then restores the backed-up bytes.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"STAGED-NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        before = os.stat(victim)
+        four_leg = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns,
+        )
+        checked = []
+
+        def rewrite_restore(_observed):
+            stamp = os.stat(victim).st_mtime_ns
+            with open(victim, "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"NEW")
+            os.utime(victim, ns=(stamp, stamp))
+            after = os.stat(victim)
+            checked.append((
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns,
+            ))
+
+        wrapper, fired, real_lstat = _swapping_lstat_factory(
+            victim, rewrite_restore, fire_on=2, order="before"
+        )
+        os.lstat = wrapper
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.lstat = real_lstat
+        assert fired, "swap never injected"
+        assert checked == [four_leg], checked
+        assert "changed" in exc.diagnostic.explanation
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"OLD"
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
 def test_publish_second_file_recheck_failure_rolls_back_first():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:

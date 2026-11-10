@@ -2,8 +2,8 @@
 """Exec-allowlist guard runtime: identity, refusal, and propagation.
 
 The guard interposes on process creation (subprocess, os.exec,
-os.system, os.posix_spawn, and an audit-hook second opinion) and
-admits or refuses each spawn by argv-level rules only:
+os.spawn, os.system, os.posix_spawn, and an audit-hook second
+opinion) and admits or refuses each spawn by argv-level rules only:
 
 - a FORBIDDEN tool name refuses even when absent;
 - an owned fixture (under the fixture root, owned uid, regular
@@ -173,7 +173,14 @@ def _emit_json(value):
 
 
 def _journal(event, argv, reason, detail=None):
-    """Append one journal line; journal failure never blocks refusal."""
+    """Append one journal line; journal failure never blocks refusal.
+
+    The journal is refusal-only by design: admitted spawns leave
+    no record, and an unwritable marker loses refusal evidence
+    too (the OSError below). Forensics reads the journal as a
+    lower bound on refused attempts, never as a spawn log; the
+    fail-closed verdict (PermissionError) does not depend on it.
+    """
     record = {'event': event, 'argv': [os.fsdecode(a) for a in argv], 'reason': reason}
     if detail is not None:
         record['detail'] = detail
@@ -399,6 +406,12 @@ _SCREEN_KEYWORDS = frozenset([
 _SCREEN_ASSIGN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
 _SCREEN_COMMAND_CAP = 4096
 _SCREEN_SUBST_DEPTH = 8
+# Bytes after which an unquoted '#' starts a comment (the shell's
+# own rule: '#' comments only at the start of a word). Anything
+# else keeps the '#' as word content so later gates screen it.
+_SCREEN_COMMENT_BREAKS = frozenset([
+    ' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>',
+])
 
 
 def _screen_shell_fixture(argv, path):
@@ -435,11 +448,18 @@ def _screen_shell_fixture(argv, path):
 
 
 def _screen_text(argv, text, depth):
-    """Gate one shell text: strip comments, split, gate commands."""
+    """Gate one shell text: strip comments, split, gate commands.
+
+    Comment stripping follows the shell exactly: an unquoted '#'
+    comments only at the start of a word. A mid-word '#' (echo
+    a#$(cmd), backticks, a#|cmd) is live shell syntax, so it
+    stays in the screened text and the later gates judge it.
+    """
     if depth > _SCREEN_SUBST_DEPTH:
         refuse(argv, 'owned-fixture-nesting-too-deep')
     stripped = []
     quote = None
+    word_start = True
     index = 0
     count = len(text)
     while index < count:
@@ -448,38 +468,52 @@ def _screen_text(argv, text, depth):
             stripped.append(char)
             if char == "'":
                 quote = None
+            word_start = False
             index += 1
             continue
         if char == '\\' and text[index + 1:index + 2] == '\n':
             # Spliced outside single quotes (the shell's own
-            # rule); inside them the backslash is literal.
+            # rule); inside them the backslash is literal. The
+            # splice joins words, so a '#' after it is mid-word.
+            word_start = False
             index += 2
             continue
         if char == '\\' and quote is None:
             stripped.append(text[index:index + 2])
+            word_start = False
             index += 2
             continue
         if char == '\\' and quote == '"':
             # An escaped quote must not toggle quote state,
             # or bytes after it screen under the wrong quoting.
             stripped.append(text[index:index + 2])
+            word_start = False
             index += 2
             continue
         if char == "'" and quote is None:
             quote = "'"
             stripped.append(char)
+            word_start = False
             index += 1
             continue
         if char == '"' and quote != "'":
             quote = None if quote == '"' else '"'
             stripped.append(char)
+            word_start = False
             index += 1
             continue
-        if char == '#' and quote is None:
+        if char == '#' and quote is None and word_start:
             while index < count and text[index] != '\n':
                 index += 1
             continue
+        if char == '#' and quote is None:
+            # Mid-word: live shell syntax, screened below.
+            stripped.append(char)
+            word_start = False
+            index += 1
+            continue
         stripped.append(char)
+        word_start = char in _SCREEN_COMMENT_BREAKS
         index += 1
     commands = []
     current = []
@@ -984,7 +1018,17 @@ def _denied_env_name(name):
 
 
 
-_AWK_SYSTEM_RE = re.compile(r'\bsystem\b\s*\(')
+_AWK_SYSTEM_RE = re.compile(r'\bsystem\b')
+_AWK_GETLINE_RE = re.compile(r'\bgetline\b')
+# A '/' starts a /.../ regex literal only where awk expects an
+# operand (statement start, after an opener, a separator, or an
+# operator that takes an expression). After an operand it is
+# division, so it stays in the screened text: pairing division
+# slashes as literals would strip live code and could hide a
+# '|' or a system() call inside real expressions.
+_AWK_REGEX_PREV = frozenset([
+    '(', '=', ',', '{', '}', ';', '!', '~', '&', '|', '?', ':',
+])
 
 
 def _awk_words(argv, words):
@@ -992,10 +1036,13 @@ def _awk_words(argv, words):
 
     Only -F and -v take operands (--source, -f, and every other
     flag refuse: no lane filter uses them). The program word
-    strips double-quoted strings and /.../ literals, then any
-    remaining '|' (pipe, coprocess, or getline pipe) or
-    'system(' refuses. A '|' is never valid awk outside those
-    literals except as a pipe, so stripping cannot hide one;
+    strips double-quoted strings (kept as "" markers, so a '/'
+    after a string still lexes as division) and /.../ regex
+    literals (only where awk expects an operand; division
+    slashes stay), then any remaining '|' (pipe, coprocess, or
+    getline pipe) or any bare 'system' or 'getline' word
+    refuses. No lane filter calls system() or reads via
+    getline, so the word refusal cannot misfire on one;
     backslash-newline splices normalize first so a split
     'system' cannot hide either. '#' refuses anywhere outside
     strings and literals (no lane filter comments): a comment
@@ -1028,22 +1075,32 @@ def _awk_words(argv, words):
                     index += 1
                 index += 1
             index += 1
+            code.append('""')
             continue
         if char == '/':
-            end = index + 1
-            while end < count and text[end] != '/':
-                if text[end] == '\\':
+            prev = None
+            for token in reversed(code):
+                for cand in reversed(token):
+                    if cand not in (' ', '\t', '\n', '\r'):
+                        prev = cand
+                        break
+                if prev is not None:
+                    break
+            if prev is None or prev in _AWK_REGEX_PREV:
+                end = index + 1
+                while end < count and text[end] != '/':
+                    if text[end] == '\\':
+                        end += 1
                     end += 1
-                end += 1
-            if end < count:
-                index = end + 1
-                continue
+                if end < count:
+                    index = end + 1
+                    continue
         if char == '#':
             refuse(argv, 'unadmitted-awk-program', 'comment')
         code.append(char)
         index += 1
     bare = ''.join(code)
-    if '|' in bare or _AWK_SYSTEM_RE.search(bare):
+    if '|' in bare or _AWK_SYSTEM_RE.search(bare) or _AWK_GETLINE_RE.search(bare):
         refuse(argv, 'unadmitted-awk-program', 'command-pipe')
     return words
 
@@ -1276,6 +1333,38 @@ def _guarded_exec(kind):
     return _run
 
 
+def _guarded_spawn(kind):
+    def _run(mode, path, *args):
+        if kind in ('spawnv', 'spawnve', 'spawnvp', 'spawnvpe'):
+            seq = [os.fsdecode(word) for word in args[0]]
+            if kind in ('spawnve', 'spawnvpe'):
+                env = args[1]
+            else:
+                env = None
+        elif kind in ('spawnle', 'spawnlpe'):
+            seq = [os.fsdecode(word) for word in args[:-1]]
+            env = args[-1]
+        else:
+            seq = [os.fsdecode(word) for word in args]
+            env = None
+        target = os.fsdecode(path)
+        head = seq[0] if seq else None
+        seq = check(seq, env=env, executable=target)
+        if seq and seq[0] != head:
+            # Like the Popen wrapper: a rewrite changed the
+            # executed program, so the path tracks it.
+            path = seq[0]
+        func = _ORIGINALS[kind]
+        if kind in ('spawnve', 'spawnvpe'):
+            return func(mode, path, seq, env if env is not None else os.environ)
+        if kind in ('spawnle', 'spawnlpe'):
+            return func(mode, path, *seq, env if env is not None else os.environ)
+        if kind in ('spawnv', 'spawnvp'):
+            return func(mode, path, seq)
+        return func(mode, path, *seq)
+    return _run
+
+
 def _audit_hook(event, args):
     # Second opinion: re-verify identity after the wrapper allowed
     # the spawn, closing the check-to-exec window. Allowed spawns
@@ -1354,7 +1443,9 @@ def install_guard(marker, fixture_root, _inherit=None):
         _ORIGINALS['popen'] = subprocess.Popen.__init__
         _ORIGINALS['system'] = os.system
         for kind in ('execv', 'execve', 'execl', 'execle', 'execlp',
-                     'execvp', 'execvpe', 'posix_spawn', 'posix_spawnp'):
+                     'execvp', 'execvpe', 'posix_spawn', 'posix_spawnp',
+                     'spawnv', 'spawnve', 'spawnvp', 'spawnvpe',
+                     'spawnl', 'spawnle', 'spawnlp', 'spawnlpe'):
             if hasattr(os, kind):
                 _ORIGINALS[kind] = getattr(os, kind)
         subprocess.Popen.__init__ = _guarded_init
@@ -1362,7 +1453,10 @@ def install_guard(marker, fixture_root, _inherit=None):
         for kind in list(_ORIGINALS):
             if kind in ('popen', 'system'):
                 continue
-            setattr(os, kind, _guarded_exec(kind))
+            if kind.startswith('spawn'):
+                setattr(os, kind, _guarded_spawn(kind))
+            else:
+                setattr(os, kind, _guarded_exec(kind))
         try:
             sys.addaudithook(_audit_hook)
         except Exception:
