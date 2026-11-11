@@ -102,6 +102,45 @@ def test_arch_portability_stays_out_of_the_matrix(lanes):
     assert 'tests/kernel/test_arch_portability.py' not in paths
     assert 'arm64' in _workflow_text()
 
+
+def test_matrix_exclusions_are_pinned_and_valid():
+    # The matrix's honest gaps: kernel-joint (CI cannot
+    # provision the libbpf-mojo checkout plus .so) on all six
+    # lanes, kernel-core-layouts (layouts recorded only for
+    # v6.6/v6.12) on the three 7.x lanes. Exact contents pinned:
+    # widening an exclusion silently shrinks the gate, and an
+    # exclusion for a lane or suite that does not exist is a
+    # typo that would excuse the wrong cells.
+    spec = importlib.util.spec_from_file_location(
+        'run_vm_tests_contract', ROOT / 'ci' / 'run_vm_tests.py'
+    )
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    assert runner.LANE_SUITE_EXCLUSIONS == {
+        'v6.12-kvm': ('kernel-joint',),
+        'v6.6-kvm': ('kernel-joint',),
+        'v7.0.14-kvm': ('kernel-joint', 'kernel-core-layouts'),
+        'v7.2-kvm': ('kernel-joint', 'kernel-core-layouts'),
+        'v7.4-rc1-kvm': ('kernel-joint', 'kernel-core-layouts'),
+        'v6.12-tcg': ('kernel-joint',),
+    }
+    lock = json.loads(
+        (ROOT / 'ci' / 'kernels.lock.json').read_text(encoding='utf-8')
+    )
+    lane_ids = {lane['id'] for lane in lock['lanes']}
+    suite_ids = {name for name, _path, _timeout in runner.SUITES}
+    assert set(runner.LANE_SUITE_EXCLUSIONS) <= lane_ids
+    for skipped in runner.LANE_SUITE_EXCLUSIONS.values():
+        assert set(skipped) <= suite_ids
+    for lane_id in lane_ids:
+        assert 'kernel-joint' in runner.LANE_SUITE_EXCLUSIONS[lane_id]
+    core_lanes = {
+        lane_id
+        for lane_id, skipped in runner.LANE_SUITE_EXCLUSIONS.items()
+        if 'kernel-core-layouts' in skipped
+    }
+    assert core_lanes == {'v7.0.14-kvm', 'v7.2-kvm', 'v7.4-rc1-kvm'}
+
 # Trust inputs snapshotted at import (collection, before any test
 # runs): every guarded child installs from these, so a test that
 # mutates os.environ cannot contaminate a later child's trust.

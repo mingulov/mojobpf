@@ -1336,6 +1336,70 @@ def test_undeclared_map_in_object_rejected():
     assert result.artifacts == ()
 
 
+def _map_outcome(ir_text, entries):
+    import types
+
+    from mojobpf.manifest import MapEntry
+
+    parent = tempfile.mkdtemp(prefix="build-mapentry-")
+    adapted = os.path.join(parent, "adapted.ll")
+    with open(adapted, "w", encoding="utf-8") as handle:
+        handle.write(ir_text)
+    manifest = types.SimpleNamespace(
+        maps=[
+            MapEntry(
+                name=name,
+                map_type=map_type,
+                key_type="u32",
+                value_type="u64",
+                max_entries=count,
+            )
+            for name, map_type, count in entries
+        ]
+    )
+    return build_module._map_entries_outcome(
+        manifest, os.path.join(parent, "missing.o"), adapted, "lane-a"
+    )
+
+
+def test_map_entries_classifier_with_maps_refused():
+    # A mapless helper-call shape carrying maps is itself a
+    # disagreement: the classifier arm reconciles instead of
+    # returning clean without reading either side.
+    diags = _map_outcome(
+        "define i64 @x() { ret i64 0 }\n",
+        (("mojobpf_map0", "array", 1),),
+    )
+    assert [item.code for item in diags] == ["MBPF216"], diags
+    assert "emits none" in diags[0].explanation, diags[0]
+
+
+def test_map_entries_non_event_pair_refused():
+    # Map pairs belong to the event/reserve arm: a non-event
+    # shape reconciles exactly one map, so a second declared
+    # map fails closed instead of passing unchecked.
+    diags = _map_outcome(
+        "call i64 inttoptr (i64 1 to ptr)(i64 0)\n"
+        "call i64 inttoptr (i64 2 to ptr)(i64 0)\n",
+        (("mojobpf_map0", "array", 1),
+         ("mojobpf_map1", "ringbuf", 4096)),
+    )
+    assert [item.code for item in diags] == ["MBPF216"], diags
+    assert "exactly one map" in diags[0].explanation, diags[0]
+
+
+def test_map_entries_non_event_empty_maps_refused():
+    # A map-shape program with no declared maps fails closed
+    # with MBPF216, never an IndexError on maps[0].
+    diags = _map_outcome(
+        "call i64 inttoptr (i64 1 to ptr)(i64 0)\n"
+        "call i64 inttoptr (i64 2 to ptr)(i64 0)\n",
+        (),
+    )
+    assert [item.code for item in diags] == ["MBPF216"], diags
+    assert "exactly one map" in diags[0].explanation, diags[0]
+
+
 def test_discover_imports_follows_transitively():
     parent = tempfile.mkdtemp(prefix="imports-")
     main = os.path.join(parent, "main.mojo")
@@ -6347,6 +6411,33 @@ def test_inspect_report_only_exits_zero():
         )
     finally:
         os.remove(path)
+
+
+def test_inspect_report_only_gate_still_fails():
+    # The license declaration gate ignores --report-only
+    # deliberately: a misdeclared grant must never read as
+    # success. The flag's help says so.
+    path = _write_garbage_object()
+    try:
+        assert (
+            cli_module.main(
+                [
+                    "inspect", path,
+                    "--source-license", "Apache-2.0",
+                    "--kernel-license", "Apache-2.0",
+                    "--report-only",
+                ]
+            )
+            == cli_module.EXIT_COMPILE
+        )
+    finally:
+        os.remove(path)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        with pytest.raises(SystemExit) as exited:
+            cli_module.main(["inspect", "--help"])
+    assert exited.value.code == 0
+    assert "declaration-gate" in buffer.getvalue(), buffer.getvalue()
 
 
 def test_inspect_clean_exits_zero():

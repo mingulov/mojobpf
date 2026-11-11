@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
+
 # MojoBPF maintenance policy (v1.0 line)
 
 This policy takes effect with the v1.0 readiness decision.

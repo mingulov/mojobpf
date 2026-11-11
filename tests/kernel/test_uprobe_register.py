@@ -833,6 +833,11 @@ def executed():
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     release = vng_release()
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("uprobe")
     workdir = guest_proc.owned_stage(prefix="mojo-uprobe-")
     base_obj = build_object(
         COUNTER_SOURCE, workdir, "uprobe", UPROBE_OBJECT_HASH,
@@ -853,9 +858,6 @@ def executed():
     )
     offsets = resolve_target_offsets(target)
     _OFFSETS = offsets
-    # Lease before staging, after builds: an unleased run
-    # refuses here, never as an admission failure.
-    guest_proc.require_target_lease("uprobe")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

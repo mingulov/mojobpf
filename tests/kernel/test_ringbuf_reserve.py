@@ -788,6 +788,11 @@ def _execute_once():
         if not os.path.isfile(os.path.join(REPO_ROOT, rel)):
             raise EnvironmentFailure("missing repo file: %s" % rel)
     release = vng_release()
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("ringbuf")
     workdir = guest_proc.owned_stage(prefix="mojo-reserve-")
     submit_obj = build_object(
         SUBMIT_SOURCE, workdir, "submit", SUBMIT_OBJECT_HASH,
@@ -830,9 +835,6 @@ def _execute_once():
     drain = build_harness(
         DRAIN_SOURCE, os.path.join(workdir, "ringbuf_drain")
     )
-    # Lease before staging, after builds: an unleased run
-    # refuses here, never as an admission failure.
-    guest_proc.require_target_lease("ringbuf")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

@@ -1012,7 +1012,7 @@ def _discard_owned_stages_collected():
             # substitution lands in the terminal as residue
             # instead of a silent clean.
             errors.append((stage, "%s" % exc))
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             errors.append((stage, "%s" % exc))
         else:
             if proved:

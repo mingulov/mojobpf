@@ -142,12 +142,14 @@ changed. Proven by `test_release_settings_identical`,
 
 ## Tracing shapes
 
-Two tracing shapes are proven alongside the packet subset above:
-a TID-filtered counter and a fixed-record event emitter, both on
+Three tracing shapes are proven alongside the packet subset above:
+a TID-filtered counter, a fixed-record event emitter, and an
+explicit reservation emitter, all on
 the exact `syscalls:sys_enter_getpid` event with no context
 payload reads. Their sources, manifests, and measured behavior
-live in `examples/tracepoint_counter/README.md` and
-`examples/tracepoint_events/README.md`; the compatibility
+live in `examples/tracepoint_counter/README.md`,
+`examples/tracepoint_events/README.md`, and
+`examples/ringbuf_reserve/README.md`; the compatibility
 document's measured tracing limitations bind every claim, and the
 unsupported list there names what stays out.
 
@@ -256,8 +258,9 @@ in-guest by the kernel-net suite (exact verdicts over the frame
 corpus, inverted mutant flipped, stale object fails); the
 socket example reads through the `skb_load_bytes` helper
 because the socket-filter verifier rejects direct context
-reads, and its in-guest execution proof arrives with the
-kernel-net skb legs.
+reads, and its in-guest execution proof is the kernel-net
+suite's live veth attach legs (socket-attach verdicts plus a
+mutation-flip leg).
 
 ## Not claimed
 
@@ -307,12 +310,12 @@ together with the change.
 <!-- SUBSET-TABLE-BEGIN -->
 | case | result | layer | evidence | fixture | tests |
 | --- | --- | --- | --- | --- | --- |
-| loop-sum | accept | kernel | v6.12/7.0.14/7.2/7.4-rc1: test-run actions match the oracle; v6.6 verifier rejects the back edge (pinned log line) | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (8efd104f) |
-| call-inline | accept | kernel | plain helper inlined; test-run actions match | subset_call_inline.mojo (243fb782) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_call_inline (8efd104f) |
-| stack-array | accept | kernel | initialized array promotes (no alloca); actions match | subset_stack_array.mojo (0af7cfb9) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_stack_array (8efd104f) |
-| casts | accept | kernel | narrow/widen round trip; test-run actions match | subset_casts.mojo (5016d187) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_casts (8efd104f) |
-| checked-arith | accept | kernel | wrap and headroom checks; test-run actions match | subset_checked_arith.mojo (7988c341) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_checked_arith (8efd104f) |
-| loop-pressure | accept | kernel | frame spills within the 512-byte budget; total exact | subset_loop_pressure.mojo (da66630c) | tests/compile/subset/test_subset_audit.py::test_loop_pressure_frame_within_budget (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_loop_pressure (8efd104f) |
+| loop-sum | accept | kernel | v6.12/7.0.14/7.2/7.4-rc1: test-run actions match the oracle; v6.6 verifier rejects the back edge (pinned log line) | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (8217c00e) |
+| call-inline | accept | kernel | plain helper inlined; test-run actions match | subset_call_inline.mojo (243fb782) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_call_inline (8217c00e) |
+| stack-array | accept | kernel | initialized array promotes (no alloca); actions match | subset_stack_array.mojo (0af7cfb9) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_stack_array (8217c00e) |
+| casts | accept | kernel | narrow/widen round trip; test-run actions match | subset_casts.mojo (5016d187) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_casts (8217c00e) |
+| checked-arith | accept | kernel | wrap and headroom checks; test-run actions match | subset_checked_arith.mojo (7988c341) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_checked_arith (8217c00e) |
+| loop-pressure | accept | kernel | frame spills within the 512-byte budget; total exact | subset_loop_pressure.mojo (da66630c) | tests/compile/subset/test_subset_audit.py::test_loop_pressure_frame_within_budget (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_loop_pressure (8217c00e) |
 | deep-stack | reject | backend | llc exits 1: BPF stack limit is exceeded, no object | subset_deep_stack.mojo (e59da606) | tests/compile/subset/test_subset_audit.py::test_deep_stack_refused_by_backend (136e3d41)<br>tests/ir/test_optimization_invariants.py::test_backend_failure_surfaced_explicitly (0a826266) |
 | dynamic-stack | reject | source | frontend: cannot use a dynamic value in a parameter list | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_dynamic_stack_rejected_at_source (136e3d41) |
 | unoptimized-stack | reject | preflight | MBPF310: unoptimized IR keeps stack allocations | (subset_stack_array.mojo compiled with -O0; bytes pinned by the stack-array row) | tests/ir/test_optimization_invariants.py::test_no_optimization_rejected_explicitly (0a826266) |
@@ -320,5 +323,5 @@ together with the change.
 | ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (219e5e82) |
 | bad-helper | reject | preflight | MBPF306: helper calls never use inline assembly | subset_bad_helper.mojo (02d336fb) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (136e3d41) |
 | ptr-erase | reject | source | frontend: rebind input type '!kgen.pointer<none>' does not match result type '!kgen.scalar<si64>' | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_ptr_erase_rejected_at_source (136e3d41) |
-| oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (8efd104f) |
+| oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (8217c00e) |
 <!-- SUBSET-TABLE-END -->

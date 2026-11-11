@@ -413,6 +413,33 @@ def _verify_install(dirfd, name, heldfd, data):
             pass
 
 
+def _require_plain_basename(name, operation):
+    """Refuse any ``name`` that is not a plain entry basename.
+
+    Empty names and names carrying ``/``, NUL, ``.``/``..`` or a
+    leading dot refuse before any descriptor opens, since
+    dirfd-relative calls would otherwise let a hostile name
+    escape the intended entry. Every dirfd-relative entry
+    operation (install, snapshot, removal) enforces this, so a
+    future caller cannot inherit an unguarded path.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(
+            "%s refused: names must be non-empty strings"
+            % (operation,)
+        )
+    if (
+        "/" in name
+        or "\x00" in name
+        or name in (".", "..")
+        or name.startswith(".")
+    ):
+        raise ValueError(
+            "%s refused: %r is not a plain basename"
+            % (operation, name)
+        )
+
+
 def install_sealed(dirfd, name, data, seal):
     """Install ``data`` under ``name`` through sealed backing.
 
@@ -449,20 +476,7 @@ def install_sealed(dirfd, name, data, seal):
     dirfd-relative unlink/linkat/open would otherwise let a
     hostile name escape the intended entry.
     """
-    if not isinstance(name, str) or not name:
-        raise ValueError(
-            "sealed install refused: names must be non-empty strings"
-        )
-    if (
-        "/" in name
-        or "\x00" in name
-        or name in (".", "..")
-        or name.startswith(".")
-    ):
-        raise ValueError(
-            "sealed install refused: %r is not a plain basename"
-            % (name,)
-        )
+    _require_plain_basename(name, "sealed install")
     watch = NameWatch("/proc/self/fd/%d" % dirfd)
     try:
         try:
@@ -710,8 +724,10 @@ def rmtree_owned(parent_fd, name, want):
     A present-but-foreign entry raises instead of removing
     anything. The parent pathname is only a hint: identity
     decides, so a swapped parent can at worst report absence
-    or refusal, never a foreign removal.
+    or refusal, never a foreign removal. ``name`` must be a
+    plain basename, like :func:`install_sealed` requires.
     """
+    _require_plain_basename(name, "owned removal")
     if want is None:
         raise AssertionError(
             "refusing to remove an unbound directory: %r" % name
@@ -757,7 +773,10 @@ def snapshot_at(dirfd, name):
     st_mtime_ns, st_ctime_ns)`` is read without following a
     final symlink: any later write, chmod, replacement or
     removal changes it. Returns None when ``name`` is absent.
+    ``name`` must be a plain basename, like
+    :func:`install_sealed` requires.
     """
+    _require_plain_basename(name, "snapshot")
     try:
         st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
     except FileNotFoundError:

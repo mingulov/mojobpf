@@ -663,6 +663,45 @@ def test_capture_image_agrees_with_follow():
                 assert captured.image.realpath == followed, name
 
 
+def test_oversized_launcher_fails_closed_not_direct():
+    # A launcher whose single exec line lies beyond the
+    # analysis window must classify unknown (refused), never
+    # direct-script: the kernel executes the late line that a
+    # truncated read misses, so truncation must fail closed.
+    with _fixture() as fix:
+        target = fix["binary"]
+        limit = execution_module._EXEC_SCRIPT_LIMIT
+        launcher = os.path.join(os.path.dirname(target), "late-exec")
+        _write(
+            launcher,
+            "#!/bin/sh\n"
+            + "# padding\n" * (limit // 10 + 8)
+            + "exec \"%s\" \"$@\"\n" % target,
+        )
+        assert os.path.getsize(launcher) > limit + 2
+        captured = execution_module.capture_chain(launcher)
+        assert captured.form == execution_module.FORM_UNKNOWN, captured
+
+
+def test_window_boundary_launcher_still_admits():
+    # A launcher that exactly fills the analysis window is
+    # fully visible, so it still resolves (no over-refusal).
+    with _fixture() as fix:
+        target = fix["binary"]
+        limit = execution_module._EXEC_SCRIPT_LIMIT
+        exec_line = "exec \"%s\" \"$@\"\n" % target
+        pad_len = limit + 2 - len("#!/bin/sh\n") - 1 - len(exec_line)
+        assert pad_len > 0
+        launcher = os.path.join(os.path.dirname(target), "edge-exec")
+        _write(
+            launcher,
+            "#!/bin/sh\n" + "#" * pad_len + "\n" + exec_line,
+        )
+        assert os.path.getsize(launcher) == limit + 2
+        captured = execution_module.capture_chain(launcher)
+        assert captured.form == execution_module.FORM_EXEC_LAUNCHER, captured
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

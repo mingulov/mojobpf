@@ -104,15 +104,16 @@ tool mojo: present Mojo 1.1.0 (8189361e) at <mojo-on-PATH>
 tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>
 tool bpftool: present bpftool v7.6.0 at <bpftool-on-PATH>
 tool python: present Python 3.14.8 at <qs>/.venv/bin/python3
-target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-lru, linux-bpfel-v3-net, linux-bpfel-v3-percpu-hash, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
+target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-lru, linux-bpfel-v3-net, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
 kernel tests: runner available at <vng-on-PATH>
 ```
 
 `doctor` changes nothing. Every tool must read `present`; a
 missing tool is reported, never silently worked around. The
-candidate list names every registered profile; only eight are
-supported — `linux-bpfel-v3-percpu-hash` is retained in-tree
-but unclaimed (see [compatibility](compatibility.md)).
+candidate list names every admitted profile: eight are
+supported. `linux-bpfel-v3-percpu-hash` is refused at the
+admission layer; its kernel suite stays in-tree as a refusal
+guard (see [compatibility](compatibility.md)).
 
 ## 4. Write the counter project
 

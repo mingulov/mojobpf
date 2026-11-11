@@ -92,7 +92,11 @@ import re
 import struct
 from dataclasses import dataclass
 
-from .capabilities import TargetProfile, lookup_profile
+from .capabilities import (
+    TargetProfile,
+    cross_check_profile_helpers,
+    lookup_profile,
+)
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
 from .elf_reader import (
     SHT_NOBITS,
@@ -211,8 +215,32 @@ BPF_OP_LD_IMM64 = 0x18
 SPDX_TAG = "SPDX-License-Identifier:"
 HEADER_SCAN_LINES = 10
 
-_LINK_STAGES = frozenset({"build.link", "adapter.link", "link"})
-_LINK_TOOLS = frozenset({"ld", "ld.lld", "ld.bfd", "llvm-link", "bpf-linker"})
+_LINK_STAGE_WORDS = frozenset(
+    {"link", "links", "linker", "linkers", "ld", "lld"}
+)
+_LINK_TOOLS = frozenset(
+    {
+        "ld",
+        "ld.lld",
+        "ld.bfd",
+        "ld.gold",
+        "lld",
+        "llvm-link",
+        "bpf-linker",
+        # Compiler drivers link whenever neither -c nor -S
+        # nor -E is passed; the tripwire does not model
+        # their flags, so any driver argv trips for review.
+        # The publish pipeline runs no driver today.
+        "clang",
+        "clang++",
+        "cc",
+        "gcc",
+        "g++",
+        "c++",
+    }
+)
+_STAGE_SEP_RE = re.compile(r"[._-]+")
+_VERSION_SUFFIX_RE = re.compile(r"-\d[\d.]*$")
 # Helpers valid only under one section, even when the profile
 # admits the ID: skb-store (9) needs a TC classifier context
 # (the net profile's ("tc", "classifier") pair), so socket, XDP,
@@ -885,8 +913,12 @@ def requires_gpl(
     require GPL coverage today.
     """
     resolved = _resolve_profile(profile)
+    # The cross-checked admission view (fail-closed MBPF101 on
+    # registry drift), judged on the resolved object once, never
+    # per call and never re-resolved by ID.
+    admitted = cross_check_profile_helpers(resolved)
     for helper_id in helper_ids:
-        if helper_id in resolved.helper_ids:
+        if helper_id in admitted:
             continue
         known = lookup_helper(helper_id)
         if known is not None and known.gpl_only:
@@ -899,7 +931,7 @@ def requires_gpl(
             % (
                 helper_id,
                 resolved.profile_id,
-                ", ".join(str(h) for h in resolved.helper_ids),
+                ", ".join(str(h) for h in admitted),
             ),
             None,
             "use only helpers of the named profile",
@@ -1118,6 +1150,10 @@ def _decode_calls(elf: Elf, executable: list[Section],
     present (checked after decoding); every other non-plain call
     form stays outside every profile.
     """
+    # The cross-checked admission view (fail-closed MBPF101 on
+    # registry drift), judged on the resolved object once, never
+    # per instruction and never re-resolved by ID.
+    admitted = cross_check_profile_helpers(profile)
     for section in executable:
         code = section_bytes(elf, section)
         if len(code) % 8 != 0:
@@ -1154,7 +1190,7 @@ def _decode_calls(elf: Elf, executable: list[Section],
                 (imm,) = struct.unpack_from("<i", code, offset + 4)
                 if src == 0:
                     facts.helper_ids.append(imm)
-                    if imm not in profile.helper_ids:
+                    if imm not in admitted:
                         unsupported.append(
                             _object_finding(
                                 "MBPF407",
@@ -1166,7 +1202,7 @@ def _decode_calls(elf: Elf, executable: list[Section],
                                     profile.profile_id,
                                     ", ".join(
                                         str(h)
-                                        for h in profile.helper_ids
+                                        for h in admitted
                                     ),
                                 ),
                                 "section:%s+0x%x"
@@ -2447,6 +2483,28 @@ def verify_object(path: str, profile: str | TargetProfile,
     )
 
 
+def _stage_is_link(stage: object) -> bool:
+    """True when any dot/dash/underscore stage word names linking."""
+    words = _STAGE_SEP_RE.split(str(stage).lower())
+    return any(word in _LINK_STAGE_WORDS for word in words)
+
+
+def _tool_is_linker(token: object) -> bool:
+    """True when the argv token names a linker or driver.
+
+    Version suffixes (``llvm-link-19``, ``ld-2.38``) and
+    target prefixes (``x86_64-linux-gnu-ld``) trip exactly
+    like the bare name. Dotted names are never split: splitting
+    them would trip on every ``shape.cc`` source operand.
+    """
+    name = os.path.basename(str(token)).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    unversioned = _VERSION_SUFFIX_RE.sub("", name)
+    candidates = {name, unversioned, unversioned.split("-")[-1]}
+    return not candidates.isdisjoint(_LINK_TOOLS)
+
+
 def assert_no_link_step(commands: object) -> None:
     """Assert that no build command links objects together.
 
@@ -2463,11 +2521,11 @@ def assert_no_link_step(commands: object) -> None:
     for record in commands:  # type: ignore[union-attr]
         stage = getattr(record, "stage", "")
         argv = getattr(record, "argv", ())
-        if stage in _LINK_STAGES:
+        if _stage_is_link(stage):
             found.append("stage %r" % (stage,))
             continue
         for token in argv:
-            if os.path.basename(str(token)) in _LINK_TOOLS:
+            if _tool_is_linker(token):
                 found.append("tool %r" % (token,))
                 break
     if found:

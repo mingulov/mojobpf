@@ -106,8 +106,12 @@ full 41-suite matrix passes on its lane; the v1.0 matrix passes
 [evidence-1.0.0.md](evidence-1.0.0.md)). Two ruled cell groups stay
 out of claim: the joint suite (needs libbpf-mojo inputs,
 labelled experimental) and 7.x task-struct layouts (1.x CO-RE
-work). The historical alpha runs do not qualify the current
-tree.
+work). These rulings are mechanized as `LANE_SUITE_EXCLUSIONS`
+in `ci/run_vm_tests.py` (pinned by
+`tests/unit/test_ci_workflow_contract.py::test_matrix_exclusions_are_pinned_and_valid`):
+excluded cells never run, print as `excluded`, and the merge
+refuses any absent cell outside the map. The historical alpha
+runs do not qualify the current tree.
 
 Every behavior section below outside the named portability
 lanes records the 0.3.0a1 alpha qualification on the tested
@@ -600,7 +604,11 @@ host suites, selected-but-refused vectors).
   uprobe programs: only the exact
   `tracepoint/syscalls/sys_enter_getpid` counter, emitter, and
   reservation shapes plus the single pinned-register uprobe
-  shape validate (see the measured limitations above). Other
+  shape validate (counter and emitter: see the measured
+  limitations above; reservation: see
+  `examples/ringbuf_reserve/README.md` and `sdk.md`'s
+  `mojobpf.events`; uprobe: see Measured uprobe behavior
+  below). Other
   events, other filters, context reads outside the pinned
   uprobe word, and per-CPU counting are refused or unclaimed.
 * Multi-program objects, other map kinds and sizes (LPM

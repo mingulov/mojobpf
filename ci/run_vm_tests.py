@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Two-lane VM matrix runner for the kernel proof suites.
+"""Six-lane VM matrix runner for the kernel proof suites.
 
 Runs every guest-backed suite (the kernel suites including the
 tracepoint/event/lifecycle tracing proofs, the verifier kernel
-and license suites, the external-consumer suite, and the
+and license suites, the five external-consumer suites, and the
 cleanup suite) in each lane pinned by ``ci/kernels.lock.json``
 with the same committed source tree, and reports one board. The tree must be committed first:
 a dirty tree is refused up front so all lanes provably test the
@@ -138,6 +138,29 @@ SUITES = (
     ("kernel-lru", "tests/kernel/test_lru_maps.py", 1800),
     ("kernel-percpu-hash", "tests/kernel/test_percpu_hash_maps.py", 1800),
 )
+
+# Pinned per-lane suite exclusions (the matrix's honest gaps).
+# An excluded cell never runs and never appears in the board;
+# the runner skips it loudly and the merge refuses any absent
+# cell outside this map, so exclusions stay visible and exact.
+# Keys must be lock lane IDs and values SUITES IDs (startup
+# refuses anything else); the contract test pins these exact
+# contents. kernel-joint proves MojoBPF/libbpf-mojo interop
+# against a libbpf-mojo checkout plus built .so
+# (MOJOBPF_LIBBPF_MOJO_SRC/MOJOBPF_LIBBPF_MOJO_LIB), which CI
+# cannot provision (separate product, no provenance pin); the
+# suite runs per-suite with the env and rejoins when CI
+# provisions it. kernel-core-layouts needs recorded
+# task_struct layouts, which exist only for v6.6/v6.12; it
+# rejoins the 7.x lanes when their layouts are recorded.
+LANE_SUITE_EXCLUSIONS = {
+    "v6.12-kvm": ("kernel-joint",),
+    "v6.6-kvm": ("kernel-joint",),
+    "v7.0.14-kvm": ("kernel-joint", "kernel-core-layouts"),
+    "v7.2-kvm": ("kernel-joint", "kernel-core-layouts"),
+    "v7.4-rc1-kvm": ("kernel-joint", "kernel-core-layouts"),
+    "v6.12-tcg": ("kernel-joint",),
+}
 
 # Pinned plan case IDs per suite (the matrix's independent
 # expectation: a plan omitting or adding IDs is rejected).
@@ -909,8 +932,13 @@ def merge_reports(paths, out_dir, expect_lanes=None):
     blending runs that never shared their bits. When
     ``expect_lanes`` names the full lane set, the merged lanes
     must equal it exactly: a missing shard refuses instead of
-    merging a silent subset. The merged board keeps the shared
-    blocks verbatim, concatenates lanes and results in input
+    merging a silent subset. Likewise every merged lane must
+    cover ``SUITES`` minus its pinned
+    ``LANE_SUITE_EXCLUSIONS`` exactly: a manually subsetted
+    shard (``--suite``) refuses instead of merging a green
+    partial board, and only the pinned map excuses absent
+    cells. The merged board keeps the shared blocks
+    verbatim, concatenates lanes and results in input
     order, and records ``merged_from``. A non-pass outcome
     anywhere fails the merge (exit 1).
     """
@@ -964,6 +992,40 @@ def merge_reports(paths, out_dir, expect_lanes=None):
                     sorted(extra),
                 )
             )
+    want_suites = set(suite_id for suite_id, _, _ in SUITES)
+    unknown = {
+        suite_id
+        for skipped in LANE_SUITE_EXCLUSIONS.values()
+        for suite_id in skipped
+    } - want_suites
+    if unknown:
+        raise SetupFailure(
+            "exclusion map names unknown suite(s) %s"
+            % (sorted(unknown),)
+        )
+    covered: dict[str, set[str]] = {}
+    for item in results:
+        covered.setdefault(item.get("lane"), set()).add(
+            item.get("suite")
+        )
+    for lane_id in sorted(seen_lanes):
+        want = want_suites - set(
+            LANE_SUITE_EXCLUSIONS.get(lane_id, ())
+        )
+        got = covered.get(lane_id, set())
+        if got != want:
+            raise SetupFailure(
+                "lane %r covers %d of %d suites (missing %s, "
+                "extra %s); only pinned exclusions excuse "
+                "absent cells"
+                % (
+                    lane_id,
+                    len(got & want),
+                    len(want),
+                    sorted(want - got),
+                    sorted(got - want),
+                )
+            )
     os.makedirs(out_dir, exist_ok=True)
     merged = {
         "tool": "run_vm_tests",
@@ -985,19 +1047,27 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         handle.write("\n")
     print("matrix board (commit %s, merged %d shards):"
           % (merged["commit"], len(shards)))
+    excluded_cells = 0
     for lane in lanes:
         row = []
+        skipped = sorted(
+            set(LANE_SUITE_EXCLUSIONS.get(lane.get("id"), ()))
+            & want_suites
+        )
+        excluded_cells += len(skipped)
         for item in results:
             if item.get("lane") == lane.get("id"):
                 row.append(
                     "%s=%s" % (item.get("suite"), item.get("outcome"))
                 )
+        for suite_id in skipped:
+            row.append("%s=excluded" % suite_id)
         print("  %s: %s" % (lane.get("id"), " ".join(row)))
     print("matrix report: %s" % report_path)
     bad = [item for item in results if item.get("outcome") != "pass"]
     if bad:
         print(
-            "matrix: %d/%d lane-suites failed (%s)"
+            "matrix: %d/%d lane-suites failed (%s; %d excluded)"
             % (
                 len(bad),
                 len(results),
@@ -1007,11 +1077,12 @@ def merge_reports(paths, out_dir, expect_lanes=None):
                        item.get("outcome"))
                     for item in bad
                 ),
+                excluded_cells,
             )
         )
         return EXIT_FAILURE
-    print("matrix: %d/%d lane-suites passed"
-          % (len(results), len(results)))
+    print("matrix: %d/%d lane-suites passed (%d excluded)"
+          % (len(results), len(results), excluded_cells))
     return EXIT_OK
 
 
@@ -2676,6 +2747,20 @@ def main(argv=None):
             args.consumer_path,
             runner["virtme_run_path"],
         )
+        known_lanes = {lane["id"] for lane in lock["lanes"]}
+        known_suites = {suite_id for suite_id, _, _ in SUITES}
+        for lane_id, skipped in LANE_SUITE_EXCLUSIONS.items():
+            if lane_id not in known_lanes:
+                raise SetupFailure(
+                    "exclusion map names unknown lane %r" % (lane_id,)
+                )
+            unknown = set(skipped) - known_suites
+            if unknown:
+                raise SetupFailure(
+                    "exclusion map names unknown suite(s) %s for "
+                    "lane %r"
+                    % (sorted(unknown), lane_id)
+                )
     except SetupFailure as exc:
         sys.stderr.write("run_vm_tests: %s\n" % exc)
         return EXIT_SETUP
@@ -2709,7 +2794,15 @@ def main(argv=None):
 
     results = []
     for lane in lanes:
+        skipped = set(LANE_SUITE_EXCLUSIONS.get(lane["id"], ()))
         for suite_id, relpath, suite_timeout in suites:
+            if suite_id in skipped:
+                print(
+                    "matrix: lane=%s suite=%s excluded (pinned)"
+                    % (lane["id"], suite_id)
+                )
+                sys.stdout.flush()
+                continue
             timeout = args.timeout or suite_timeout
             print(
                 "matrix: lane=%s suite=%s timeout=%ds ..."
@@ -2778,10 +2871,25 @@ def main(argv=None):
         json.dump(report, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
+    selected = {suite_id for suite_id, _, _ in suites}
+    excluded_cells = sum(
+        len(set(LANE_SUITE_EXCLUSIONS.get(lane["id"], ())) & selected)
+        for lane in lanes
+    )
+    if not results:
+        print(
+            "matrix: no lane-suites ran (%d pinned-excluded "
+            "cells); refusing an empty board" % excluded_cells
+        )
+        return EXIT_SETUP
     print("matrix board (commit %s):" % commit)
     for lane in lanes:
         row = []
+        skipped = set(LANE_SUITE_EXCLUSIONS.get(lane["id"], ()))
         for suite_id, _relpath, _timeout in suites:
+            if suite_id in skipped:
+                row.append("%s=excluded" % suite_id)
+                continue
             match = [
                 item
                 for item in results
@@ -2793,7 +2901,7 @@ def main(argv=None):
     bad = [item for item in results if item["outcome"] != "pass"]
     if bad:
         print(
-            "matrix: %d/%d lane-suites failed (%s)"
+            "matrix: %d/%d lane-suites failed (%s; %d excluded)"
             % (
                 len(bad),
                 len(results),
@@ -2802,10 +2910,14 @@ def main(argv=None):
                     % (item["lane"], item["suite"], item["outcome"])
                     for item in bad
                 ),
+                excluded_cells,
             )
         )
         return EXIT_FAILURE
-    print("matrix: %d/%d lane-suites passed" % (len(results), len(results)))
+    print(
+        "matrix: %d/%d lane-suites passed (%d excluded)"
+        % (len(results), len(results), excluded_cells)
+    )
     return EXIT_OK
 
 

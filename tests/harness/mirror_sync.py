@@ -2,7 +2,8 @@
 """Single source of truth for tree-to-package mirror pairs.
 
 ``compiler/`` is the source of truth for the three adapter
-scripts; ``src/mojobpf/resources/adapter/`` carries the
+scripts plus the target proof table;
+``src/mojobpf/resources/adapter/`` carries the
 byte-identical distributed copies the wheel ships. Both the fast
 mirror check (``tests/unit/test_mirror_sync.py``) and the wheel
 contract (``tests/packaging/test_wheel_contents.py``) consume this

@@ -23,6 +23,9 @@ The older spelling ``mojobpf.helpers.profile_helper_ids`` is that
 same introducing-only view under a misleading "admitted" name;
 new code must call :func:`helpers_for_profile` for admission and
 :func:`introduced_helper_ids` when it truly means "introduced".
+Callers already holding a resolved profile object use
+:func:`cross_check_profile_helpers` for the same admission view
+with drift enforcement and without re-resolution.
 ``mojobpf.manifest`` re-exports the profile registry names so
 existing importers keep working.
 
@@ -573,23 +576,25 @@ def lookup_profile(profile_id: str) -> TargetProfile:
         ) from None
 
 
-def helpers_for_profile(profile_id: str) -> tuple[int, ...]:
-    """Return ALL helper IDs admitted by ``profile_id``, ascending.
+def cross_check_profile_helpers(
+    profile: TargetProfile,
+) -> tuple[int, ...]:
+    """Return ALL helper IDs admitted by ``profile``, ascending.
 
-    This is the truthful admission view: the profile's complete
-    admitted set, including helpers inherited from the base
-    profile (so the uprobe profile reports its seven base
-    helpers, not an empty tuple). Every returned ID is
-    cross-checked against the helper registry; an admitted but
-    unrecorded ID, or an unsorted/duplicated profile list, fails
-    closed with ``MBPF101`` instead of reporting a set the two
-    sources disagree on. Unknown profiles raise ``MBPF101`` like
-    :func:`lookup_profile`.
+    The object-level admission view: the profile's complete
+    admitted set, cross-checked against the helper registry. An
+    admitted but unrecorded ID, or an unsorted/duplicated
+    profile list, fails closed with ``MBPF101`` instead of
+    reporting a set the two sources disagree on. Unlike
+    :func:`helpers_for_profile`, this judges the passed object
+    itself, never re-resolving by ID: callers holding an
+    already-resolved (possibly synthetic) profile keep their
+    object's data with drift enforcement added.
 
     Admission is membership only; license coverage stays with the
     license gates.
     """
-    profile = lookup_profile(profile_id)
+    profile_id = profile.profile_id
     admitted = tuple(profile.helper_ids)
     if tuple(sorted(set(admitted))) != admitted:
         raise ProfileError(
@@ -622,6 +627,25 @@ def helpers_for_profile(profile_id: str) -> tuple[int, ...]:
                 )
             )
     return admitted
+
+
+def helpers_for_profile(profile_id: str) -> tuple[int, ...]:
+    """Return ALL helper IDs admitted by ``profile_id``, ascending.
+
+    This is the truthful admission view: the profile's complete
+    admitted set, including helpers inherited from the base
+    profile (so the uprobe profile reports its seven base
+    helpers, not an empty tuple). The resolved profile is
+    judged by :func:`cross_check_profile_helpers`: an admitted
+    but unrecorded ID, or an unsorted/duplicated profile list,
+    fails closed with ``MBPF101`` instead of reporting a set
+    the two sources disagree on. Unknown profiles raise
+    ``MBPF101`` like :func:`lookup_profile`.
+
+    Admission is membership only; license coverage stays with the
+    license gates.
+    """
+    return cross_check_profile_helpers(lookup_profile(profile_id))
 
 
 def introduced_helper_ids(profile_id: str) -> tuple[int, ...]:

@@ -1421,6 +1421,45 @@ def test_distribution_symlink_escape_rejected():
     ), diagnostics
 
 
+def test_distribution_fifo_refused_without_hang():
+    # A FIFO beside the lock never hangs the binding check:
+    # non-regular distribution bytes refuse with MBPF102.
+    import threading
+
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    lockdir = os.path.dirname(lockfile)
+    os.mkfifo(os.path.join(lockdir, "dist.fifo"))
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "dist.fifo", "sha256": "1" * 64}
+        ),
+    )
+    outcome = {}
+
+    def _admit():
+        try:
+            outcome["result"] = admit_tools(
+                lockfile_path=lockfile,
+                search_paths=(bindir,),
+                names=("mojo",),
+            )
+        except Exception as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_admit, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), "distribution FIFO hung admission"
+    assert "error" not in outcome, outcome["error"]
+    admitted, diagnostics = outcome["result"]
+    assert admitted == {}, diagnostics
+    assert [item.code for item in diagnostics] == ["MBPF102"], (
+        diagnostics
+    )
+
+
 def test_failed_distribution_allows_zero_probes():
     # A failed distribution binding is enforced before ANY
     # discovery probe: with an all-zero digest, no fixture tool

@@ -926,6 +926,29 @@ def test_symlink_source_pointing_outside_rejected():
         raise AssertionError("symlink escape was accepted")
 
 
+def test_nul_source_fails_mbpf207_not_traceback():
+    # A NUL byte smuggled through a TOML escape is an unusable
+    # source path, refused with MBPF207 -- never a raw
+    # ValueError traceback from resolve().
+    text = mutate(
+        'source = "src/xdp.mojo"', 'source = "a\\u0000b.mojo"\n'
+    )
+    diagnostic = expect_code(text, "MBPF207")
+    assert "usable path" in diagnostic.explanation, diagnostic
+
+
+def test_nul_manifest_path_fails_mbpf209_not_traceback():
+    # A NUL byte in the manifest path itself is an unreadable
+    # manifest, refused with MBPF209 -- open() raises
+    # ValueError, not OSError, so the read guard must catch it.
+    try:
+        parse_manifest(os.path.join("nope", "a\x00b.toml"))
+    except MojobpfError as exc:
+        assert exc.diagnostic.code == "MBPF209", exc.diagnostic
+    else:
+        raise AssertionError("NUL manifest path was accepted")
+
+
 def test_missing_source_fails():
     manifest_path, _tmpdir = write_project(VALID_MANIFEST, sources=())
     try:

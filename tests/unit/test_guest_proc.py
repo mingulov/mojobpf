@@ -2549,8 +2549,10 @@ def test_xdp_unleased_run_reports_not_run_terminal():
     real_which = suite.shutil.which
     real_popen = suite.guest_proc.subprocess.Popen
     suite.shutil.which = lambda tool: "/fake/" + tool
+    builds = []
 
     def _fake_build(source, workdir, name):
+        builds.append(name)
         path = os.path.join(workdir, name + ".bpf.o")
         with open(path, "wb") as handle:
             handle.write(b"fake-object:" + name.encode())
@@ -2589,6 +2591,7 @@ def test_xdp_unleased_run_reports_not_run_terminal():
     _clear_tmp_xdp_stages(before)
     text = buffer.getvalue()
     assert calls == [], calls
+    assert builds == [], builds
     assert code == 3, (code, text[-500:])
     assert "MOJOBPF_SUITE_RESULT " in text, text[-500:]
     _plan, parsed, terminal = _parse_emitted(text.splitlines())
@@ -2608,7 +2611,9 @@ def test_xdp_unleased_run_reports_not_run_terminal():
 
 def test_xdp_frontend_timeout_is_typed():
     # A hung frontend surfaces as infrastructure failure with a
-    # terminal record, never an untyped escape from main().
+    # terminal record, never an untyped escape from main(). The
+    # drill grants the lease: the hung build is post-lease
+    # behavior, reachable only after the lease gate passes.
     suite = _load_suite("tests/kernel/test_mojo_xdp.py")
     before = _tmp_xdp_stages()
     real_build = suite.build_object
@@ -2621,6 +2626,8 @@ def test_xdp_frontend_timeout_is_typed():
     suite.build_object = _hung
     saved_cache = dict(suite._CACHED)
     suite._CACHED.clear()
+    saved_lease = os.environ.get("MOJOBPF_TARGET_LEASE")
+    os.environ["MOJOBPF_TARGET_LEASE"] = "1"
     buffer = io.StringIO()
     try:
         with contextlib.redirect_stdout(buffer):
@@ -2630,6 +2637,10 @@ def test_xdp_frontend_timeout_is_typed():
         suite.shutil.which = real_which
         suite._CACHED.clear()
         suite._CACHED.update(saved_cache)
+        if saved_lease is None:
+            os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+        else:
+            os.environ["MOJOBPF_TARGET_LEASE"] = saved_lease
         _clear_tmp_xdp_stages(before)
     text = buffer.getvalue()
     assert code == 2, (code, text[-500:])

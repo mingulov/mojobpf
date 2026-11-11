@@ -577,7 +577,6 @@ SDK_SIGNATURES = {
 _NAME_RE = re.compile(r"^(?:def|struct)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _COMPTIME_RE = re.compile(r"^comptime\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
 _WS_RE = re.compile(r"\s+")
-_STRING_MASK_RE = re.compile(r'"(?:[^"\\]|\\.)*("|$)')
 _IMPORT_RE = re.compile(
     r"^(?:from\s+([A-Za-z_][A-Za-z0-9_.]*)|import\s+([A-Za-z_]"
     r"[A-Za-z0-9_.]*))"
@@ -737,27 +736,107 @@ def _split_import_names(body: str) -> list[str]:
     return found
 
 
+def _lex_line(line: str, in_triple: bool) -> tuple[str, int, bool]:
+    """Lex one line to (code text, paren delta, in-triple flag).
+
+    Code text keeps every non-comment character (string
+    contents included); only the paren delta masks string
+    spans. Triple-quoted strings carry across lines; a ``#``
+    never starts a comment inside a string and a quote never
+    starts a string inside a comment. Single-quote spans mask
+    too: Mojo has no single-quote strings, so the spelling is
+    invalid input, but masking it keeps a hostile line from
+    joining away the statement below.
+    """
+    out: list[str] = []
+    delta = 0
+    state = "tstring" if in_triple else "code"
+    escaped = False
+    index = 0
+    size = len(line)
+    while index < size:
+        char = line[index]
+        if state == "comment":
+            break
+        if state == "tstring":
+            if escaped:
+                escaped = False
+                out.append(char)
+                index += 1
+                continue
+            if char == "\\":
+                escaped = True
+                out.append(char)
+                index += 1
+                continue
+            if line.startswith('"""', index):
+                out.append('"""')
+                index += 3
+                state = "code"
+                continue
+            out.append(char)
+            index += 1
+            continue
+        if state == "dstring" or state == "sstring":
+            closer = '"' if state == "dstring" else "'"
+            out.append(char)
+            index += 1
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == closer:
+                state = "code"
+            continue
+        if char == "#":
+            break
+        if line.startswith('"""', index):
+            state = "tstring"
+            out.append('"""')
+            index += 3
+            continue
+        if char == '"':
+            state = "dstring"
+            out.append(char)
+            index += 1
+            continue
+        if char == "'":
+            state = "sstring"
+            out.append(char)
+            index += 1
+            continue
+        if char == "(":
+            delta += 1
+        elif char == ")":
+            delta -= 1
+        out.append(char)
+        index += 1
+    return "".join(out), delta, state == "tstring"
+
+
 def _join_logical_lines(text: str) -> list[tuple[int, str]]:
     """Join parenthesized import statements to logical lines.
 
-    The depth count masks double-quoted string spans first: a
-    paren inside a string literal never opens or closes a
-    logical line, so a forbidden import can never hide behind
-    one. Only the count is masked; the buffered statement text
-    is unchanged.
+    The depth count masks string spans first: a paren inside a
+    ``"..."``, ``'...'`` or multi-line ``\"\"\"...\"\"\"`` literal
+    never opens or closes a logical line, so a forbidden import
+    can neither hide behind a string paren nor be conjured
+    from inside one. Only the count is masked; the buffered
+    statement text is unchanged apart from string-aware
+    comment stripping.
     """
     logical: list[tuple[int, str]] = []
     buffer = ""
     start = 0
     depth = 0
+    in_triple = False
     for lineno, raw in enumerate(text.splitlines(), start=1):
-        line = raw.split("#", 1)[0]
+        code, delta, in_triple = _lex_line(raw, in_triple)
         if not buffer:
             start = lineno
-        buffer += " " + line.strip()
-        masked = _STRING_MASK_RE.sub('""', line)
-        depth += masked.count("(") - masked.count(")")
-        if depth <= 0:
+        buffer += " " + code.strip()
+        depth += delta
+        if not in_triple and depth <= 0:
             depth = 0
             if buffer.strip():
                 logical.append((start, _normalize(buffer)))

@@ -472,6 +472,11 @@ def guest_run():
                     "frame %s hash %s, manifest says %s"
                     % (entry["file"], digest, entry["sha256"])
                 )
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-net-", dir="/tmp")
     staged = {
         "tc.bpf.o": build_object(TC_SOURCE, stage, "tc"),
@@ -537,10 +542,6 @@ def guest_run():
     commands.append(
         "attach_case socket_attach_mut socket_mut.bpf.o %s" % sock_args
     )
-    # Lease before staging, after builds: the build drills run
-    # unleased and must reach their injected failures, while an
-    # unleased run must still refuse here.
-    guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

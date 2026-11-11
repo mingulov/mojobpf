@@ -247,7 +247,13 @@ from .models import (
     BuildResult,
     is_int,
 )
-from .safeio import IR_LIMIT, JSON_LIMIT, MOJO_LIMIT, read_capped
+from .safeio import (
+    IR_LIMIT,
+    JSON_LIMIT,
+    MOJO_LIMIT,
+    OBJECT_LIMIT,
+    read_capped,
+)
 from .sdk import SDK_VERSION
 from .toolchain import (
     ToolInfo,
@@ -3683,7 +3689,9 @@ def _map_entries_outcome(manifest, staged_obj: str,
     ring-buffer size from the audited size tag); a manifest
     declaring any other kind or
     count fails closed here (``MBPF216``), as does an object whose
-    BTF map attributes disagree with the emitted shape, instead of
+    BTF map attributes disagree with the emitted shape, a mapless
+    shape carrying maps, or a non-event shape declaring anything
+    but exactly one map, instead of
     publishing an artifact that disagrees with its manifest. The
     core family additionally reconciles the emitted 4096-byte map
     value against the manifest's declared value type and the
@@ -3712,6 +3720,33 @@ def _map_entries_outcome(manifest, staged_obj: str,
     if shape is not None and (
         shape[0] == "classifier" or shape[:2] == ("skb", 0)
     ):
+        # Mapless helper-call shapes emit no maps: the name-set
+        # check above already bound object to manifest, so any
+        # declared map is itself a disagreement, refused here
+        # instead of returning clean without reading either side.
+        if manifest.maps:
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "built object %r carries maps %s but its %s "
+                        "helper-call shape emits none"
+                        % (
+                            staged_obj,
+                            sorted(
+                                entry.name
+                                for entry in manifest.maps
+                            ),
+                            shape[0],
+                        )
+                    ),
+                    location=staged_obj,
+                    remedy="declare no maps for this program shape; "
+                    "wider shapes need a reviewed route",
+                )
+            ]
         return []
     if shape is None:
         return [
@@ -3767,7 +3802,28 @@ def _map_entries_outcome(manifest, staged_obj: str,
         want_kind = "array"
     # The map names matched above and a non-event map-mode object
     # carries exactly one map, so the manifest declares exactly
-    # one here.
+    # one here. Pairs belong to the event/reserve arm above: a
+    # second declared map, or none under a map shape, fails
+    # closed instead of reconciling maps[0] and ignoring the rest
+    # (or crashing on an empty list).
+    if len(manifest.maps) != 1:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built non-event object %r declares %d maps "
+                    "but its %s helper-call shape reconciles "
+                    "exactly one map"
+                    % (staged_obj, len(manifest.maps), family)
+                ),
+                location=staged_obj,
+                remedy="declare exactly the one state map this "
+                "program shape emits; pairs need the "
+                "event/reserve shape",
+            )
+        ]
     declared = manifest.maps[0]
     if adapter_route == "parsed":
         # The spec contract already bound manifest to IR at
@@ -4183,13 +4239,13 @@ def _spill_gate_outcome(
        value plus key slots for the skb loadmap).
     """
     try:
-        with open(adapted_path, "r", encoding="utf-8") as handle:
-            adapted_text = handle.read()
-    except (OSError, UnicodeDecodeError):
+        adapted_text = read_capped(
+            adapted_path, limit=IR_LIMIT, kind="adapted IR"
+        ).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
         return _step_failure(
             STAGE_BUILD_BACKEND,
-            "cannot read adapted IR for the spill gate: %r"
-            % (adapted_path,),
+            "cannot read adapted IR for the spill gate: %s" % exc,
             adapted_path,
             "check the adapter service output",
         )
@@ -4342,8 +4398,7 @@ def _spill_gate_outcome(
             ),
         )
     try:
-        with open(staged_obj, "rb") as handle:
-            image = handle.read()
+        image = read_capped(staged_obj, limit=OBJECT_LIMIT, kind="object")
     except OSError as exc:
         return _step_failure(
             STAGE_BUILD_BACKEND,

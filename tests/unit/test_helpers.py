@@ -361,6 +361,63 @@ def test_capabilities_unknown_profile_rejects_mbpf101():
         raise AssertionError("expected MBPF101 for unknown profile")
 
 
+def test_capabilities_unsorted_profile_list_fails_closed(monkeypatch):
+    # A profile list that is not an ascending unique set means
+    # the registry drifted: admission refuses with MBPF101
+    # instead of reporting the disagreeing set.
+    import dataclasses
+
+    base = capabilities_module.lookup_profile("linux-bpfel-v3")
+    for drifted_ids in (
+        (2, 1, 3, 5, 8, 14, 130),
+        (1, 1, 2, 3, 5, 8, 14, 130),
+    ):
+        drifted = dataclasses.replace(base, helper_ids=drifted_ids)
+        monkeypatch.setattr(
+            capabilities_module,
+            "_admitted_profiles",
+            lambda: {"drifted": drifted},
+        )
+        try:
+            helpers_for_profile("drifted")
+        except ProfileError as exc:
+            assert exc.diagnostic.code == "MBPF101", exc.diagnostic
+            assert "ascending unique set" in (
+                exc.diagnostic.explanation
+            ), exc.diagnostic
+        else:
+            raise AssertionError(
+                "expected MBPF101 for %r" % (drifted_ids,)
+            )
+
+
+def test_capabilities_unrecorded_helper_fails_closed(monkeypatch):
+    # A profile admitting a helper the registry never recorded
+    # means the two registries disagree: admission refuses with
+    # MBPF101 instead of reporting the disagreeing set.
+    import dataclasses
+
+    assert lookup_helper(9999) is None
+    base = capabilities_module.lookup_profile("linux-bpfel-v3")
+    drifted = dataclasses.replace(
+        base, helper_ids=(1, 2, 3, 5, 8, 14, 130, 9999)
+    )
+    monkeypatch.setattr(
+        capabilities_module,
+        "_admitted_profiles",
+        lambda: {"drifted": drifted},
+    )
+    try:
+        helpers_for_profile("drifted")
+    except ProfileError as exc:
+        assert exc.diagnostic.code == "MBPF101", exc.diagnostic
+        assert "unrecorded helper" in (
+            exc.diagnostic.explanation
+        ), exc.diagnostic
+    else:
+        raise AssertionError("expected MBPF101 for unrecorded helper")
+
+
 def test_capabilities_introduced_view_is_distinct_and_noted():
     assert helpers_for_profile is not profile_helper_ids
     assert introduced_helper_ids is not profile_helper_ids

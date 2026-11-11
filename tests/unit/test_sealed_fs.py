@@ -77,6 +77,59 @@ def test_install_sealed_refuses_non_basename():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_snapshot_at_refuses_non_basename():
+    # Snapshot shares install's basename rule: a hostile name
+    # would escape the owned directory through the
+    # dirfd-relative stat, so it refuses instead of reading
+    # outside.
+    root, _identity = _owned_dir()
+    try:
+        outside = os.path.join(
+            os.path.dirname(root), "snapshot-outside.txt"
+        )
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("outside")
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for bad in (
+                "", "sub/evil", "..", ".", ".hidden", "a\x00b",
+                "../snapshot-outside.txt",
+            ):
+                with pytest.raises(ValueError):
+                    sealed_fs.snapshot_at(dirfd, bad)
+        finally:
+            os.close(dirfd)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        try:
+            os.unlink(outside)
+        except OSError:
+            pass
+
+
+def test_rmtree_owned_refuses_non_basename():
+    # Removal shares install's basename rule: a hostile name
+    # refuses before any identity check or removal.
+    root, _identity = _owned_dir()
+    try:
+        keep = os.path.join(root, "keep")
+        os.mkdir(keep)
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for bad in (
+                "", "sub/evil", "..", ".", ".hidden", "a\x00b",
+            ):
+                with pytest.raises(ValueError):
+                    sealed_fs.rmtree_owned(
+                        dirfd, bad, (0, 0)
+                    )
+        finally:
+            os.close(dirfd)
+        assert os.path.isdir(keep)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_install_sealed_replaces_without_following():
     # A1M4-1: publishing over a planted symlink replaces the
     # link itself; the link target is never followed or adopted.

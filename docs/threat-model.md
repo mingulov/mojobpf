@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
+
 # MojoBPF host threat model
 
 This document states what the MojoBPF build driver trusts, what it

@@ -68,7 +68,13 @@ from .execution import (
 )
 from .manifest import ProfileError, lookup_profile
 from .models import is_int
-from .safeio import LOCK_LIMIT, read_capped, resolve_under_root
+from .safeio import (
+    DIST_LIMIT,
+    LOCK_LIMIT,
+    hash_file_capped,
+    read_capped,
+    resolve_under_root,
+)
 
 TOOLCHAIN_SCHEMA_VERSION = 1
 LOCKFILE_SCHEMA_VERSION = 1
@@ -1035,17 +1041,6 @@ def load_toolchain_document(lockfile_path: str) -> dict | None:
     return data
 
 
-def _sha256_of_file(path: str) -> str:
-    """Return the hex SHA-256 of a file's bytes (may raise OSError)."""
-    import hashlib
-
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def check_toolchain_distribution(
     lockfile_path: str,
 ) -> Diagnostic | None:
@@ -1058,7 +1053,9 @@ def check_toolchain_distribution(
     present record is verified, never trusted descriptively:
     ``file`` (a beside-the-lock relative path: absolute paths,
     ``..`` segments and symlink escapes are rejected) must exist
-    and its bytes must match ``sha256``. An all-zero
+    as a regular file within ``DIST_LIMIT`` bytes (FIFOs and
+    other non-regular files refuse without blocking) and its
+    bytes must match ``sha256``. An all-zero
     placeholder digest is explicitly rejected and can never
     match. Returns None when the binding holds (or is absent),
     else the ``MBPF104`` diagnostic (malformed record) or
@@ -1140,14 +1137,16 @@ def check_toolchain_distribution(
             "a plain relative file name",
         )
     try:
-        observed = _sha256_of_file(candidate)
-    except OSError:
+        observed = hash_file_capped(
+            candidate, limit=DIST_LIMIT, kind="distribution file"
+        ).hexdigest()
+    except OSError as exc:
         return Diagnostic(
             code="MBPF102",
             stage=STAGE_TOOLCHAIN_MATCH,
             severity=SEVERITY_ERROR,
-            explanation="lockfile distribution file %r does not exist "
-            "or is unreadable" % (filename,),
+            explanation="lockfile distribution file %r is not "
+            "readable distribution bytes: %s" % (filename, exc),
             location="%s: distribution" % (lockfile_path,),
             remedy="restore the pinned distribution or re-pin the "
             "lockfile deliberately",

@@ -1555,13 +1555,22 @@ def _split_assignment(line: str) -> tuple[str, str] | None:
 
 
 def _read_script_text(path: str) -> str | None:
-    """Return the script text, or None when not a readable script."""
+    """Return the script text, or None when not analyzable.
+
+    A script larger than the analysis window is unanalyzable,
+    never truncated: the kernel executes lines past the window
+    (a late ``exec`` line flips the form), so a partial read
+    would misclassify a launcher as direct. Callers treat None
+    as fail-closed (unknown / unresolvable).
+    """
     try:
         with open(path, "rb") as handle:
             head = handle.read(2)
             if head != b"#!":
                 return None
-            rest = handle.read(_EXEC_SCRIPT_LIMIT)
+            rest = handle.read(_EXEC_SCRIPT_LIMIT + 1)
+            if len(rest) > _EXEC_SCRIPT_LIMIT:
+                return None
     except OSError:
         return None
     try:
@@ -1842,7 +1851,8 @@ def capture_chain(entry_abspath: str) -> CapturedChain:
             hops=(),
             image=entry,
             interpreter=interpreter,
-            note="shebang script is unreadable",
+            note="shebang script is unreadable or exceeds the "
+            "analysis window",
         )
     shell = _is_shell_interpreter(interpreter)
     target = _exec_target(text, shell)

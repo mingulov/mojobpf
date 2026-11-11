@@ -626,6 +626,11 @@ def guest_run():
         raise EnvironmentFailure("missing SDK dir: %s" % SDK_INCLUDE)
     frames = load_corpus()
     by_name = dict(frames)
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-acct-", dir="/tmp")
     classifier_obj = build_mojo(CLASSIFIER_SOURCE, stage, "classifier")
     classifier_mut = build_mojo(CLASSIFIER_MUTATED, stage, "classifier_mut")
@@ -796,11 +801,6 @@ def guest_run():
     commands.append(
         "run_case m2revert counter.bpf.o %d %s" % (XDP_PASS, pass_frame)
     )
-    # Lease before staging, after builds: the build drills
-    # run unleased and must reach their injected failures, while
-    # an unleased run must still refuse here, never as an
-    # admission failure.
-    guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

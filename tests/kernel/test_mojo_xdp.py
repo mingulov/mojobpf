@@ -240,6 +240,11 @@ def guest_run():
     for fixture in FIXTURES:
         if not os.path.isfile(os.path.join(EXAMPLE_DIR, fixture)):
             raise EnvironmentFailure("missing fixture: %s" % fixture)
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-xdp-", dir="/tmp")
     packets = {}
     for fixture in FIXTURES:
@@ -264,11 +269,6 @@ def guest_run():
         commands.append(
             'run_case %s %s %d %s' % (tag, obj, expect_fn(packets[packet]), packet)
         )
-    # Lease before staging, after builds: the build drills
-    # run unleased and must reach their injected failures, while
-    # an unleased run must still refuse here, never as an
-    # admission failure.
-    guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

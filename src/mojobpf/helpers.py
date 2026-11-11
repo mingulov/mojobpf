@@ -37,8 +37,9 @@ kernels: the twelve profile helpers load under the non-GPL
 project declaration, while the witness is rejected with the
 kernel's GPL-restriction message (see the helper-license
 kernel suite).
-Kernel symbol spellings match the verifier log form
-(``bpf_get_current_task#35``, ``bpf_ringbuf_reserve#131``).
+Kernel symbol spellings are bare symbols
+(``bpf_get_current_task``, ``bpf_ringbuf_reserve``); diagnostics
+render them as ``helper <id> (<symbol>)``.
 
 Standard library only.
 """
@@ -187,7 +188,12 @@ def lookup_helper(helper_id: object) -> HelperCapability | None:
 
 
 def profile_helper_ids(profile_id: str) -> tuple[int, ...]:
-    """Return the admitted helper IDs for ``profile_id``, ascending.
+    """Return the helper IDs INTRODUCED by ``profile_id``, ascending.
+
+    The introducing-only view: the IDs whose registry entry names
+    this profile, excluding helpers the profile admits through
+    inheritance. For the admitted set (including inheritance),
+    call :func:`mojobpf.capabilities.helpers_for_profile`.
 
     Raises :class:`KeyError` for a profile identifier no target
     profile owns. Known profiles that introduce no helpers (core,

@@ -342,6 +342,11 @@ def guest_run():
                  ACQONLY_SOURCE, PACKET, PACKET_MIXED, HARNESS):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-isa-atomic-", dir="/tmp")
     with guest_proc.open_consumed(PACKET, "rb") as handle:
         packet = handle.read()
@@ -374,7 +379,6 @@ def guest_run():
         commands.append(
             "run_case %s %s %d %s" % (tag, obj, expect, data)
         )
-    guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

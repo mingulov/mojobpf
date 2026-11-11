@@ -862,6 +862,11 @@ def _execute_once():
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     release = vng_release()
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("events")
     workdir = guest_proc.owned_stage(prefix="mojo-events-")
     if GUEST_ROUTE == "parsed":
         emitter_hash, small_hash = (
@@ -903,9 +908,6 @@ def _execute_once():
     drain = build_harness(
         DRAIN_SOURCE, os.path.join(workdir, "ringbuf_drain")
     )
-    # Lease before staging, after builds: an unleased run
-    # refuses here, never as an admission failure.
-    guest_proc.require_target_lease("events")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

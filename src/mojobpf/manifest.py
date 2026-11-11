@@ -194,7 +194,8 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
     * ``MBPF204``: duplicate map name.
     * ``MBPF205``: invalid map size or type.
     * ``MBPF206``: conflicting or unsupported section/program-type pair.
-    * ``MBPF207``: source path escape (absolute or outside the manifest).
+    * ``MBPF207``: source path escape (absolute, outside the
+      manifest, or unusable like a NUL byte).
     * ``MBPF208``: missing program source.
     * ``MBPF209``: malformed manifest (syntax, shape or value type).
     * ``MBPF210``: invalid name for ELF/BTF/kernel-object use.
@@ -209,7 +210,9 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
     where = str(manifest_path)
     try:
         raw = read_capped(where, limit=MANIFEST_LIMIT, kind="manifest")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: open() rejects NUL bytes with ValueError,
+        # not OSError, so the read guard catches both.
         raise _fail(
             "MBPF209",
             "cannot read manifest: %s" % exc,
@@ -509,7 +512,18 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
                 "%s: source %r" % (where, program.source),
                 "use a relative path inside the project directory",
             )
-        resolved = (base / candidate).resolve()
+        try:
+            resolved = (base / candidate).resolve()
+        except ValueError:
+            # Unusable source path (NUL byte): resolve() rejects
+            # it with ValueError, refused here with MBPF207.
+            raise _fail(
+                "MBPF207",
+                "program source is not a usable path: %r"
+                % (program.source,),
+                "%s: source %r" % (where, program.source),
+                "use a relative path inside the project directory",
+            ) from None
         try:
             inside = resolved.is_relative_to(base)
         except ValueError:

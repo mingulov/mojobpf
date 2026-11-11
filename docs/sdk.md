@@ -696,7 +696,9 @@ Third parties build the shape through the installed package only
 * Program types and helpers beyond the proven shapes are outside
   the surface: XDP programs use helpers 1-3, the tracepoint
   counter adds helper 14, the tracepoint event program adds
-  helpers 5, 8, and 130, and the uprobe register counter uses
+  helpers 5, 8, and 130, the tracepoint reservation emitter
+  adds helpers 131-133, the socket/TC network shapes add
+  helpers 9 and 26, and the uprobe register counter uses
   helpers 1-2 with no helper-ID call and one pinned register
   read, each admitted only inside its own audited count vector;
   anything else fails closed

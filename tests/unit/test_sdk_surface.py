@@ -49,12 +49,17 @@ SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 # unknown name, the unknown module, the wrong-module name, the
 # deeper path, and the five multi-module plain-import rows
 # (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``).
-# The eighteen static rows (module-only imports, ``std.*``
+# The twenty-five static rows (module-only imports, ``std.*``
 # ignores, the empty import, the alternate unknown-module
-# spellings, the core-module accept/reject rows, and the
-# string-paren line-join rows) rest on one-time manual
-# observation against the same frontend. Accept rows exit 0;
-# reject rows exit 1 with a source-layer diagnostic.
+# spellings, the core-module accept/reject rows, the
+# string-paren line-join rows, and the quote/comment masking
+# rows) rest on one-time manual observation against the same
+# frontend, except the seven masking rows: those pin static
+# masking behavior only (no compiler on the audit host), and
+# the single-quote rows use invalid-Mojo spellings (Mojo has
+# no single-quote strings) that hostile input could carry.
+# Accept rows exit 0; reject rows exit 1 with a source-layer
+# diagnostic.
 CHECKER_CASES = (
     ("from mojobpf.packet import XDP_PASS\n", 0),
     ("from mojobpf.core import core_read_task_pid\n", 0),
@@ -88,6 +93,19 @@ CHECKER_CASES = (
     ("import mojobpf._impl, mojobpf.packet\n", 1),
     ("import mojobpf.packet as pkt, mojobpf._impl as e\n", 1),
     ("import mojobpf.packet, std.random\n", 0),
+    # Single-quote spans mask parens too, so a hostile line
+    # cannot join away a forbidden import below it.
+    ("x = '('\nfrom mojobpf import _impl\n", 1),
+    ("x = '(')\nfrom mojobpf import _impl\n", 1),
+    # Triple-quoted spans mask across lines; an import spelled
+    # inside one is string content, never a statement.
+    ('x = """("""\nfrom mojobpf import _impl\n', 1),
+    ('x = """(\n"""\nfrom mojobpf import _impl\n', 1),
+    ('x = """\nfrom mojobpf import _impl\n"""\n', 0),
+    # '#' inside a string never starts a comment, and a quote
+    # inside a comment never starts a string.
+    ('x = "a#b"\nfrom mojobpf import _impl\n', 1),
+    ("# don't\nfrom mojobpf import _impl\n", 1),
 )
 
 

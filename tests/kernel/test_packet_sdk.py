@@ -482,6 +482,11 @@ def guest_run():
             raise EnvironmentFailure("missing fixture: %s" % source)
     if not os.path.isdir(SDK_INCLUDE):
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-packet-", dir="/tmp")
     staged = {"bpf_test_run.py": HARNESS}
     for shape in list(SHAPES) + [neg[0] for neg in NEGATIVES]:
@@ -516,11 +521,6 @@ def guest_run():
         + [key + ".bin" for key in sorted(packets)]
         + ["guest_packet.sh"]
     )
-    # Lease before staging, after builds: the build drills
-    # run unleased and must reach their injected failures, while
-    # an unleased run must still refuse here, never as an
-    # admission failure.
-    guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

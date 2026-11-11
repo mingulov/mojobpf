@@ -356,6 +356,11 @@ def guest_run():
                  SDK_INCLUDE):
         if not os.path.exists(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-isa-pseudo-", dir="/tmp")
     packet = bytes(60)
     with open(os.path.join(stage, "data.bin"), "wb") as handle:
@@ -381,7 +386,6 @@ def guest_run():
         )
     for tag, obj in DUMP_CASES:
         commands.append("dump_case %s %s" % (tag, obj))
-    guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

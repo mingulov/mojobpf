@@ -283,7 +283,7 @@ suite directory; the full suite output is shown above the code.
 ### License and provenance (MBPF7xx)
 
 All at stage `inspect.license`, severity `error`, except `MBPF708`
-(`evidence.capture`).
+(`evidence.capture`) and `MBPF710` (`evidence.verify`).
 
 | Code | Meaning | Location |
 | ---- | ----- | -------- |
@@ -296,6 +296,7 @@ All at stage `inspect.license`, severity `error`, except `MBPF708`
 | MBPF707 | Program source lacks a license grant | Program source |
 | MBPF708 | Provenance input unreadable (evidence capture) | Input path |
 | MBPF709 | GPL-only helper under a non-GPL declaration | None |
+| MBPF710 | Evidence verification failed (evidence verify) | Failing input |
 
 ## Further reading
 

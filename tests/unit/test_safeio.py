@@ -530,6 +530,7 @@ def test_converted_callers_use_capped_helpers():
         (sdk.parse_sdk_module, "read_capped", "MOJO_LIMIT"),
         (build._same_file_bytes, "read_capped", "MOJO_LIMIT"),
         (build._spill_gate_outcome, "read_capped", "IR_LIMIT"),
+        (build._spill_gate_outcome, "read_capped", "OBJECT_LIMIT"),
         (build._map_entries_outcome, "read_capped", "IR_LIMIT"),
         (build._run_adapter, "read_capped", "JSON_LIMIT"),
         (execution._verify_dependency_record, "read_capped", "DIST_LIMIT"),
@@ -551,3 +552,28 @@ def test_converted_callers_use_capped_helpers():
         source = inspect.getsource(func)
         assert helper in source, func.__qualname__
         assert token in source, func.__qualname__
+
+
+def test_converted_callers_carry_no_bare_open():
+    # The helper/token pin above passes vacuously when only one
+    # of several reads is capped, so converted functions must
+    # carry no bare open() at all: every read routes through a
+    # capped helper.
+    from mojobpf import build
+
+    for func in (build._spill_gate_outcome,):
+        source = inspect.getsource(func)
+        assert "open(" not in source, func.__qualname__
+
+
+def test_spill_gate_refuses_oversized_adapted_ir(tmp_path):
+    from mojobpf import build
+    from mojobpf.safeio import IR_LIMIT
+
+    huge = _sparse(str(tmp_path / "adapted.ll"), IR_LIMIT + 1)
+    diagnostic = build._spill_gate_outcome(
+        None, huge, "missing.o", 1, str(tmp_path), "x", []
+    )
+    assert diagnostic is not None
+    assert "exceeds" in diagnostic.explanation, diagnostic
+    assert "cap" in diagnostic.explanation, diagnostic

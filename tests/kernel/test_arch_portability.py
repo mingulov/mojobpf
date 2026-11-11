@@ -1133,6 +1133,11 @@ def guest_run():
     if not cross:
         tools.append("bpftool")
     check_tools(*tools)
+    # Lease after tool checks, before staging and builds: an
+    # unleased run refuses here with NOT_RUN before any guest
+    # work, never as an admission failure, and a broken
+    # toolchain still fails as itself.
+    guest_proc.require_target_lease("guest_run")
     workdir = tempfile.mkdtemp(prefix="mojo-arch-build-")
     base_obj = build_object(BASE_SOURCE, workdir, "base")
     mutated_obj = build_object(MUTATED_SOURCE, workdir, "mutated")
@@ -1248,11 +1253,6 @@ def guest_run():
         "run_event_phase aportev emitter.bpf.o /sys/fs/bpf/ev_arch_aportev"
         " %d %d" % (EVENT_N, EVENT_M)
     )
-    # Lease before staging, after builds: the build drills
-    # run unleased and must reach their injected failures, while
-    # an unleased run must still refuse here, never as an
-    # admission failure.
-    guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
             {"PATH": os.environ.get("PATH", "")}

@@ -1162,7 +1162,7 @@ def _remove_pinned_tree(path: str, pin) -> str | None:
         proved = sealed_fs.rmtree_owned(
             parent_fd, os.path.basename(key), pin
         )
-    except (AssertionError, OSError) as exc:
+    except (AssertionError, OSError, ValueError) as exc:
         return "%s: %s" % (path, exc)
     finally:
         try:

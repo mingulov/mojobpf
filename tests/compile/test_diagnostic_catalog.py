@@ -20,7 +20,7 @@ cases); audit ``MBPF3xx`` codes with a genuine Mojo spelling plus
 the build-step codes (``MBPF106``/``MBPF107``/``MBPF216``/``MBPF218``) run
 through the genuine driver; object codes (``MBPF4xx``) run against
 synthetic ELF images shared with the artifact-contract suite.
-Seven audit codes have no Mojo spelling (the frontend cannot emit
+Six audit codes have no Mojo spelling (the frontend cannot emit
 their shapes, or only rejected flag combinations produce them):
 they pin the IR-level rendering with a one-line neighboring-valid
 IR mutant each. ``MBPF301`` is an adapter-internal consistency

@@ -63,6 +63,7 @@ from mojobpf.manifest import (  # noqa: E402
     profile_digest,
 )
 from mojobpf.sdk import SDK_VERSION  # noqa: E402
+from test_inspect_btf import _valid_blob as _map_attr_blob  # noqa: E402
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -110,8 +111,16 @@ def main(argv):
         sys.stderr.write("fixture frontend boom\\\\n")
         return 3
     out = argv[argv.index("-o") + 1]
+    if os.environ.get("MOJOBPF_PUB_MOJO") == "maps":
+        body = (
+            "; fixture raw IR with one map lookup and one update\\\\n"
+            "; lowered lookup inttoptr (i64 1 to ptr)\\\\n"
+            "; lowered update inttoptr (i64 2 to ptr)\\\\n"
+        )
+    else:
+        body = "; fixture raw IR\\\\n"
     with open(out, "w", encoding="utf-8") as handle:
-        handle.write("; fixture raw IR\\\\n")
+        handle.write(body)
     return 0
 
 
@@ -127,6 +136,18 @@ import sys
 
 LICENSE = b"Apache-2.0 WITH LLVM-exception\\x00"
 XDP_CODE = (
+    b"\\xb0\\x00\\x00\\x00\\x02\\x00\\x00\\x00"
+    b"\\x95\\x00\\x00\\x00\\x00\\x00\\x00\\x00"
+)
+# The qualified ("map", 1) add-immediate multiset (-16, -4, -4,
+# +1) as four ADD64_IMM instructions plus the return/exit tail,
+# so the maps-mode object passes the spill gate exactly like the
+# pinned backend's proven layout.
+MAP_XDP_CODE = (
+    b"\\x07\\x00\\x00\\x00\\xf0\\xff\\xff\\xff"
+    b"\\x07\\x00\\x00\\x00\\xfc\\xff\\xff\\xff"
+    b"\\x07\\x00\\x00\\x00\\xfc\\xff\\xff\\xff"
+    b"\\x07\\x00\\x00\\x00\\x01\\x00\\x00\\x00"
     b"\\xb0\\x00\\x00\\x00\\x02\\x00\\x00\\x00"
     b"\\x95\\x00\\x00\\x00\\x00\\x00\\x00\\x00"
 )
@@ -163,7 +184,10 @@ def minimal_elf(code):
 
 
 MAP_BYTES = b"\\x00" * 32
-BTF_BYTES = b"\\x00" * 32
+# Rendered by _fixture_tools: the well-formed map-attribute BTF
+# blob (array ``mojobpf_map0``, one entry) the inspect suite
+# pins, so the maps-mode object carries parseable attributes.
+MAP_BTF = b"{map_btf}"
 
 
 def minimal_map_elf(code):
@@ -178,7 +202,7 @@ def minimal_map_elf(code):
     lic_off = xdp_off + len(code)
     maps_off = lic_off + len(LICENSE)
     btf_off = maps_off + len(MAP_BYTES)
-    sym_off = btf_off + len(BTF_BYTES)
+    sym_off = btf_off + len(MAP_BTF)
     strtab = b"\\x00mojobpf_map0\\x00"
     str_off = sym_off + 48
     shstr_off = str_off + len(strtab)
@@ -202,7 +226,7 @@ def minimal_map_elf(code):
         0, 0, 8, 0,
     )
     btf = struct.pack(
-        "<IIQQQQIIQQ", 19, 1, 0, 0, btf_off, len(BTF_BYTES),
+        "<IIQQQQIIQQ", 19, 1, 0, 0, btf_off, len(MAP_BTF),
         0, 0, 1, 0,
     )
     symtab = struct.pack(
@@ -221,7 +245,7 @@ def minimal_map_elf(code):
     sym_map = struct.pack("<IBBHQQ", 1, 0x11, 0, 3, 0, 32)
     return (
         eh + null + xdp + lic + maps + btf + symtab + strsec
-        + shstrsec + code + LICENSE + MAP_BYTES + BTF_BYTES
+        + shstrsec + code + LICENSE + MAP_BYTES + MAP_BTF
         + sym_null + sym_map + strtab + shstr
     )
 
@@ -231,8 +255,16 @@ def main(argv):
         print("llc 9.9.9 (fixture)")
         return 0
     out = argv[argv.index("-o") + 1]
+    if "-stop-after=prologepilog" in argv:
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write(
+                "; fixture MIR frame dump" + chr(10)
+                + "fixedStack: []" + chr(10)
+                + "stack: []" + chr(10)
+            )
+        return 0
     if os.environ.get("MOJOBPF_PUB_LLC") == "maps":
-        payload = minimal_map_elf(XDP_CODE)
+        payload = minimal_map_elf(MAP_XDP_CODE)
     else:
         payload = minimal_elf(XDP_CODE)
     with open(out, "wb") as handle:
@@ -329,6 +361,14 @@ def _load_module(name, path):
     return module
 
 
+# The inspect-pinned map-attribute blob as a single-backslash
+# ``\xNN`` literal for the fixture script (the template renders
+# it verbatim into a bytes literal).
+_MAP_BTF_LITERAL = "".join(
+    "\\x%02x" % byte for byte in _map_attr_blob()
+)
+
+
 def _fixture_tools(parent):
     bindir = os.path.join(parent, "bin")
     os.makedirs(bindir)
@@ -337,7 +377,12 @@ def _fixture_tools(parent):
         ("llc", LLC_FIXTURE),
     ):
         path = os.path.join(bindir, name)
-        _write(path, template.replace("{python}", sys.executable))
+        rendered = template.replace("{python}", sys.executable)
+        if name == "llc":
+            rendered = rendered.replace(
+                "{map_btf}", _MAP_BTF_LITERAL
+            )
+        _write(path, rendered)
         os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
     adapter = os.path.join(parent, "adapter.py")
     _write(adapter, ADAPTER_FIXTURE.replace("{python}", sys.executable))
@@ -842,6 +887,28 @@ def test_requires_gpl_unrecorded_profile():
     assert "no GPL-restriction entry" in exc.diagnostic.explanation
 
 
+def test_requires_gpl_drifted_profile_object_fails_closed():
+    # The production path judges the resolved object itself: a
+    # drifted helper list refuses with MBPF101 (never silently
+    # admitted, never re-resolved by ID).
+    from mojobpf.capabilities import ProfileError
+
+    check = inspect_module.requires_gpl
+    drifted = dataclasses.replace(
+        lookup_profile("linux-bpfel-v3"),
+        helper_ids=(2, 1, 3, 5, 8, 14, 130),
+    )
+    try:
+        check((), (), (), drifted)
+    except ProfileError as exc:
+        assert exc.diagnostic.code == "MBPF101", exc.diagnostic
+        assert "ascending unique set" in (
+            exc.diagnostic.explanation
+        ), exc.diagnostic
+    else:
+        raise AssertionError("expected MBPF101 for drifted object")
+
+
 def test_kernel_recognized_set():
     recognized = inspect_module.kernel_recognizes_as_gpl
     for declaration in (
@@ -949,6 +1016,22 @@ def test_no_link_step_passes_on_build_commands():
             duration_s=0.3,
             log_excerpt="",
         ),
+        CommandRecord(
+            argv=("/usr/bin/clang-format", "--version"),
+            stage="build.setup",
+            status="ok",
+            exit_code=0,
+            duration_s=0.1,
+            log_excerpt="",
+        ),
+        CommandRecord(
+            argv=("/bin/mojo", "build", "shape.cc"),
+            stage="build.frontend",
+            status="ok",
+            exit_code=0,
+            duration_s=0.2,
+            log_excerpt="",
+        ),
     )
     assert inspect_module.assert_no_link_step(records) is None
     assert inspect_module.assert_no_link_step(()) is None
@@ -969,9 +1052,23 @@ def test_no_link_step_rejects_linkers():
         ("build.link", ("/bin/tool",)),
         ("adapter.link", ("/bin/tool",)),
         ("link", ("/bin/tool",)),
+        ("build-link", ("/bin/tool",)),
+        ("Link", ("/bin/tool",)),
+        ("build.linker", ("/bin/tool",)),
+        ("adapter_link", ("/bin/tool",)),
         ("build.backend", ("/usr/bin/ld", "a.o")),
+        ("build.backend", ("/usr/bin/ld.lld", "a.o")),
+        ("build.backend", ("/usr/bin/ld.bfd", "a.o")),
+        ("build.backend", ("/usr/bin/ld.gold", "a.o")),
+        ("build.backend", ("/usr/bin/lld", "a.o")),
+        ("build.backend", ("/usr/bin/ld-2.38", "a.o")),
+        ("build.backend", ("/opt/x/llvm-link-19", "a.o")),
+        ("build.backend", ("/usr/bin/x86_64-linux-gnu-ld", "a.o")),
         ("build.backend", ("bpf-linker", "a.o")),
         ("build.backend", ("/opt/x/llvm-link", "a.o")),
+        ("build.backend", ("/usr/bin/clang", "a.o")),
+        ("build.backend", ("/usr/bin/gcc-13", "a.o")),
+        ("build.backend", ("/usr/bin/cc", "a.o")),
     ):
         try:
             inspect_module.assert_no_link_step([record(stage, argv)])
@@ -2500,7 +2597,31 @@ def _inputs_from_doc(doc):
     )
 
 
+def test_maps_fixture_object_carries_parseable_map_btf():
+    with _scratch() as parent:
+        bindir, _adapter = _fixture_tools(parent)
+        out = os.path.join(parent, "maps.bpf.o")
+        with _env(MOJOBPF_PUB_LLC="maps"):
+            proc = subprocess.run(
+                [os.path.join(bindir, "llc"), "-o", out],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+        assert proc.returncode == 0, proc.stderr
+        assert inspect_module.object_map_specs(out) == (
+            ("mojobpf_map0", 2, 1),
+        )
+
+
 def test_build_captures_real_sdk_and_imports():
+    # A map-carrying build needs all three sides coherent: the
+    # manifest declares the map, the fixture frontend emits the
+    # map-shaped IR (one lookup plus one update), and the
+    # fixture backend emits the map object. A marker-free
+    # (classifier) IR with declared maps is a manifest/program
+    # disagreement (MBPF216), not a passing fixture.
     with _scratch() as parent:
         bindir, adapter = _fixture_tools(parent)
         project = _project(parent)
@@ -2516,7 +2637,7 @@ def test_build_captures_real_sdk_and_imports():
         ) as handle:
             handle.write("from helper import thing\n")
         out_dir = os.path.join(parent, "out")
-        with _env(MOJOBPF_PUB_LLC="maps"):
+        with _env(MOJOBPF_PUB_LLC="maps", MOJOBPF_PUB_MOJO="maps"):
             result = _build_demo(
                 parent, bindir, adapter, project, out_dir
             )
@@ -2604,6 +2725,9 @@ def test_build_cache_key_invalidates_on_import_change():
 
 
 def test_build_cache_key_invalidates_on_sdk_change():
+    # Map-carrying build: manifest, map-shaped IR, and map
+    # object stay coherent (see
+    # test_build_captures_real_sdk_and_imports).
     with _scratch() as parent:
         bindir, adapter = _fixture_tools(parent)
         project = _project(parent)
@@ -2623,7 +2747,7 @@ def test_build_cache_key_invalidates_on_sdk_change():
         build_module._sdk_dir = lambda: fake_sdk
         evidence_module._sdk_root = lambda: fake_sdk
         try:
-            with _env(MOJOBPF_PUB_LLC="maps"):
+            with _env(MOJOBPF_PUB_LLC="maps", MOJOBPF_PUB_MOJO="maps"):
                 first = _build_demo(
                     parent, bindir, adapter, project, out_dir
                 )
@@ -2634,7 +2758,7 @@ def test_build_cache_key_invalidates_on_sdk_change():
             ]
             with open(sdk_file, "a", encoding="utf-8") as handle:
                 handle.write("# changed\n")
-            with _env(MOJOBPF_PUB_LLC="maps"):
+            with _env(MOJOBPF_PUB_LLC="maps", MOJOBPF_PUB_MOJO="maps"):
                 second = _build_demo(
                     parent, bindir, adapter, project, out_dir
                 )

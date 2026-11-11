@@ -2802,19 +2802,29 @@ def _write_report(workdir, name, report):
     return path
 
 
+def _full_outcomes(runner, failed=(), skip=()):
+    # One passing outcome per matrix suite: only full-lane
+    # shards merge, so accept-path fixtures cover SUITES.
+    return tuple(
+        (suite_id, "fail" if suite_id in failed else "pass")
+        for suite_id, _, _ in runner.SUITES
+        if suite_id not in skip
+    )
+
+
 def test_merge_shards_combines_lanes_and_results():
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
         first = _write_report(
             workdir, "a.json",
-            _shard_report("lane-a", outcomes=(("s1", "pass"),)),
+            _shard_report("lane-a", outcomes=_full_outcomes(runner)),
         )
         second = os.path.join(workdir, "b.json")
         with open(second, "w", encoding="utf-8") as handle:
             json.dump(
                 _shard_report(
-                    "lane-b", outcomes=(("s1", "pass"), ("s2", "pass")),
+                    "lane-b", outcomes=_full_outcomes(runner),
                 ),
                 handle,
             )
@@ -2831,7 +2841,7 @@ def test_merge_shards_combines_lanes_and_results():
         assert [lane["id"] for lane in merged["lanes"]] == [
             "lane-a", "lane-b",
         ]
-        assert len(merged["results"]) == 3
+        assert len(merged["results"]) == 2 * len(runner.SUITES)
         assert merged["merged_from"] == [first, second]
         print("PASS merge combines shards")
     finally:
@@ -2844,11 +2854,15 @@ def test_merge_shard_failure_fails_merged():
     try:
         first = _write_report(
             workdir, "a.json",
-            _shard_report("lane-a", outcomes=(("s1", "pass"),)),
+            _shard_report("lane-a", outcomes=_full_outcomes(runner)),
         )
+        failed_id = runner.SUITES[0][0]
         second = _write_report(
             workdir, "b.json",
-            _shard_report("lane-b", outcomes=(("s1", "fail"),)),
+            _shard_report(
+                "lane-b",
+                outcomes=_full_outcomes(runner, failed=(failed_id,)),
+            ),
         )
         out = os.path.join(workdir, "merged")
         assert runner.main(
@@ -2961,10 +2975,12 @@ def test_merge_accepts_exact_expected_lanes():
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
         first = _write_report(
-            workdir, "a.json", _shard_report("lane-a")
+            workdir, "a.json",
+            _shard_report("lane-a", outcomes=_full_outcomes(runner)),
         )
         second = _write_report(
-            workdir, "b.json", _shard_report("lane-b")
+            workdir, "b.json",
+            _shard_report("lane-b", outcomes=_full_outcomes(runner)),
         )
         out = os.path.join(workdir, "merged")
         assert runner.main(
@@ -2972,6 +2988,92 @@ def test_merge_accepts_exact_expected_lanes():
              "--expect-lanes", "lane-a,lane-b"]
         ) == 0
         print("PASS merge accepts exact expected lanes")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_partial_suite_coverage():
+    # A manually subsetted shard (--suite) never merges green:
+    # every merged lane must cover the full SUITES set, so a
+    # partial board refuses instead of reporting "2/2 passed".
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report("lane-a", outcomes=(("s1", "pass"),)),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report("lane-b", outcomes=(("s1", "pass"),)),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out,
+             "--expect-lanes", "lane-a,lane-b"]
+        ) == 2
+        print("PASS merge refuses partial suite coverage")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_accepts_pinned_exclusions():
+    # A lane missing exactly its pinned exclusions merges: the
+    # exclusion map (not silence) explains the absent cells.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "v6.12-kvm",
+                outcomes=_full_outcomes(
+                    runner, skip=("kernel-joint",)
+                ),
+            ),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "v7.2-kvm",
+                outcomes=_full_outcomes(
+                    runner,
+                    skip=("kernel-joint", "kernel-core-layouts"),
+                ),
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out,
+             "--expect-lanes", "v6.12-kvm,v7.2-kvm"]
+        ) == 0
+        print("PASS merge accepts pinned exclusions")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_beyond_pinned_exclusions():
+    # A lane missing more than its pinned exclusions refuses:
+    # the map excuses exactly its cells, never a wider hole.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "v6.12-kvm",
+                outcomes=_full_outcomes(
+                    runner,
+                    skip=("kernel-joint", "kernel-xdp"),
+                ),
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, "--out-dir", out,
+             "--expect-lanes", "v6.12-kvm"]
+        ) == 2
+        print("PASS merge refuses beyond pinned exclusions")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -423,6 +423,10 @@ def executed():
 def _executed_once():
     """Run the single guest attempt; see executed()."""
     global _RESULT, _STAGE
+    # Lease before builds: the guest path refuses here with
+    # NOT_RUN before any compiler work, while host-side tests
+    # keep calling fixture() directly without a lease.
+    guest_proc.require_target_lease("helper_licenses")
     fix = fixture()
     release = vng_release()
     stage = guest_proc.owned_stage(prefix="mojo-helper-licenses-", dir="/tmp")

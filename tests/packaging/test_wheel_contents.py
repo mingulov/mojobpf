@@ -7,7 +7,8 @@ content) and pins its contract:
 
 * the payload is exactly the Python tool modules, the validation
   package modules, the eight Mojo SDK sources, and the three
-  adapter scripts plus the admission descriptor (byte-identical
+  adapter scripts plus the admission descriptor and target
+  proof table (byte-identical
   to the tree), with the eleven contract schemas shipped as
   versioned wheel data files;
 * the console script, license texts, and metadata (name, version,

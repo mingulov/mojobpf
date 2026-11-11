@@ -498,6 +498,9 @@ def _command_inspect(args) -> int:
             if (result.ok or args.report_only)
             else EXIT_COMPILE
         )
+    # The declaration gate ignores --report-only deliberately: a
+    # license-pair mismatch means the object misdeclares its own
+    # grant, which scripts must never read as success.
     return EXIT_OK if result.ok else EXIT_COMPILE
 
 
@@ -877,7 +880,9 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument(
         "--report-only",
         action="store_true",
-        help="print findings but exit 0 even when findings are present",
+        help="print findings but exit 0 even when findings are "
+        "present (license declaration-gate failures still exit "
+        "non-zero)",
     )
     inspect.set_defaults(func=_command_inspect)
 
