@@ -202,7 +202,8 @@ for name in ('mojo', 'llc'):
 spec = importlib.util.find_spec('mojobpf.resources.adapter')
 adapter_dir = list(spec.submodule_search_locations)[0]
 siblings = {}
-for name in ('admission.json', 'audit.py', 'mojo_ir_adapter.py'):
+for name in ('admission.json', 'audit.py', 'mojo_ir_adapter.py',
+             'target_proof_table.json'):
     siblings[name] = sha256_file(os.path.join(adapter_dir, name))
 doc = {'adapter': {
            'note': 'quickstart (installed-package pins)',

@@ -14,6 +14,7 @@ repository root) or directly (``python3 tests/unit/test_<name>.py``).
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -368,7 +369,7 @@ def test_schema_documents_pin_version_1():
 
 
 def test_load_schema_rejects_unknown():
-    _assert_contract_error("MBPF307", load_schema, "nope")
+    _assert_contract_error("MBPF329", load_schema, "nope")
 
 
 def _strip_descriptions(value):
@@ -519,7 +520,7 @@ def test_schema_parity_boundary_python_rejects_schema_valid_mismatch():
     raw["observed"] = {
         "outcome": "PASS", "failure_stage": None, "value": 41,
     }
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
     try:
         import jsonschema
     except ImportError:
@@ -580,42 +581,42 @@ def test_target_round_trip():
 def test_target_fingerprint_tamper_rejected():
     raw = make_target()
     raw["kernel"]["release"] = "6.6.0-evil"
-    _assert_contract_error("MBPF306", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF328", TargetManifest.from_dict, raw)
 
 
 def test_target_rejects_bare_release():
     raw = make_target()
     del raw["kernel"]
-    _assert_contract_error("MBPF303", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF325", TargetManifest.from_dict, raw)
     raw = make_target()
     raw["uname"] = "6.12.0"
     raw["fingerprint"] = TargetManifest.fingerprint_of(raw)
-    _assert_contract_error("MBPF302", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF324", TargetManifest.from_dict, raw)
 
 
 def test_target_rejects_bad_mode_and_version():
     raw = make_target(execution_mode="container")
     raw["fingerprint"] = TargetManifest.fingerprint_of(raw)
-    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF327", TargetManifest.from_dict, raw)
     raw = make_target()
     raw["schema_version"] = 2
     raw["fingerprint"] = TargetManifest.fingerprint_of(raw)
-    _assert_contract_error("MBPF304", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF326", TargetManifest.from_dict, raw)
 
 
 def test_target_rejects_hostile_shapes():
     raw = make_target()
     raw["cpu"]["features"] = 5
-    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF327", TargetManifest.from_dict, raw)
     raw = make_target()
     raw["jit"]["hardening"] = {"spectre": True}
-    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF327", TargetManifest.from_dict, raw)
     raw = make_target()
     raw["btf"]["modules"] = "bpf_testmod"
-    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF327", TargetManifest.from_dict, raw)
     raw = make_target()
     raw["execution_mode"] = ["tcg"]
-    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    _assert_contract_error("MBPF327", TargetManifest.from_dict, raw)
 
 
 # Fixture ABI.
@@ -669,20 +670,20 @@ def test_fixture_round_trip():
 def test_fixture_freezes_abi():
     raw = make_fixture()
     del raw["object"]["sha256"]
-    _assert_contract_error("MBPF303", Fixture.from_dict, raw)
+    _assert_contract_error("MBPF325", Fixture.from_dict, raw)
     raw = make_fixture()
     raw["maps"] = []
     raw["event_abi"] = {"version": 1, "record_bytes": 32}
     assert Fixture.from_dict(raw).to_dict() == raw
     raw = make_fixture(barriers=["ready", "ready"])
-    _assert_contract_error("MBPF305", Fixture.from_dict, raw)
+    _assert_contract_error("MBPF327", Fixture.from_dict, raw)
     raw = make_fixture(barriers=["launch"])
-    _assert_contract_error("MBPF305", Fixture.from_dict, raw)
+    _assert_contract_error("MBPF327", Fixture.from_dict, raw)
     raw = make_fixture()
     raw["maps"].append(dict(raw["maps"][0]))
-    _assert_contract_error("MBPF305", Fixture.from_dict, raw)
+    _assert_contract_error("MBPF327", Fixture.from_dict, raw)
     raw = make_fixture(extra="nope")
-    _assert_contract_error("MBPF302", Fixture.from_dict, raw)
+    _assert_contract_error("MBPF324", Fixture.from_dict, raw)
 
 
 def test_fixture_accepts_ringbuf_zero_sizes():
@@ -701,13 +702,13 @@ def test_fixture_accepts_ringbuf_zero_sizes():
 
 def test_fixture_rejects_hostile_shapes():
     _assert_contract_error(
-        "MBPF305", Fixture.from_dict, make_fixture(barriers=[[]])
+        "MBPF327", Fixture.from_dict, make_fixture(barriers=[[]])
     )
     _assert_contract_error(
-        "MBPF305", Fixture.from_dict, make_fixture(barriers="ready")
+        "MBPF327", Fixture.from_dict, make_fixture(barriers="ready")
     )
     _assert_contract_error(
-        "MBPF305", Fixture.from_dict, make_fixture(maps={})
+        "MBPF327", Fixture.from_dict, make_fixture(maps={})
     )
 
 
@@ -748,7 +749,7 @@ def test_plan_hash_tamper_rejected():
     run_plan, _, _ = basic_plan()
     raw = run_plan.to_dict()
     raw["plan_hash"] = "0" * 64
-    _assert_contract_error("MBPF306", RunPlan.from_dict, raw)
+    _assert_contract_error("MBPF328", RunPlan.from_dict, raw)
 
 
 def test_plan_rejects_bad_cross_references():
@@ -758,10 +759,10 @@ def test_plan_rejects_bad_cross_references():
     assert other != fp
     bad_target = make_case("NET-XDP-01", other)
     _assert_contract_error(
-        "MBPF305", make_plan, [bad_target], [target]
+        "MBPF327", make_plan, [bad_target], [target]
     )
     dup = [make_case("NET-XDP-01", fp), make_case("NET-XDP-01", fp)]
-    _assert_contract_error("MBPF305", make_plan, dup, [target])
+    _assert_contract_error("MBPF327", make_plan, dup, [target])
     deny_expected = {"outcome": "FAIL", "failure_stage": "ATTACH"}
     lonely_deny = make_case(
         "DENY-1",
@@ -771,7 +772,7 @@ def test_plan_rejects_bad_cross_references():
         expected=dict(deny_expected),
     )
     _assert_contract_error(
-        "MBPF305", make_plan, [lonely_deny], [target]
+        "MBPF327", make_plan, [lonely_deny], [target]
     )
     positive = make_case("NET-XDP-01", fp)
     deny_of_deny = make_case(
@@ -789,11 +790,11 @@ def test_plan_rejects_bad_cross_references():
         expected=dict(deny_expected),
     )
     _assert_contract_error(
-        "MBPF305", make_plan, [positive, first_deny, deny_of_deny],
+        "MBPF327", make_plan, [positive, first_deny, deny_of_deny],
         [target],
     )
     sneaky = make_case("NET-XDP-01", fp, denies="NET-XDP-01")
-    _assert_contract_error("MBPF305", make_plan, [sneaky], [target])
+    _assert_contract_error("MBPF327", make_plan, [sneaky], [target])
 
 
 def test_plan_rejects_bad_revisions():
@@ -802,7 +803,7 @@ def test_plan_rejects_bad_revisions():
     bad = dict(REVISIONS)
     bad["repository_commit"] = "xyz"
     _assert_contract_error(
-        "MBPF305", make_plan, [case], [target], bad
+        "MBPF327", make_plan, [case], [target], bad
     )
 
 
@@ -814,7 +815,7 @@ def test_plan_rejects_denial_expecting_pass():
         "DENY-1", fp, expectation="denial", denies="NET-XDP-01"
     )
     _assert_contract_error(
-        "MBPF305", make_plan, [positive, bad], [target]
+        "MBPF327", make_plan, [positive, bad], [target]
     )
 
 
@@ -834,7 +835,7 @@ def test_result_rejects_forged_pass():
     run_plan, target, _ = basic_plan()
     fp = target["fingerprint"]
     raw = make_result(run_plan, "NET-XDP-01", fp, evidence=[])
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
     raw = make_result(
         run_plan,
         "NET-XDP-01",
@@ -843,30 +844,30 @@ def test_result_rejects_forged_pass():
         outcome="PASS",
         failure_stage=None,
     )
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
     raw = make_result(
         run_plan,
         "NET-XDP-01",
         fp,
         cleanup={"status": "NOT_CHECKED", "residue": []},
     )
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
 
 
 def test_result_rejects_truncated_and_unknown():
     run_plan, target, _ = basic_plan()
     raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
     del raw["identities"]["workload"]
-    _assert_contract_error("MBPF303", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF325", CaseResult.from_dict, raw)
     raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
     del raw["outcome"]
-    _assert_contract_error("MBPF303", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF325", CaseResult.from_dict, raw)
     raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
     raw["success_text"] = "PASS (trust me)"
-    _assert_contract_error("MBPF302", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF324", CaseResult.from_dict, raw)
     raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
     raw["schema_version"] = 99
-    _assert_contract_error("MBPF304", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF326", CaseResult.from_dict, raw)
 
 
 def test_result_fail_requires_stage_and_matches_observed():
@@ -883,13 +884,13 @@ def test_result_fail_requires_stage_and_matches_observed():
         failure_stage=None,
         observed={"outcome": "FAIL", "failure_stage": None},
     )
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
     raw = make_result(
         run_plan, "NET-XDP-01", fp, outcome="FAIL",
         failure_stage="LOAD",
         observed={"outcome": "FAIL", "failure_stage": "RUNTIME"},
     )
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
 
 
 def test_result_rejects_bare_not_applicable():
@@ -899,7 +900,7 @@ def test_result_rejects_bare_not_applicable():
         run_plan, "NET-XDP-01", fp, outcome="NOT_RUN",
         applicability="NOT_APPLICABLE", failure_stage="INFRA",
     )
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
     raw = make_result(
         run_plan, "NET-XDP-01", fp, outcome="NOT_RUN",
         applicability="NOT_APPLICABLE", failure_stage="INFRA",
@@ -946,12 +947,12 @@ def test_result_rejects_bad_semantics():
         "outcome": "PASS", "failure_stage": None, "value": 42,
         "bogus": True,
     }
-    _assert_contract_error("MBPF302", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF324", CaseResult.from_dict, raw)
     raw = make_result(run_plan, "NET-XDP-01", fp)
     raw["observed"] = {
         "outcome": "PASS", "failure_stage": None, "value": {1, 2},
     }
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
     raw = make_result(
         run_plan, "NET-XDP-01", fp, outcome="FAIL",
         failure_stage="LOAD",
@@ -960,7 +961,7 @@ def test_result_rejects_bad_semantics():
     raw["observed"] = {
         "outcome": "FAIL", "failure_stage": "LOAD", "error_class": "",
     }
-    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
 
 
 def test_result_rejects_strict_json_type_mismatch():
@@ -982,7 +983,7 @@ def test_result_rejects_strict_json_type_mismatch():
             "outcome": "PASS", "failure_stage": None,
             "value": observed_value,
         }
-        _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+        _assert_contract_error("MBPF327", CaseResult.from_dict, raw)
     # Matching booleans still pass.
     raw = make_result(run_plan, "NET-XDP-01", fp)
     raw["expected"] = {
@@ -993,7 +994,7 @@ def test_result_rejects_strict_json_type_mismatch():
     # A boolean schema version is not integer 1.
     raw = make_result(run_plan, "NET-XDP-01", fp)
     raw["schema_version"] = True
-    _assert_contract_error("MBPF304", CaseResult.from_dict, raw)
+    _assert_contract_error("MBPF326", CaseResult.from_dict, raw)
 
 
 def test_result_rejects_hostile_shapes_without_abort():
@@ -1028,7 +1029,7 @@ def test_result_rejects_hostile_shapes_without_abort():
         decision = aggregate(run_plan, [raw])
         assert decision.verdict == "FAIL", index
         assert len(decision.rejected) == 1, index
-        assert decision.rejected[0]["code"] == "MBPF305", index
+        assert decision.rejected[0]["code"] == "MBPF327", index
 
 
 def test_cost_record_values():
@@ -1052,10 +1053,10 @@ def test_cost_record_values():
     assert CostRecord.from_dict(unavailable).to_dict() == unavailable
     missing_reason = dict(good)
     missing_reason["value"] = None
-    _assert_contract_error("MBPF305", CostRecord.from_dict, missing_reason)
+    _assert_contract_error("MBPF327", CostRecord.from_dict, missing_reason)
     both = dict(unavailable)
     both["value"] = 0
-    _assert_contract_error("MBPF305", CostRecord.from_dict, both)
+    _assert_contract_error("MBPF327", CostRecord.from_dict, both)
 
 
 # Aggregation: happy paths, retries and denial scoping.
@@ -1221,7 +1222,7 @@ def test_aggregate_denial_ordinary_pass_rejected():
         run_plan, [make_result(run_plan, "NET-XDP-01", fp), rec]
     )
     assert decision.verdict == "FAIL"
-    assert decision.rejected[0]["code"] == "MBPF311"
+    assert decision.rejected[0]["code"] == "MBPF331"
     assert decision.ledger["passed"]["count"] == 1
 
 
@@ -1250,7 +1251,7 @@ def test_aggregate_semantic_oracle_41_to_42():
     decision = aggregate(run_plan, [stale])
     assert decision.verdict == "FAIL"
     assert len(decision.rejected) == 1
-    assert decision.rejected[0]["code"] == "MBPF305"
+    assert decision.rejected[0]["code"] == "MBPF327"
 
 
 def test_aggregate_denial_error_class_must_match():
@@ -1328,7 +1329,7 @@ def test_aggregate_plan_expected_strict_type_mismatch():
     raw["observed"] = dict(raw["expected"])
     decision = aggregate(run_plan, [raw])
     assert decision.verdict == "FAIL"
-    assert decision.rejected[0]["code"] == "MBPF311"
+    assert decision.rejected[0]["code"] == "MBPF331"
 
 
 # Aggregation negatives: every one forces a non-PASS gate and preserves
@@ -1350,7 +1351,7 @@ def test_aggregate_duplicate_is_rejected():
     decision = aggregate(run_plan, [raw, dict(raw)])
     assert decision.verdict == "FAIL"
     assert len(decision.rejected) == 1
-    assert decision.rejected[0]["code"] == "MBPF312"
+    assert decision.rejected[0]["code"] == "MBPF332"
     assert decision.rejected[0]["raw_digest"] == CaseResult.from_dict(
         raw
     ).digest()
@@ -1368,7 +1369,7 @@ def test_aggregate_unplanned_case_and_unknown_target():
     decision = aggregate(run_plan, [planned, stray, wrong_target])
     assert decision.verdict == "FAIL"
     codes = [entry["code"] for entry in decision.rejected]
-    assert codes == ["MBPF310", "MBPF310"]
+    assert codes == ["MBPF330", "MBPF330"]
     assert decision.suite.attempts_preserved == 3
 
 
@@ -1437,7 +1438,7 @@ def test_aggregate_wrong_hashes_rejected():
         decision = aggregate(run_plan, [bad])
         assert decision.verdict == "FAIL"
         assert len(decision.rejected) == 1
-        assert decision.rejected[0]["code"] == "MBPF311", mutate
+        assert decision.rejected[0]["code"] == "MBPF331", mutate
         assert decision.rejected[0]["raw_digest"] is not None
     assert aggregate(run_plan, [good]).verdict == "PASS"
 
@@ -1451,8 +1452,8 @@ def test_aggregate_truncated_record_preserved():
     decision = aggregate(run_plan, [good, truncated, "not-a-record"])
     assert decision.verdict == "FAIL"
     assert [entry["code"] for entry in decision.rejected] == [
-        "MBPF303",
-        "MBPF301",
+        "MBPF325",
+        "MBPF323",
     ]
     assert decision.suite.attempts_preserved == 3
 
@@ -1543,7 +1544,7 @@ def test_aggregate_forged_success_cannot_pass():
     no_evidence = make_result(run_plan, "NET-XDP-01", fp, evidence=[])
     decision = aggregate(run_plan, [no_evidence])
     assert decision.verdict == "FAIL"
-    assert decision.rejected[0]["code"] == "MBPF305"
+    assert decision.rejected[0]["code"] == "MBPF327"
     assert decision.ledger["passed"]["count"] == 0
 
 
@@ -1553,7 +1554,7 @@ def test_aggregate_missing_workload_rejected():
     del raw["identities"]["workload"]
     decision = aggregate(run_plan, [raw])
     assert decision.verdict == "FAIL"
-    assert decision.rejected[0]["code"] == "MBPF303"
+    assert decision.rejected[0]["code"] == "MBPF325"
 
 
 def test_aggregate_retry_replacement_rejected():
@@ -1564,7 +1565,7 @@ def test_aggregate_retry_replacement_rejected():
     orphan_second = make_result(run_plan, "NET-XDP-01", fp, attempt=2)
     decision = aggregate(run_plan, [orphan_second])
     assert decision.verdict == "FAIL"
-    assert decision.rejected[0]["code"] == "MBPF313"
+    assert decision.rejected[0]["code"] == "MBPF333"
     assert decision.suite.attempts_preserved == 1
 
 
@@ -1576,7 +1577,7 @@ def test_aggregate_extra_attempt_rejected():
     decision = aggregate(run_plan, [first, extra])
     assert decision.verdict == "FAIL"
     assert len(decision.rejected) == 1
-    assert decision.rejected[0]["code"] == "MBPF310"
+    assert decision.rejected[0]["code"] == "MBPF330"
     assert decision.suite.attempts_preserved == 2
     assert len(decision.suite.rejected_digests) == 1
 
@@ -1694,7 +1695,7 @@ def test_aggregate_pass_on_unavailable_cell_rejected():
     )
     decision = aggregate(run_plan, [lying])
     assert decision.verdict == "FAIL"
-    assert decision.rejected[0]["code"] == "MBPF314"
+    assert decision.rejected[0]["code"] == "MBPF334"
     assert decision.ledger["passed"]["count"] == 0
 
 
@@ -1815,7 +1816,7 @@ def test_aggregate_same_cell_rerun_id_change_is_duplicate():
     # Both rows share one (case, target, attempt) key, so the second is a
     # duplicate even though its run_id differs.
     assert decision.verdict == "FAIL"
-    assert decision.rejected[0]["code"] == "MBPF312"
+    assert decision.rejected[0]["code"] == "MBPF332"
 
 
 def test_aggregate_mixed_run_id_two_cells():
@@ -1833,12 +1834,12 @@ def test_aggregate_mixed_run_id_two_cells():
     )
     assert decision.verdict == "FAIL"
     assert any(
-        entry["code"] == "MBPF311" for entry in decision.rejected
+        entry["code"] == "MBPF331" for entry in decision.rejected
     )
 
 
 def test_aggregate_malformed_plan_raises():
-    _assert_contract_error("MBPF303", aggregate, {"nope": True}, [])
+    _assert_contract_error("MBPF325", aggregate, {"nope": True}, [])
 
 
 def test_aggregate_accepts_model_objects():
@@ -1873,7 +1874,7 @@ def test_aggregate_revalidates_model_instances():
     decision = aggregate(run_plan, [evil])
     assert decision.verdict == "FAIL"
     assert len(decision.rejected) == 1
-    assert decision.rejected[0]["code"] == "MBPF305"
+    assert decision.rejected[0]["code"] == "MBPF327"
     assert decision.ledger["passed"]["count"] == 0
 
 
@@ -1882,7 +1883,7 @@ def test_aggregate_revalidates_plan_instance():
     fp = target["fingerprint"]
     raw = make_result(run_plan, "NET-XDP-01", fp)
     run_plan.revisions["package"] = "mutated-9.9.9"
-    _assert_contract_error("MBPF306", aggregate, run_plan, [raw])
+    _assert_contract_error("MBPF328", aggregate, run_plan, [raw])
 
 
 def test_aggregate_broken_instance_preserved_not_raised():
@@ -1892,12 +1893,12 @@ def test_aggregate_broken_instance_preserved_not_raised():
     raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
     valid = CaseResult.from_dict(raw)
     broken = dataclasses.replace(valid, cleanup={})
-    _assert_contract_error("MBPF305", broken.to_dict)
-    _assert_contract_error("MBPF305", broken.digest)
+    _assert_contract_error("MBPF327", broken.to_dict)
+    _assert_contract_error("MBPF327", broken.digest)
     decision = aggregate(run_plan, [broken])
     assert decision.verdict == "FAIL"
     assert len(decision.rejected) == 1
-    assert decision.rejected[0]["code"] == "MBPF305"
+    assert decision.rejected[0]["code"] == "MBPF327"
     bound = decision.rejected[0]["raw_digest"]
     assert isinstance(bound, str) and len(bound) == 64
     int(bound, 16)
@@ -1932,7 +1933,7 @@ def test_aggregate_malformed_model_substitution_changes_suite():
         != second_suite["rejected_digests"]
     )
     _assert_contract_error(
-        "MBPF314", verify_suite_result, first_suite, run_plan,
+        "MBPF334", verify_suite_result, first_suite, run_plan,
         [accepted, swapped],
     )
 
@@ -1944,23 +1945,23 @@ def test_to_dict_rejects_malformed_instances():
     raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
     valid = CaseResult.from_dict(raw)
     _assert_contract_error(
-        "MBPF305", dataclasses.replace(valid, cleanup=None).to_dict
+        "MBPF327", dataclasses.replace(valid, cleanup=None).to_dict
     )
     _assert_contract_error(
-        "MBPF305",
+        "MBPF327",
         dataclasses.replace(valid, evidence="nope").to_dict,
     )
     _assert_contract_error(
-        "MBPF305",
+        "MBPF327",
         dataclasses.replace(valid, costs="nope").to_dict,
     )
     suite = aggregate(run_plan, [raw]).suite
     assert suite is not None
     _assert_contract_error(
-        "MBPF305", dataclasses.replace(suite, decision={}).to_dict
+        "MBPF327", dataclasses.replace(suite, decision={}).to_dict
     )
     _assert_contract_error(
-        "MBPF305", dataclasses.replace(suite, ledger=5).to_dict
+        "MBPF327", dataclasses.replace(suite, ledger=5).to_dict
     )
 
 
@@ -1984,22 +1985,22 @@ def test_verify_suite_result_rejects_tampering():
     forged = json.loads(json.dumps(suite))
     forged["result_digests"] = ["0" * 64]
     _assert_contract_error(
-        "MBPF314", verify_suite_result, forged, run_plan, raws
+        "MBPF334", verify_suite_result, forged, run_plan, raws
     )
     forged = json.loads(json.dumps(suite))
     forged["decision"]["verdict"] = "FAIL"
     _assert_contract_error(
-        "MBPF314", verify_suite_result, forged, run_plan, raws
+        "MBPF334", verify_suite_result, forged, run_plan, raws
     )
     forged = json.loads(json.dumps(suite))
     forged["attempts_preserved"] = 99
     _assert_contract_error(
-        "MBPF314", verify_suite_result, forged, run_plan, raws
+        "MBPF334", verify_suite_result, forged, run_plan, raws
     )
     forged = json.loads(json.dumps(suite))
     forged["rejected_digests"] = ["0" * 64]
     _assert_contract_error(
-        "MBPF314", verify_suite_result, forged, run_plan, raws
+        "MBPF334", verify_suite_result, forged, run_plan, raws
     )
 
 
@@ -2015,13 +2016,13 @@ def test_verify_suite_result_binds_rejected_attempts():
     swapped = json.loads(json.dumps(bad))
     swapped["identities"]["object_sha256"] = "2" * 64
     _assert_contract_error(
-        "MBPF314", verify_suite_result, suite, run_plan,
+        "MBPF334", verify_suite_result, suite, run_plan,
         [good, swapped],
     )
     dropped = json.loads(json.dumps(suite))
     dropped["rejected_digests"] = []
     _assert_contract_error(
-        "MBPF314", verify_suite_result, dropped, run_plan,
+        "MBPF334", verify_suite_result, dropped, run_plan,
         [good, bad],
     )
 
@@ -2033,7 +2034,7 @@ def test_suite_result_rejects_bad_ledger_counts():
         run_plan, [make_result(run_plan, "NET-XDP-01", fp)]
     ).to_suite_dict()
     suite["ledger"]["passed"]["count"] = 99
-    _assert_contract_error("MBPF305", SuiteResult.from_dict, suite)
+    _assert_contract_error("MBPF327", SuiteResult.from_dict, suite)
 
 
 def test_schema_bundle_round_trip():
@@ -2062,7 +2063,7 @@ def test_schema_bundle_rejects_tampering_and_loss():
         ) as handle:
             handle.write(" ")
         _assert_contract_error(
-            "MBPF307", verify_schema_bundle, dest, pin
+            "MBPF329", verify_schema_bundle, dest, pin
         )
     with tempfile.TemporaryDirectory() as tmp:
         dest = os.path.join(tmp, "bundle")
@@ -2070,7 +2071,7 @@ def test_schema_bundle_rejects_tampering_and_loss():
         pin = digest_of(manifest)
         os.unlink(os.path.join(dest, "cost.schema.json"))
         _assert_contract_error(
-            "MBPF307", verify_schema_bundle, dest, pin
+            "MBPF329", verify_schema_bundle, dest, pin
         )
     with tempfile.TemporaryDirectory() as tmp:
         manifest = export_schema_bundle(tmp)
@@ -2081,7 +2082,7 @@ def test_schema_bundle_rejects_tampering_and_loss():
         ) as handle:
             json.dump(manifest, handle)
         _assert_contract_error(
-            "MBPF307", verify_schema_bundle, tmp, pin
+            "MBPF329", verify_schema_bundle, tmp, pin
         )
 
 
@@ -2103,7 +2104,7 @@ def test_schema_bundle_manifest_pin():
         assert len(pin) == 64
         assert verify_schema_bundle(dest, pin) == manifest
         _assert_contract_error(
-            "MBPF307", verify_schema_bundle, dest, "0" * 64
+            "MBPF329", verify_schema_bundle, dest, "0" * 64
         )
 
 
@@ -2128,7 +2129,7 @@ def test_schema_bundle_pin_rejects_resigned_tampering():
             json.dump(manifest, handle)
         # Self-consistent but resigned, so the pinned check rejects it.
         _assert_contract_error(
-            "MBPF307", verify_schema_bundle, dest, pin
+            "MBPF329", verify_schema_bundle, dest, pin
         )
 
 
@@ -2144,6 +2145,57 @@ def test_schema_bundle_pin_is_required():
             raise AssertionError(
                 "verify_schema_bundle must require a pinned digest"
             )
+
+
+def _emitted_codes(path):
+    # Quoted literals only: emissions are "MBPFnnn" strings,
+    # while range mentions in comments stay backquoted.
+    with open(path, encoding="utf-8") as handle:
+        return set(
+            "MBPF" + digits
+            for digits in re.findall(
+                r"['\"]MBPF([0-9]{3})['\"]", handle.read()
+            )
+        )
+
+
+def test_validation_codes_never_overlap_adapter_codes():
+    # The stable-code contract (diagnostics.py: a code keeps its
+    # meaning) holds across layers: the validation family owns
+    # MBPF323-MBPF334, the adapter owns MBPF301-MBPF322, and the
+    # two sets must stay disjoint whichever side grows next.
+    root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    validation = set()
+    for name in ("models.py", "aggregate.py"):
+        validation |= _emitted_codes(
+            os.path.join(root, "src", "mojobpf", "validation", name)
+        )
+    assert validation == {
+        "MBPF323", "MBPF324", "MBPF325", "MBPF326", "MBPF327",
+        "MBPF328", "MBPF329", "MBPF330", "MBPF331", "MBPF332",
+        "MBPF333", "MBPF334",
+    }, sorted(validation)
+    adapter = set()
+    sources = [
+        os.path.join(root, "compiler", "audit.py"),
+        os.path.join(
+            root, "src", "mojobpf", "resources", "adapter", "audit.py"
+        ),
+    ]
+    lib = os.path.join(root, "compiler", "lib")
+    sources.extend(
+        os.path.join(lib, entry)
+        for entry in sorted(os.listdir(lib))
+        if entry.endswith((".cpp", ".h"))
+    )
+    for path in sources:
+        adapter |= _emitted_codes(path)
+    assert not (validation & adapter), sorted(validation & adapter)
+    assert not (adapter & set("MBPF%d" % code for code in range(323, 335))), (
+        "adapter reached into the validation range"
+    )
 
 
 def _direct_run():

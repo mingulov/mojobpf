@@ -280,7 +280,7 @@ def test_tree_copies_match_authoritative_source():
         checked = mirror_sync.check_tree_mirrors(REPO_ROOT)
     except mirror_sync.MirrorDriftError as exc:
         raise AssertionError(str(exc))
-    assert checked == 3, checked
+    assert checked == 4, checked
 
 
 def test_wheel_matches_authoritative_source():
@@ -557,6 +557,36 @@ def test_admission_descriptor_pinned_and_mirrored():
         assert profile_digest(resolved) == profile_digest(
             literal
         ), profile_id
+
+
+def test_lockfile_pins_every_adapter_sibling():
+    # The lockfile's adapter record must pin exactly the sibling
+    # set the driver enforces: a missing pin refuses with MBPF104
+    # and a stale pin refuses with MBPF102, so drift between the
+    # tuple, the packaged bytes, and the lock breaks every
+    # default-adapter build loudly here instead of downstream.
+    _tree_src_on_path()
+    from mojobpf.build import ADAPTER_SIBLING_FILES
+
+    adapter_dir = os.path.join(
+        REPO_ROOT, "src", "mojobpf", "resources", "adapter"
+    )
+    with open(
+        os.path.join(REPO_ROOT, "toolchains.lock.json"),
+        encoding="utf-8",
+    ) as handle:
+        lock = json.load(handle)
+    siblings = lock["adapter"]["siblings"]
+    assert set(siblings) == set(ADAPTER_SIBLING_FILES), (
+        sorted(siblings),
+        sorted(ADAPTER_SIBLING_FILES),
+    )
+    for name in ADAPTER_SIBLING_FILES:
+        with open(
+            os.path.join(adapter_dir, name), "rb"
+        ) as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        assert siblings[name] == digest, name
 
 
 def _write_hook_pyproject(root):
@@ -938,6 +968,7 @@ def test_wheel_from_sdist_regenerates():
             "compiler/audit.py",
             "compiler/mojo_ir_adapter.py",
             "compiler/admission.json",
+            "compiler/target_proof_table.json",
         ):
             assert any(
                 name.endswith(required) for name in members

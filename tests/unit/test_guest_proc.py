@@ -6401,6 +6401,7 @@ def test_compiler_alias_cleanup_proves_owned_inode_removal(mode, monkeypatch):
                              inputs=_r6_inputs("sources", target))
     paths = {}
     real_rmdir, real_fstat = helper.os.rmdir, helper.os.fstat
+    real_open = helper.os.open
     before = set(os.listdir("/proc/self/fd"))
 
     def consumer(path):
@@ -6410,15 +6411,30 @@ def test_compiler_alias_cleanup_proves_owned_inode_removal(mode, monkeypatch):
             assert handle.read() == b"original source"
         return 0
 
+    def _rmdir_target(path, kwargs):
+        # The pinned cleanup removes through the parent descriptor
+        # (basename plus dir_fd); resolve that shape to the full
+        # pathname so the attack recognizes its target.
+        target = os.fspath(path)
+        dir_fd = kwargs.get("dir_fd")
+        if dir_fd is not None and target != paths.get("root"):
+            try:
+                parent = os.readlink("/proc/self/fd/%d" % dir_fd)
+            except OSError:
+                parent = None
+            if parent is not None:
+                target = os.path.join(parent, target)
+        return target
+
     def remove(path, *args, **kwargs):
-        if os.fspath(path) == paths.get("root"):
+        if _rmdir_target(path, kwargs) == paths.get("root"):
             if mode in ("move_after_stat", "replacement_contents"):
                 moved = paths["root"] + ".moved"
-                os.rename(path, moved)
+                os.rename(paths["root"], moved)
                 paths["moved"] = moved
-                os.mkdir(path)
+                os.mkdir(paths["root"])
                 if mode == "replacement_contents":
-                    sentinel = os.path.join(path, "preserve-me")
+                    sentinel = os.path.join(paths["root"], "preserve-me")
                     with open(sentinel, "wb") as handle:
                         handle.write(b"replacement contents")
                     paths["sentinel"] = sentinel
@@ -6427,9 +6443,22 @@ def test_compiler_alias_cleanup_proves_owned_inode_removal(mode, monkeypatch):
             return result
         return real_rmdir(path, *args, **kwargs)
 
+    def opener(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        # The pinned occupant opens directory-only through the
+        # parent descriptor; record it so the postcondition fault
+        # lands on the proof read, not an unrelated stat.
+        if (
+            kwargs.get("dir_fd") is not None
+            and (flags & os.O_DIRECTORY)
+            and os.fspath(path) == os.path.basename(paths.get("root", ""))
+        ):
+            paths["child"] = fd
+        return fd
+
     def stat(fd):
         if (mode == "postcondition_unreadable" and paths.get("removed") and
-                fd == paths.get("fd")):
+                fd == paths.get("child")):
             raise OSError(errno.EIO, "owned directory postcondition unreadable")
         return real_fstat(fd)
 
@@ -6440,6 +6469,7 @@ def test_compiler_alias_cleanup_proves_owned_inode_removal(mode, monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(helper.os, "rmdir", remove)
             patch.setattr(helper.os, "fstat", stat)
+            patch.setattr(helper.os, "open", opener)
             try:
                 helper.consumes_source(consumer)(target)
             except helper.HarnessEnvironment as exc:

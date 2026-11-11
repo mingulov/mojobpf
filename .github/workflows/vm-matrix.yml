@@ -2,8 +2,9 @@
 # MojoBPF continuous checks.
 #
 # Job map (every lane-owned module executes in exactly one job):
-# unit runs ci/test_lanes.py --lane unit (25 modules, anywhere);
-# compiler runs --lane compiler (84 modules: compiler/tests,
+# unit runs the unit lane through the lane runner (25 modules,
+# anywhere); compiler runs --lane compiler (84 modules:
+# compiler/tests,
 # tests/elf|ir|compile|differential, tests/core, codegen_cost,
 # compiler-owned tests/unit and tests/packaging files); package
 # runs --lane package (sdist + wheel contents); vm-matrix runs

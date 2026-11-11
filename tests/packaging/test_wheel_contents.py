@@ -67,6 +67,7 @@ PINNED_PAYLOAD = (
     "mojobpf/resources/adapter/admission.json",
     "mojobpf/resources/adapter/audit.py",
     "mojobpf/resources/adapter/mojo_ir_adapter.py",
+    "mojobpf/resources/adapter/target_proof_table.json",
     "mojobpf/resources/sdk/mojobpf/checksum.mojo",
     "mojobpf/resources/sdk/mojobpf/core.mojo",
     "mojobpf/resources/sdk/mojobpf/events.mojo",
@@ -305,6 +306,7 @@ def test_adapter_sync():
         "mojobpf/resources/adapter/admission.json",
         "mojobpf/resources/adapter/audit.py",
         "mojobpf/resources/adapter/mojo_ir_adapter.py",
+        "mojobpf/resources/adapter/target_proof_table.json",
     ]
     for shipped, source in SYNCED_FILES:
         with open(

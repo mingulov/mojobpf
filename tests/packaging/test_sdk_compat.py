@@ -406,6 +406,46 @@ IMPORT_PROBES = (
         False,
         None,
     ),
+    (
+        "compat_import_multi_ok",
+        "import mojobpf.packet, mojobpf.core\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
+    (
+        "compat_import_multi_std",
+        "import mojobpf.packet, std.random\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
+    (
+        "compat_import_multi_bad_second",
+        "import mojobpf.packet, mojobpf._impl\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
+    (
+        "compat_import_multi_bad_first",
+        "import mojobpf._impl, mojobpf.packet\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
+    (
+        "compat_import_multi_bad_alias",
+        "import mojobpf.packet as pkt, mojobpf._impl as e\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
 )
 
 

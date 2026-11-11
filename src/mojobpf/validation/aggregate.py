@@ -4,15 +4,16 @@
 :func:`aggregate` implements ``aggregate(plan, results) -> GateDecision``.
 It accepts :class:`CaseResult` objects or plain mappings; malformed
 records are preserved as rejected attempts and force a non-PASS verdict
-rather than raising. Every rejection carries a stable ``MBPF31x`` code:
+rather than raising. Every rejection carries a stable ``MBPF330``-``MBPF334``
+code (the adapter owns ``MBPF301``-``MBPF322``; the ranges never overlap):
 
-* ``MBPF310``: unplanned case, unknown target cell, or an attempt
+* ``MBPF330``: unplanned case, unknown target cell, or an attempt
   number beyond the sealed ``expected_attempts``.
-* ``MBPF311``: identity or hash mismatch (plan, revisions, source,
+* ``MBPF331``: identity or hash mismatch (plan, revisions, source,
   object, consumer, fixture, corpus, run).
-* ``MBPF312``: duplicate result for one (case, target, attempt).
-* ``MBPF313``: broken attempt chain (retry replaced an earlier attempt).
-* ``MBPF314``: inconsistent verdict (PASS on an unavailable cell, or a
+* ``MBPF332``: duplicate result for one (case, target, attempt).
+* ``MBPF333``: broken attempt chain (retry replaced an earlier attempt).
+* ``MBPF334``: inconsistent verdict (PASS on an unavailable cell, or a
   final outcome the evidence cannot support).
 
 Verdict precedence is FAIL, then INCOMPLETE, then PASS. A denial case
@@ -80,7 +81,7 @@ class GateDecision:
         """Return the terminal SuiteResult record for this decision."""
         if self.suite is None:
             raise ContractError(
-                "MBPF314",
+                "MBPF334",
                 "no suite record: aggregation saw no run_id",
                 stage=STAGE_AGGREGATE,
             )
@@ -240,7 +241,7 @@ def aggregate(
         if cell not in expected_set:
             _reject(
                 rejected,
-                "MBPF310",
+                "MBPF330",
                 "unplanned cell %s" % label,
                 index,
                 label,
@@ -251,7 +252,7 @@ def aggregate(
         if key in seen:
             _reject(
                 rejected,
-                "MBPF312",
+                "MBPF332",
                 "duplicate result for %s attempt %d"
                 % (label, result.attempt),
                 index,
@@ -264,7 +265,7 @@ def aggregate(
         if result.attempt > case.expected_attempts:
             _reject(
                 rejected,
-                "MBPF310",
+                "MBPF330",
                 "%s: unplanned attempt %d beyond sealed expectation %d"
                 % (label, result.attempt, case.expected_attempts),
                 index,
@@ -313,7 +314,7 @@ def aggregate(
         if problems:
             _reject(
                 rejected,
-                "MBPF311",
+                "MBPF331",
                 "%s: %s" % (label, "; ".join(problems)),
                 index,
                 label,
@@ -325,7 +326,7 @@ def aggregate(
         ):
             _reject(
                 rejected,
-                "MBPF314",
+                "MBPF334",
                 "%s: PASS on %s cell cannot increment PASS"
                 % (label, result.applicability),
                 index,
@@ -340,7 +341,7 @@ def aggregate(
         for result in accepted:
             _reject(
                 rejected,
-                "MBPF311",
+                "MBPF331",
                 "%s: mixed run_id %r in one suite"
                 % (
                     _cell_id(result.case_id, result.target_fingerprint),
@@ -368,7 +369,7 @@ def aggregate(
             for result in per_cell[cell]:
                 _reject(
                     rejected,
-                    "MBPF313",
+                    "MBPF333",
                     "%s: broken attempt chain %s" % (label, attempts),
                     -1,
                     label,
@@ -403,7 +404,7 @@ def aggregate(
         if not cell_results:
             if any(
                 entry.get("cell") == label
-                and entry.get("code") in ("MBPF312", "MBPF313")
+                and entry.get("code") in ("MBPF332", "MBPF333")
                 for entry in rejected
             ):
                 buckets["failed"].append(label)
@@ -806,7 +807,7 @@ def verify_suite_result(
     )
     if checked_suite.plan_hash != checked_plan.plan_hash:
         raise ContractError(
-            "MBPF311",
+            "MBPF331",
             "suite plan_hash does not match the plan",
             "suite",
             None,
@@ -815,7 +816,7 @@ def verify_suite_result(
     decision = aggregate(checked_plan, results)
     if decision.suite is None:
         raise ContractError(
-            "MBPF314",
+            "MBPF334",
             "suite binds no run_id",
             "suite",
             None,
@@ -833,7 +834,7 @@ def verify_suite_result(
     ):
         if actual[key] != expected[key]:
             raise ContractError(
-                "MBPF314",
+                "MBPF334",
                 "suite %s does not match recomputed aggregation" % key,
                 "suite",
                 None,

@@ -112,10 +112,13 @@ EXIT_TEST = 6
 EXIT_INTERRUPTED = 130
 
 # Diagnostic codes that mean the manifest (or its profile request)
-# is unusable: exit 2. MBPF212 stays a compile failure (exit 4):
-# a malformed adapter response or driver-built bad request is not a
-# manifest-meaning error. MBPF102/104 (pin mismatch, lockfile
-# problem) mean the environment is unusable: exit 3.
+# is unusable: exit 2. MBPF212 is excluded from that set (it
+# stays a compile failure, exit 4): a malformed adapter
+# response or driver-built bad request is not a
+# manifest-meaning error. Every other failure code also exits
+# 4 through _build_exit_code's fallthrough; only the codes
+# below (and MBPF102/104 pin/lockfile problems, exit 3)
+# divert from it.
 MANIFEST_EXIT_CODES = frozenset(
     ["MBPF101"]
     + ["MBPF%03d" % code for code in range(201, 212)]

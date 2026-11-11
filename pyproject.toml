@@ -65,4 +65,5 @@ files = [
     "adapter_service.py",
     "audit.py",
     "mojo_ir_adapter.py",
+    "target_proof_table.json",
 ]

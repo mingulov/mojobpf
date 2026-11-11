@@ -27,6 +27,10 @@ SYNCED_FILES = (
         "mojobpf/resources/adapter/mojo_ir_adapter.py",
         "compiler/mojo_ir_adapter.py",
     ),
+    (
+        "mojobpf/resources/adapter/target_proof_table.json",
+        "compiler/target_proof_table.json",
+    ),
 )
 
 

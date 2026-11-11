@@ -1698,6 +1698,46 @@ def test_verify_gate_parsed_object_kind_mismatch_rejected():
             shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
+def test_verify_gate_parsed_object_kind_five_rejected():
+    # Per-CPU hash has no parsed lowering (the contract
+    # comparison refuses it with MBPF219 before any object
+    # exists), so a type-5 BTF map on the parsed arm names no
+    # reviewed parsed-route kind: the gate refuses with
+    # MBPF216 instead of reconciling it. The staged object is
+    # an honest Lane-A per-CPU-hash build cross-wired onto
+    # the parsed arm, which honest builds never produce.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        PERCPUHASH_RMW_SOURCES[4], "xdp_entry",
+        "crosswire_percpuhash_obj", True,
+        max_entries=4, map_type="percpu_hash",
+        template=PERCPUHASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert result.work_dir is not None
+        adapted = os.path.join(
+            result.work_dir, "xdp_entry.adapter", "adapted.ll"
+        )
+        assert os.path.isfile(adapted), adapted
+        staged = os.path.join(
+            result.work_dir, "xdp_entry.bpf.o"
+        )
+        assert os.path.isfile(staged), staged
+        manifest = parse_manifest(manifest_path)
+        program = manifest.programs[0]
+        outcome = _verify_gate_outcome(
+            manifest, program, staged, adapted, "parsed",
+        )
+        assert [item.code for item in outcome] == ["MBPF216"], outcome
+        assert outcome[0].stage == "build.backend", outcome
+        assert "no reviewed parsed-route map kind" in outcome[0].explanation, outcome
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
 def _check_hash_shape_builds(source, entries, artifact):
     manifest_path, out_dir = write_project(
         source, "xdp_entry", artifact, True,

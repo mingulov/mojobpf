@@ -169,6 +169,7 @@ Standard library only.
 """
 
 import json
+import os
 import re
 
 STAGE_AUDIT = "adapter.audit"
@@ -662,13 +663,39 @@ ADMITTED_MODES = (
 # Modes whose release artifacts come from the parsed LLVM route.
 # A mode flips only with its layout + negative evidence re-proven
 # through the parsed lane plus an approved target-proof-table row
-# (Lane-A amendment promotion criteria). All start false.
+# (Lane-A amendment promotion criteria). The frozenset alone
+# qualifies nothing: parsed_qualified() conjoins it with the
+# table, so a mode without an approved row stays lane-a.
 PARSED_QUALIFIED_MODES = frozenset({"classifier", "subprog", "map", "combined", "tracepoint", "event", "uprobe", "reserve", "core", "skb"})
 
 
-def parsed_qualified(mode):
-    """True when the mode's release artifacts come from parsed."""
-    return mode in PARSED_QUALIFIED_MODES
+def parsed_qualified(mode, table_path=None):
+    """True when the mode's release artifacts come from parsed.
+
+    The frozenset names the candidate modes; the
+    target-proof table (beside this module, mirrored into the
+    packaged adapter) approves them one row per mode. A mode
+    qualifies only with both. A missing or malformed table
+    raises TableError: a corrupt approval record fails
+    loudly, never as a silent lane-a downgrade or a silent
+    parsed admission. Tests pass table_path explicitly.
+    """
+    if mode not in PARSED_QUALIFIED_MODES:
+        return False
+    if table_path is None:
+        table_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "target_proof_table.json",
+        )
+    try:
+        with open(table_path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise TableError(
+            "cannot read target-proof table %s: %s"
+            % (table_path, exc)
+        )
+    return mode in validate_target_proof_table(raw)
 
 
 class TableError(ValueError):

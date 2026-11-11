@@ -3535,6 +3535,36 @@ def test_publish_recheck_restored_mtime_rewrite_rejected():
         ] == []
 
 
+def test_publish_oversized_predecessor_refuses_bounded_backup():
+    # Published artifacts are bounded by construction, so a
+    # predecessor past OBJECT_LIMIT is foreign: the backup
+    # refuses instead of copying it without bound, and no
+    # partial backup survives.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"STAGED-NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        with open(victim, "wb") as handle:
+            handle.write(b"X" * (evidence_module.OBJECT_LIMIT + 1))
+        exc = _expect_error(
+            lambda: publish([("a.bpf.o", staged)], out_dir),
+            "MBPF106",
+            "evidence.publish",
+        )
+        assert "cannot back up" in exc.diagnostic.explanation
+        assert "staged bound" in exc.diagnostic.explanation
+        with open(victim, "rb") as handle:
+            assert len(handle.read()) == (
+                evidence_module.OBJECT_LIMIT + 1
+            )
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
 def test_publish_second_file_recheck_failure_rolls_back_first():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:

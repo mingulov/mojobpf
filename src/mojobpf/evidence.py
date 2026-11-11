@@ -1402,8 +1402,11 @@ def _copy_fd_to_fd(
 ) -> None:
     """Copy bytes between descriptors, tolerating short writes.
 
-    When ``limit`` is set, the copy is refused past that many bytes
-    (the staged-copy bound; predecessor backups stay unbounded).
+    When ``limit`` is set, the copy is refused past that many bytes.
+    Both the staged copy and the predecessor backup run under
+    ``OBJECT_LIMIT``: published artifacts are bounded by
+    construction, so an oversized predecessor is foreign and
+    refuses instead of filling the disk.
     """
     total = 0
     while True:
@@ -1526,7 +1529,17 @@ def _back_up_predecessor(
                     final_path,
                     "republish into a stable directory",
                 )
-            _copy_fd_to_fd(src_fd, backup_fd)
+            try:
+                _copy_fd_to_fd(
+                    src_fd, backup_fd, limit=OBJECT_LIMIT
+                )
+            except OSError as exc:
+                raise _publish_fail(
+                    "cannot publish %r: cannot back up %r: %s"
+                    % (name, final_path, exc),
+                    final_path,
+                    "clear the blocking path or publish elsewhere",
+                ) from None
             os.fchmod(backup_fd, stat.S_IMODE(current.st_mode))
         finally:
             _close_quietly(src_fd)

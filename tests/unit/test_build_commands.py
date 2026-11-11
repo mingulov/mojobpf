@@ -3035,6 +3035,20 @@ def test_cli_build_exit_mapping_adapter_contract():
     assert "MBPF212" in err
 
 
+def test_cli_exit_vocabulary_pinned():
+    # The CLI exits only these codes: 0 ok, 2 usage, 3
+    # environment, 4 compile, 5 verify/loader, 6 test, and
+    # 130 for SIGINT (128 + signal number, the Unix
+    # convention -- the one value above 6, by design).
+    assert cli_module.EXIT_OK == 0
+    assert cli_module.EXIT_USAGE == 2
+    assert cli_module.EXIT_ENVIRONMENT == 3
+    assert cli_module.EXIT_COMPILE == 4
+    assert cli_module.EXIT_VERIFY_LOADER == 5
+    assert cli_module.EXIT_TEST == 6
+    assert cli_module.EXIT_INTERRUPTED == 130
+
+
 def test_adapter_huge_response_refused_naming_limit():
     # The adapter response document is a capped file read: a valid
     # 2 MiB response is refused with the byte limit named.

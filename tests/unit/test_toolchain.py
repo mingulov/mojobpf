@@ -1051,6 +1051,7 @@ def _measured_adapter_pins():
                 "mojo_ir_adapter.py",
                 "audit.py",
                 "admission.json",
+                "target_proof_table.json",
             )
         },
     }

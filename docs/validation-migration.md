@@ -61,8 +61,8 @@ cannot express full `expected`/`observed` equality for arbitrary JSON
 values: JSON Schema has no cross-property comparison, so no schema
 clause can state "`observed.value` equals `expected.value`" for
 per-case payloads. That equality is enforced only by the Python
-parser (`CaseResult.from_dict`, `MBPF305`) and the gate
-(`aggregate`, `MBPF311`/`MBPF314`).
+parser (`CaseResult.from_dict`, `MBPF327`) and the gate
+(`aggregate`, `MBPF331`/`MBPF334`).
 
 Concretely, a `PASS` record with expected `value: 42` and observed
 `value: 41` is schema-valid but rejected by the parser, and every

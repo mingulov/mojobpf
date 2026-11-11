@@ -42,18 +42,19 @@ SDK_ROOT = os.path.join(
 SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 
 # Checker truth table: (source, expected violation count).
-# Seven rows are re-verified against the genuine Mojo 1.1.0
+# Twelve rows are re-verified against the genuine Mojo 1.1.0
 # frontend on every run of the packaging compatibility suite
 # (``mojo build --emit llvm -I <sdk>``): the plain accept, the
 # parenthesized-list accept, the ``as``-alias accept, the
-# unknown name, the unknown module, the wrong-module name, and
-# the deeper path
+# unknown name, the unknown module, the wrong-module name, the
+# deeper path, and the five multi-module plain-import rows
 # (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``).
-# The remaining fourteen rows (module-only imports, ``std.*``
+# The eighteen static rows (module-only imports, ``std.*``
 # ignores, the empty import, the alternate unknown-module
-# spellings, and the core-module accept/reject rows) rest on
-# one-time manual observation against the same frontend. Accept
-# rows exit 0; reject rows exit 1 with a source-layer diagnostic.
+# spellings, the core-module accept/reject rows, and the
+# string-paren line-join rows) rest on one-time manual
+# observation against the same frontend. Accept rows exit 0;
+# reject rows exit 1 with a source-layer diagnostic.
 CHECKER_CASES = (
     ("from mojobpf.packet import XDP_PASS\n", 0),
     ("from mojobpf.core import core_read_task_pid\n", 0),
@@ -82,6 +83,11 @@ CHECKER_CASES = (
     ('x = f("a)b")\nfrom mojobpf import _impl\n', 1),
     ('print("unbalanced (")\nfrom mojobpf import _impl\n', 1),
     ("from mojobpf import packet  # (note)\n", 0),
+    ("import mojobpf.packet, mojobpf.core\n", 0),
+    ("import mojobpf.packet, mojobpf._impl\n", 1),
+    ("import mojobpf._impl, mojobpf.packet\n", 1),
+    ("import mojobpf.packet as pkt, mojobpf._impl as e\n", 1),
+    ("import mojobpf.packet, std.random\n", 0),
 )
 
 

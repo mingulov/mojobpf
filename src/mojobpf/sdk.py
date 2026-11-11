@@ -881,23 +881,32 @@ def check_mojo_imports(text: str) -> tuple[ImportViolation, ...]:
                         )
                     )
         else:
-            parts = rest.split()
-            if parts[:1] == ["as"]:
-                parts = parts[2:]
-            path = dotted
-            if len(path.split(".")) > 2:
-                violations.append(
-                    ImportViolation(
-                        line=lineno,
-                        statement=statement,
-                        explanation=(
-                            "module path %r is deeper than "
-                            "mojobpf.<module>" % path
-                        ),
+            # Plain `import`: every comma-separated module judges,
+            # not just the first (`import mojobpf.maps,
+            # mojobpf.evil` must flag the second). Aliases split
+            # off per module; non-mojobpf modules skip like the
+            # statement-level filter above.
+            for path in _split_import_names(
+                dotted if not rest else dotted + "," + rest
+            ):
+                if path != "mojobpf" and not path.startswith(
+                    "mojobpf."
+                ):
+                    continue
+                if len(path.split(".")) > 2:
+                    violations.append(
+                        ImportViolation(
+                            line=lineno,
+                            statement=statement,
+                            explanation=(
+                                "module path %r is deeper than "
+                                "mojobpf.<module>" % path
+                            ),
+                        )
                     )
-                )
-                continue
-            if path != "mojobpf":
+                    continue
+                if path == "mojobpf":
+                    continue
                 module = path.split(".")[1]
                 if module not in SDK_EXPORTS:
                     violations.append(

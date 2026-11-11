@@ -524,11 +524,15 @@ IDENTITY_CASES = ([('source', binding, operation) for binding in
 
 @pytest.mark.parametrize('frontend_emit', ['llvm', 'llvm-bitcode'])
 @pytest.mark.parametrize('lifetime', ['alive', 'erased'])
-def test_native_byte_identical_replacement_refuses_before_mutation(tmp_path,identity_caller,frontend_emit,lifetime,subtests):
+def test_native_byte_identical_replacement_refuses_before_mutation(tmp_path,identity_caller,frontend_emit,lifetime):
+    # No pytest-subtests plugin: the lane disables plugin
+    # autoload, so every identity case runs inline and reports
+    # its own failure. All cases execute; nothing stops early.
     raw = capture(tmp_path,ROOT/'tests/compile/map_roundtrip.mojo',frontend_emit)
     original = digest(raw)
+    failures = []
     for phase,binding,operation in IDENTITY_CASES:
-        with subtests.test(phase=phase,binding=binding,operation=operation):
+        try:
             def no_core(): resource.setrlimit(resource.RLIMIT_CORE,(0,0))
             result = run([identity_caller,raw,phase,binding,lifetime,operation],preexec_fn=no_core)
             assert result.returncode == 0, result.stdout + result.stderr
@@ -540,6 +544,9 @@ def test_native_byte_identical_replacement_refuses_before_mutation(tmp_path,iden
                 assert all(proof[key] > 0 for key in ('cached_primitives','cached_helpers','cached_scratch','cached_inert','cached_key_uses'))
             else:
                 assert all(proof[key] == 0 for key in ('cached_primitives','cached_helpers','cached_scratch','cached_inert','cached_key_uses'))
+        except AssertionError as exc:
+            failures.append('%s/%s/%s: %s' % (phase, binding, operation, exc))
+    assert not failures, '\n'.join(failures)
     assert digest(raw) == original
 
 

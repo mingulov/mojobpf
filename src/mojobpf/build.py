@@ -403,12 +403,14 @@ def _transforms_for_routes(routes):
 
 # Adapter implementation files sealed with the build: the service
 # wrapper itself (always) plus these siblings when present next
-# to it (the transform cannot run without its modules, and
-# neither route admits a profile without the descriptor).
+# to it (the transform cannot run without its modules, neither
+# route admits a profile without the descriptor, and the parsed
+# gate qualifies no mode without its approval table).
 ADAPTER_SIBLING_FILES = (
     "mojo_ir_adapter.py",
     "audit.py",
     "admission.json",
+    "target_proof_table.json",
 )
 
 # MIR fixed-frame assertion for map-mode objects: no fixed frame
@@ -521,15 +523,17 @@ MAP_TYPE_IDS = {
 # BTF map-type ids the parsed route can emit, valued in the
 # manifest spelling vocabulary (the gate compares against
 # declared.map_type, and the Lane-A marker arm speaks
-# spellings too). The spec contract admits all five
-# single-map kinds (array 2, hash 1, LRU 9, percpu 6,
-# per-CPU hash 5), one kind per commit; the parsed lowering
-# consumes kind tags into helper-call operands, so the staged
-# object's BTF attributes (not the adapted text) are the built
-# kind evidence on this route.
+# spellings too). Four single-map kinds flipped (array 2,
+# hash 1, LRU 9, percpu 6), one kind per commit; per-CPU
+# hash (5) has no parsed lowering (the contract comparison
+# refuses it with MBPF219 before any object exists), so a
+# type-5 BTF map on the parsed arm names no reviewed kind
+# and fails closed. The parsed lowering consumes kind tags
+# into helper-call operands, so the staged object's BTF
+# attributes (not the adapted text) are the built kind
+# evidence on this route.
 PARSED_MAP_TYPE_KINDS = {
     2: "array", 1: "hash", 9: "lru_hash", 6: "percpu_array",
-    5: "percpu_hash",
 }
 # Declared value-type vocabulary to BTF value sizes in bytes. Every
 # profile-admitted keyed-map value type has an entry here; a

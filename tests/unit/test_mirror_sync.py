@@ -43,7 +43,7 @@ def _fake_root(drift_audit=False, drop_service=False):
 
 
 def test_committed_tree_in_sync():
-    assert mirror_sync.check_tree_mirrors(REPO_ROOT) == 3
+    assert mirror_sync.check_tree_mirrors(REPO_ROOT) == 4
     print("PASS committed tree in sync")
 
 

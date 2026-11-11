@@ -235,6 +235,7 @@
   "src/mojobpf/resources/adapter/admission.json",
   "src/mojobpf/resources/adapter/audit.py",
   "src/mojobpf/resources/adapter/mojo_ir_adapter.py",
+  "src/mojobpf/resources/adapter/target_proof_table.json",
   "src/mojobpf/resources/sdk/mojobpf/checksum.mojo",
   "src/mojobpf/resources/sdk/mojobpf/core.mojo",
   "src/mojobpf/resources/sdk/mojobpf/events.mojo",

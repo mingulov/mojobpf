@@ -191,6 +191,31 @@ locations for every code.
 | MBPF321 | Instruction outside the audited opcode subset (including a second instruction, stray word, or constant expression on one line) |
 | MBPF322 | Atomic or volatile memory access (orderings unqualified) |
 
+### Validation contracts (MBPF323-MBPF334)
+
+The frozen `test-contracts-v1` / `suite-result-v1` parsers
+(`mojobpf.validation`) own this range; it never overlaps the
+adapter's `MBPF301`-`MBPF322` above (pinned by
+`tests/unit/test_validation_contracts.py::test_validation_codes_never_overlap_adapter_codes`).
+Stages are the contract layers (`validation.contract`,
+`validation.bundle`, `validation.aggregate`, and the record
+locations); every code below has severity `error`.
+
+| Code | Meaning |
+| ---- | ------- |
+| MBPF323 | Value must be a JSON object |
+| MBPF324 | Unknown field |
+| MBPF325 | Missing required field |
+| MBPF326 | Unsupported schema_version (test-contracts-v1 reads 1 only) |
+| MBPF327 | Value-shape violation (enum membership, non-empty string, integer shape, integer range, array shape, finite number, string keys, or JSON-value shape) |
+| MBPF328 | Fingerprint or plan_hash mismatch (stored versus recomputed) |
+| MBPF329 | Schema-bundle failure (schemas not found, unknown schema, or unloadable schema) |
+| MBPF330 | Unplanned cell, or an attempt beyond the sealed expected_attempts |
+| MBPF331 | Result identity or hash mismatch (plan, revisions, source, object, consumer, fixture, corpus, run), or mixed run_id in one suite |
+| MBPF332 | Duplicate result for one (case, target, attempt) |
+| MBPF333 | Broken attempt chain (a retry replaced an earlier attempt) |
+| MBPF334 | Inconsistent verdict (no suite record, or PASS on a cell that cannot increment PASS) |
+
 The internal parsed reader's candidate model uses typed values and CFG
 facts. It keeps matching audit codes, including `MBPF316` for storing
 address-derived comparison bits and `MBPF305` for unsupported numeric

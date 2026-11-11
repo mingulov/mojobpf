@@ -238,7 +238,50 @@ def _under_repo(path):
         return True
 
 
+# Names setuptools owns directly under build/ after `pip wheel`
+# (per-invocation bdist/temp/scripts directories match by prefix
+# in _clean_wheel_build_dir).
+_SETUPTOOLS_BUILD_NAMES = frozenset({"lib"})
+
+
+def _clean_wheel_build_dir(build_dir, before):
+    """Remove setuptools residue; preserve foreign build/ entries.
+
+    Only setuptools-owned names and entries created by this
+    invocation are removed. Foreign entries such as ``lower/``
+    (the separately built lowering binary) survive: lanes run
+    module-per-process serially, so the before/after snapshot
+    cannot race another builder.
+    """
+    if not os.path.isdir(build_dir):
+        return
+    for entry in sorted(os.listdir(build_dir)):
+        if entry in before and (
+            entry not in _SETUPTOOLS_BUILD_NAMES
+            and not entry.startswith(("bdist.", "temp.", "scripts-"))
+        ):
+            continue
+        target = os.path.join(build_dir, entry)
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+    try:
+        os.rmdir(build_dir)
+    except OSError:
+        pass
+
+
 def _build_wheel(parent):
+    build_dir = os.path.join(REPO_ROOT, "build")
+    before = (
+        set(os.listdir(build_dir))
+        if os.path.isdir(build_dir)
+        else set()
+    )
     proc = _run(
         [
             sys.executable,
@@ -255,12 +298,10 @@ def _build_wheel(parent):
         dict(os.environ),
         600,
     )
-    for path in (
-        os.path.join(REPO_ROOT, "build"),
-        os.path.join(REPO_ROOT, "src", "mojobpf.egg-info"),
-    ):
-        if os.path.exists(path):
-            shutil.rmtree(path, ignore_errors=True)
+    _clean_wheel_build_dir(build_dir, before)
+    egg_info = os.path.join(REPO_ROOT, "src", "mojobpf.egg-info")
+    if os.path.exists(egg_info):
+        shutil.rmtree(egg_info, ignore_errors=True)
     if proc.returncode != 0:
         raise EnvironmentFailure(
             "pip wheel failed (exit %d):\n%s\n%s"
@@ -719,6 +760,7 @@ def fixture():
                 "mojo_ir_adapter.py",
                 "audit.py",
                 "admission.json",
+                "target_proof_table.json",
             )
         },
     }

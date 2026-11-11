@@ -5,8 +5,9 @@ This module implements ``test-contracts-v1`` (case/target/fixture/run-plan
 records) and the ``suite-result-v1`` terminal record. The JSON schemas under
 ``schemas/`` are the frozen cross-consumer contract; the parsers here are the
 Python enforcement. Every malformed input fails deterministically with a
-stable ``MBPF3xx`` diagnostic code; unknown fields and unknown schema
-versions are never partially interpreted.
+stable ``MBPF323``-``MBPF329`` diagnostic code (the adapter owns
+``MBPF301``-``MBPF322``; the ranges never overlap); unknown fields
+and unknown schema versions are never partially interpreted.
 
 Contract acquisition for standalone consumers (no sibling checkout needed,
 works from an installed ``mojobpf`` package or an unpacked source archive
@@ -138,7 +139,7 @@ SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ContractError(MojobpfError):
-    """Stable contract violation carrying one MBPF3xx diagnostic."""
+    """Stable contract violation carrying one MBPF323-MBPF334 diagnostic."""
 
     def __init__(
         self,
@@ -231,7 +232,7 @@ def _is_exact_int(value: Any, want: int) -> bool:
 def _require_mapping(value: Any, what: str, location: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise _fail(
-            "MBPF301", "%s must be a JSON object" % what, location=location
+            "MBPF323", "%s must be a JSON object" % what, location=location
         )
     return value
 
@@ -245,7 +246,7 @@ def _check_keys(
     for key in required:
         if key not in mapping:
             raise _fail(
-                "MBPF303",
+                "MBPF325",
                 "missing required field %r" % key,
                 location=location,
             )
@@ -253,14 +254,14 @@ def _check_keys(
     for key in mapping:
         if key not in allowed:
             raise _fail(
-                "MBPF302", "unknown field %r" % key, location=location
+                "MBPF324", "unknown field %r" % key, location=location
             )
 
 
 def _check_version(mapping: Mapping[str, Any], location: str) -> None:
     if not _is_exact_int(mapping.get("schema_version"), SCHEMA_VERSION):
         raise _fail(
-            "MBPF304",
+            "MBPF326",
             "unsupported schema_version %r; test-contracts-v1 reads 1 only"
             % (mapping.get("schema_version"),),
             location=location,
@@ -276,7 +277,7 @@ def _check_enum(
         member = False
     if not member:
         raise _fail(
-            "MBPF305",
+            "MBPF327",
             "%s must be one of %s, got %r"
             % (what, sorted(allowed), value),
             location=location,
@@ -289,7 +290,7 @@ def _check_str(
 ) -> str:
     if not isinstance(value, str) or (not allow_empty and not value):
         raise _fail(
-            "MBPF305",
+            "MBPF327",
             "%s must be a non-empty string" % what,
             location=location,
         )
@@ -302,7 +303,7 @@ def _check_pattern(
     text = _check_str(value, what, location)
     if not pattern.match(text):
         raise _fail(
-            "MBPF305", "%s has invalid shape: %r" % (what, text),
+            "MBPF327", "%s has invalid shape: %r" % (what, text),
             location=location,
         )
     return text
@@ -317,17 +318,17 @@ def _check_int(
 ) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise _fail(
-            "MBPF305", "%s must be an integer" % what, location=location
+            "MBPF327", "%s must be an integer" % what, location=location
         )
     if minimum is not None and value < minimum:
         raise _fail(
-            "MBPF305",
+            "MBPF327",
             "%s must be >= %d" % (what, minimum),
             location=location,
         )
     if maximum is not None and value > maximum:
         raise _fail(
-            "MBPF305",
+            "MBPF327",
             "%s must be <= %d" % (what, maximum),
             location=location,
         )
@@ -338,7 +339,7 @@ def _check_str_list(value: Any, what: str, location: str) -> list[str]:
     """Require a JSON array of non-empty strings (never null/scalar)."""
     if not isinstance(value, list):
         raise _fail(
-            "MBPF305", "%s must be an array" % what, location=location
+            "MBPF327", "%s must be an array" % what, location=location
         )
     return [
         _check_str(entry, "%s entry" % what, location) for entry in value
@@ -357,7 +358,7 @@ def _check_json_value(value: Any, what: str, location: str) -> Any:
                 float("inf"), float("-inf")
             ):
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "%s must be a finite number" % label,
                     location=location,
                 )
@@ -371,14 +372,14 @@ def _check_json_value(value: Any, what: str, location: str) -> Any:
             for key, entry in current.items():
                 if not isinstance(key, str):
                     raise _fail(
-                        "MBPF305",
+                        "MBPF327",
                         "%s object keys must be strings" % label,
                         location=location,
                     )
                 stack.append((entry, "%s[%s]" % (label, key)))
             continue
         raise _fail(
-            "MBPF305",
+            "MBPF327",
             "%s must be a JSON value (number, string, boolean, null, "
             "array or object)" % label,
             location=location,
@@ -407,7 +408,7 @@ def _check_behavior(value: Any, location: str) -> dict[str, Any]:
     if mapping["outcome"] == OUTCOME_PASS:
         if stage is not None:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "failure_stage must be null when outcome is PASS",
                 location=location,
             )
@@ -479,7 +480,7 @@ def schemas_dir() -> Path:
     if (source / "result.schema.json").is_file():
         return source
     raise _fail(
-        "MBPF307",
+        "MBPF329",
         "contract schemas not found (checked installed package data and %s)"
         % source,
         stage=STAGE_BUNDLE,
@@ -493,7 +494,7 @@ def load_schema(name: str) -> dict[str, Any]:
     """
     filename = "%s.schema.json" % name
     if filename not in SCHEMA_FILES:
-        raise _fail("MBPF307", "unknown schema %r" % name,
+        raise _fail("MBPF329", "unknown schema %r" % name,
                     stage=STAGE_BUNDLE)
     path = schemas_dir() / filename
     try:
@@ -501,7 +502,7 @@ def load_schema(name: str) -> dict[str, Any]:
             data = json.load(handle)
     except (OSError, ValueError) as exc:
         raise _fail(
-            "MBPF307", "cannot load schema %s: %s" % (filename, exc),
+            "MBPF329", "cannot load schema %s: %s" % (filename, exc),
             stage=STAGE_BUNDLE,
         )
     return _require_mapping(data, "schema %s" % filename, filename)  # type: ignore[return-value]
@@ -511,13 +512,13 @@ def schema_digest(name: str) -> str:
     """Return the SHA-256 hex digest of one frozen schema file's bytes."""
     filename = "%s.schema.json" % name
     if filename not in SCHEMA_FILES:
-        raise _fail("MBPF307", "unknown schema %r" % name,
+        raise _fail("MBPF329", "unknown schema %r" % name,
                     stage=STAGE_BUNDLE)
     try:
         raw = (schemas_dir() / filename).read_bytes()
     except OSError as exc:
         raise _fail(
-            "MBPF307", "cannot read schema %s: %s" % (filename, exc),
+            "MBPF329", "cannot read schema %s: %s" % (filename, exc),
             stage=STAGE_BUNDLE,
         )
     return hashlib.sha256(raw).hexdigest()
@@ -594,7 +595,7 @@ class TargetManifest:
         modules = btf.get("modules", [])
         if not isinstance(modules, list):
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "btf.modules must be an array",
                 location="target.btf",
             )
@@ -743,7 +744,7 @@ class TargetManifest:
             shared = probed.get("shared_objects", [])
             if not isinstance(shared, list):
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "probed_process.shared_objects must be an array",
                     location="target.probed_process",
                 )
@@ -758,7 +759,7 @@ class TargetManifest:
         recomputed = cls.fingerprint_of(mapping)
         if recomputed != fingerprint:
             raise _fail(
-                "MBPF306",
+                "MBPF328",
                 "target fingerprint mismatch: stored %s, recomputed %s"
                 % (fingerprint, recomputed),
                 location="target",
@@ -776,7 +777,7 @@ class TargetManifest:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed TargetManifest instance: %s" % (exc,),
                 location="target",
             )
@@ -821,7 +822,7 @@ class Fixture:
         entries = mapping["entries"]
         if not isinstance(entries, list) or not entries:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "entries must be a non-empty array",
                 location="fixture",
             )
@@ -837,7 +838,7 @@ class Fixture:
             )
             if symbol in seen_entries:
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "duplicate entry symbol %r" % symbol,
                     location=where,
                 )
@@ -847,7 +848,7 @@ class Fixture:
         maps = mapping["maps"]
         if not isinstance(maps, list):
             raise _fail(
-                "MBPF305", "maps must be an array", location="fixture"
+                "MBPF327", "maps must be an array", location="fixture"
             )
         seen_maps: set[str] = set()
         for index, entry in enumerate(maps):
@@ -862,7 +863,7 @@ class Fixture:
             name = _check_pattern(item["name"], SYMBOL_RE, "map name", where)
             if name in seen_maps:
                 raise _fail(
-                    "MBPF305", "duplicate map name %r" % name,
+                    "MBPF327", "duplicate map name %r" % name,
                     location=where,
                 )
             seen_maps.add(name)
@@ -940,7 +941,7 @@ class Fixture:
         barriers = mapping["barriers"]
         if not isinstance(barriers, list) or not barriers:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "barriers must be a non-empty array",
                 location="fixture",
             )
@@ -948,7 +949,7 @@ class Fixture:
             _check_enum(barrier, BARRIERS, "barrier", "fixture")
         if len(set(barriers)) != len(barriers):
             raise _fail(
-                "MBPF305", "barriers must be unique", location="fixture"
+                "MBPF327", "barriers must be unique", location="fixture"
             )
         return cls(
             fixture_id=fixture_id,
@@ -963,7 +964,7 @@ class Fixture:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed Fixture instance: %s" % (exc,),
                 location="fixture",
             )
@@ -1015,7 +1016,7 @@ class RunPlanCase:
         targets = mapping["targets"]
         if not isinstance(targets, list) or not targets:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "targets must be a non-empty array of fingerprints",
                 location=location,
             )
@@ -1028,7 +1029,7 @@ class RunPlanCase:
             )
         if len(set(checked_targets)) != len(checked_targets):
             raise _fail(
-                "MBPF305", "case targets must be unique", location=location
+                "MBPF327", "case targets must be unique", location=location
             )
         expectation = _check_enum(
             mapping["expectation"], EXPECTATIONS, "expectation", location
@@ -1038,25 +1039,25 @@ class RunPlanCase:
             denies = _check_pattern(denies, ID_RE, "denies", location)
             if denies == case_id:
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "a denial case cannot deny itself",
                     location=location,
                 )
         elif denies is not None:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "denies is allowed only on denial cases",
                 location=location,
             )
         required = mapping["required"]
         if not isinstance(required, bool):
             raise _fail(
-                "MBPF305", "required must be a boolean", location=location
+                "MBPF327", "required must be a boolean", location=location
             )
         consumers = mapping["consumers"]
         if not isinstance(consumers, list) or not consumers:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "consumers must be a non-empty array",
                 location=location,
             )
@@ -1102,7 +1103,7 @@ class RunPlanCase:
         )
         if expectation == "denial" and expected["outcome"] == OUTCOME_PASS:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "a denial case must expect a failure, not PASS",
                 location="%s.expected" % location,
             )
@@ -1151,7 +1152,7 @@ class RunPlanCase:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed RunPlanCase instance: %s" % (exc,),
                 location="plan",
             )
@@ -1193,7 +1194,7 @@ class RunPlan:
         _check_version(mapping, "plan")
         if mapping["contract_version"] != TEST_CONTRACTS_VERSION:
             raise _fail(
-                "MBPF304",
+                "MBPF326",
                 "unsupported contract_version %r; want %r"
                 % (mapping["contract_version"], TEST_CONTRACTS_VERSION),
                 location="plan",
@@ -1225,7 +1226,7 @@ class RunPlan:
         raw_targets = mapping["targets"]
         if not isinstance(raw_targets, list) or not raw_targets:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "targets must be a non-empty array",
                 location="plan",
             )
@@ -1235,12 +1236,12 @@ class RunPlan:
         fingerprints = [target.fingerprint for target in targets]
         if len(set(fingerprints)) != len(fingerprints):
             raise _fail(
-                "MBPF305", "plan targets must be unique", location="plan"
+                "MBPF327", "plan targets must be unique", location="plan"
             )
         raw_cases = mapping["cases"]
         if not isinstance(raw_cases, list) or not raw_cases:
             raise _fail(
-                "MBPF305", "cases must be a non-empty array",
+                "MBPF327", "cases must be a non-empty array",
                 location="plan",
             )
         cases = tuple(
@@ -1250,14 +1251,14 @@ class RunPlan:
         case_ids = [case.case_id for case in cases]
         if len(set(case_ids)) != len(case_ids):
             raise _fail(
-                "MBPF305", "plan case_ids must be unique", location="plan"
+                "MBPF327", "plan case_ids must be unique", location="plan"
             )
         by_id = {case.case_id: case for case in cases}
         for case in cases:
             for fingerprint in case.targets:
                 if fingerprint not in fingerprints:
                     raise _fail(
-                        "MBPF305",
+                        "MBPF327",
                         "case %r references unknown plan target %s"
                         % (case.case_id, fingerprint),
                         location="plan",
@@ -1266,14 +1267,14 @@ class RunPlan:
                 guarded = by_id.get(case.denies)
                 if guarded is None:
                     raise _fail(
-                        "MBPF305",
+                        "MBPF327",
                         "case %r denies unknown case %r"
                         % (case.case_id, case.denies),
                         location="plan",
                     )
                 if guarded.expectation != "positive":
                     raise _fail(
-                        "MBPF305",
+                        "MBPF327",
                         "case %r must deny a positive case" % case.case_id,
                         location="plan",
                     )
@@ -1290,7 +1291,7 @@ class RunPlan:
         }
         if cls.hash_of(body) != plan_hash:
             raise _fail(
-                "MBPF306",
+                "MBPF328",
                 "plan_hash mismatch: stored %s, recomputed %s"
                 % (plan_hash, cls.hash_of(body)),
                 location="plan",
@@ -1319,7 +1320,7 @@ class RunPlan:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed RunPlan instance: %s" % (exc,),
                 location="plan",
             )
@@ -1438,7 +1439,7 @@ class CostRecord:
         if cost_value is None:
             if not isinstance(reason, str) or not reason:
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "unavailable_reason is required when value is null",
                     location=location,
                 )
@@ -1447,13 +1448,13 @@ class CostRecord:
                 cost_value, (int, float)
             ):
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "value must be a number or null",
                     location=location,
                 )
             if reason is not None:
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "unavailable_reason is allowed only when value is null",
                     location=location,
                 )
@@ -1489,7 +1490,7 @@ class CostRecord:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed CostRecord instance: %s" % (exc,),
                 location="cost",
             )
@@ -1658,7 +1659,7 @@ class CaseResult:
         required = mapping["required"]
         if not isinstance(required, bool):
             raise _fail(
-                "MBPF305", "required must be a boolean", location="result"
+                "MBPF327", "required must be a boolean", location="result"
             )
         expected = _check_behavior(mapping["expected"], "result.expected")
         observed = _check_behavior(mapping["observed"], "result.observed")
@@ -1669,7 +1670,7 @@ class CaseResult:
         if outcome == OUTCOME_PASS:
             if failure_stage is not None:
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "failure_stage must be null when outcome is PASS",
                     location="result",
                 )
@@ -1683,14 +1684,14 @@ class CaseResult:
             failure_stage != observed["failure_stage"]
         ):
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "top-level outcome/failure_stage must equal observed",
                 location="result",
             )
         evidence = mapping["evidence"]
         if not isinstance(evidence, list):
             raise _fail(
-                "MBPF305", "evidence must be an array", location="result"
+                "MBPF327", "evidence must be an array", location="result"
             )
         checked_evidence: list[dict[str, Any]] = []
         for index, entry in enumerate(evidence):
@@ -1719,7 +1720,7 @@ class CaseResult:
         residue = cleanup["residue"]
         if not isinstance(residue, list):
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "cleanup.residue must be an array",
                 location="result.cleanup",
             )
@@ -1729,13 +1730,13 @@ class CaseResult:
         ]
         if cleanup_status == "CLEAN" and checked_residue:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "CLEAN cleanup must carry no residue entries",
                 location="result.cleanup",
             )
         if cleanup_status == "RESIDUE" and not checked_residue:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "RESIDUE cleanup must name its residue",
                 location="result.cleanup",
             )
@@ -1743,14 +1744,14 @@ class CaseResult:
             # Exclusion from the gate denominator needs proof: a bare
             # NOT_APPLICABLE claim cannot self-exclude a cell.
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "a NOT_APPLICABLE result must carry evidence digests",
                 location="result",
             )
         raw_costs = mapping.get("costs", [])
         if not isinstance(raw_costs, list):
             raise _fail(
-                "MBPF305", "costs must be an array", location="result"
+                "MBPF327", "costs must be an array", location="result"
             )
         costs = tuple(
             CostRecord.from_dict(entry, "result.costs[%d]" % index)
@@ -1765,19 +1766,19 @@ class CaseResult:
             # boundary note.
             if not json_equal(observed, expected):
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "a PASS result must observe exactly its expectation",
                     location="result",
                 )
             if not checked_evidence:
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "a PASS result must carry evidence digests",
                     location="result",
                 )
             if cleanup_status != "CLEAN":
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "a PASS result must report CLEAN cleanup",
                     location="result",
                 )
@@ -1829,7 +1830,7 @@ class CaseResult:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed CaseResult instance: %s" % (exc,),
                 location="result",
             )
@@ -1842,7 +1843,7 @@ class CaseResult:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed CaseResult instance: %s" % (exc,),
                 location="result",
             )
@@ -1886,7 +1887,7 @@ class SuiteResult:
         _check_version(mapping, "suite")
         if mapping["suite_result_version"] != SUITE_RESULT_VERSION:
             raise _fail(
-                "MBPF304",
+                "MBPF326",
                 "unsupported suite_result_version %r; want %r"
                 % (mapping["suite_result_version"], SUITE_RESULT_VERSION),
                 location="suite",
@@ -1898,7 +1899,7 @@ class SuiteResult:
         digests = mapping["result_digests"]
         if not isinstance(digests, list):
             raise _fail(
-                "MBPF305", "result_digests must be an array",
+                "MBPF327", "result_digests must be an array",
                 location="suite",
             )
         checked_digests = [
@@ -1908,7 +1909,7 @@ class SuiteResult:
         rejected = mapping["rejected_digests"]
         if not isinstance(rejected, list):
             raise _fail(
-                "MBPF305", "rejected_digests must be an array",
+                "MBPF327", "rejected_digests must be an array",
                 location="suite",
             )
         checked_rejected = [
@@ -1957,7 +1958,7 @@ class SuiteResult:
             cells = entry["cells"]
             if not isinstance(cells, list):
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "ledger cells must be an array",
                     location="suite.ledger.%s" % bucket,
                 )
@@ -1965,7 +1966,7 @@ class SuiteResult:
                 _check_str(cell, "ledger cell", "suite.ledger.%s" % bucket)
             if count != len(cells):
                 raise _fail(
-                    "MBPF305",
+                    "MBPF327",
                     "ledger count must equal its cells for %s" % bucket,
                     location="suite.ledger.%s" % bucket,
                 )
@@ -1980,7 +1981,7 @@ class SuiteResult:
         reasons = decision["reasons"]
         if not isinstance(reasons, list):
             raise _fail(
-                "MBPF305", "decision reasons must be an array",
+                "MBPF327", "decision reasons must be an array",
                 location="suite.decision",
             )
         checked_reasons = [
@@ -2018,7 +2019,7 @@ class SuiteResult:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise _fail(
-                "MBPF305",
+                "MBPF327",
                 "malformed SuiteResult instance: %s" % (exc,),
                 location="suite",
             )
@@ -2098,21 +2099,21 @@ def verify_schema_bundle(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise _fail(
-            "MBPF307", "cannot read bundle manifest: %s" % exc,
+            "MBPF329", "cannot read bundle manifest: %s" % exc,
             location=str(manifest_path),
             stage=STAGE_BUNDLE,
         )
     _require_mapping(manifest, "bundle manifest", str(manifest_path))
     if manifest.get("bundle") != BUNDLE_NAME:
         raise _fail(
-            "MBPF307",
+            "MBPF329",
             "not a %s bundle: %r" % (BUNDLE_NAME, manifest.get("bundle")),
             location=str(manifest_path),
             stage=STAGE_BUNDLE,
         )
     if not _is_exact_int(manifest.get("version"), BUNDLE_VERSION):
         raise _fail(
-            "MBPF307",
+            "MBPF329",
             "unsupported bundle version %r" % (manifest.get("version"),),
             location=str(manifest_path),
             stage=STAGE_BUNDLE,
@@ -2122,7 +2123,7 @@ def verify_schema_bundle(
         SUITE_RESULT_VERSION,
     ]:
         raise _fail(
-            "MBPF307",
+            "MBPF329",
             "bundle contracts must be %r" % (
                 [TEST_CONTRACTS_VERSION, SUITE_RESULT_VERSION],
             ),
@@ -2132,7 +2133,7 @@ def verify_schema_bundle(
     schemas = manifest.get("schemas")
     if not isinstance(schemas, Mapping):
         raise _fail(
-            "MBPF307",
+            "MBPF329",
             "bundle manifest schemas must be a mapping",
             location=str(manifest_path),
             stage=STAGE_BUNDLE,
@@ -2141,14 +2142,14 @@ def verify_schema_bundle(
         entry = schemas.get(filename)
         if not isinstance(entry, Mapping):
             raise _fail(
-                "MBPF307",
+                "MBPF329",
                 "bundle is missing schema entry %s" % filename,
                 location=str(manifest_path),
                 stage=STAGE_BUNDLE,
             )
         if not _is_exact_int(entry.get("version"), SCHEMA_VERSION):
             raise _fail(
-                "MBPF307",
+                "MBPF329",
                 "bundle schema %s has unsupported version %r"
                 % (filename, entry.get("version")),
                 location=str(manifest_path),
@@ -2158,7 +2159,7 @@ def verify_schema_bundle(
             raw = (root / filename).read_bytes()
         except OSError:
             raise _fail(
-                "MBPF307",
+                "MBPF329",
                 "bundle is missing schema file %s" % filename,
                 location=str(root / filename),
                 stage=STAGE_BUNDLE,
@@ -2166,7 +2167,7 @@ def verify_schema_bundle(
         actual = hashlib.sha256(raw).hexdigest()
         if actual != entry.get("sha256"):
             raise _fail(
-                "MBPF307",
+                "MBPF329",
                 "bundle schema %s digest mismatch" % filename,
                 location=str(root / filename),
                 stage=STAGE_BUNDLE,
@@ -2174,7 +2175,7 @@ def verify_schema_bundle(
     pinned = digest_of(manifest)
     if pinned != expected_manifest_digest:
         raise _fail(
-            "MBPF307",
+            "MBPF329",
             "bundle manifest digest %s does not match the pinned "
             "digest %s" % (pinned, expected_manifest_digest),
             location=str(manifest_path),

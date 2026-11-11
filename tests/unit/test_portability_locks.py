@@ -899,8 +899,13 @@ def test_ci_actions_are_pinned():
         "ea165f8d65b6e75b540449e92b4886f43607fa02",
         "v4.6.2",
     ) in pinned
+    assert (
+        "download-artifact",
+        "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "v4.3.0",
+    ) in pinned
     uses = re.findall(r"uses:\s*(\S+)", text)
-    assert len(uses) == 5, uses
+    assert len(uses) == 8, uses
     for reference in uses:
         _action, _, revision = reference.partition("@")
         assert len(revision) == 40, reference
