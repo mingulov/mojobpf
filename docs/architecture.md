@@ -35,8 +35,16 @@ standard helper-call encoding (`@__mojobpf_lookup_v1` becomes
 becomes `inttoptr (i64 14 to ptr)`,
 `@__mojobpf_ktime_get_ns_v1` becomes `inttoptr (i64 5 to ptr)`,
 `@__mojobpf_get_smp_processor_id_v1` becomes
-`inttoptr (i64 8 to ptr)`, and `@__mojobpf_ringbuf_output_v1`
-becomes `inttoptr (i64 130 to ptr)`, preserving type, arguments,
+`inttoptr (i64 8 to ptr)`, `@__mojobpf_ringbuf_output_v1`
+becomes `inttoptr (i64 130 to ptr)`,
+`@__mojobpf_ringbuf_reserve_v1` becomes
+`inttoptr (i64 131 to ptr)`, `@__mojobpf_ringbuf_submit_v1`
+becomes `inttoptr (i64 132 to ptr)`,
+`@__mojobpf_ringbuf_discard_v1` becomes
+`inttoptr (i64 133 to ptr)`, `@__mojobpf_skb_load_bytes_v1`
+becomes `inttoptr (i64 26 to ptr)`, and
+`@__mojobpf_skb_store_bytes_v1` becomes
+`inttoptr (i64 9 to ptr)`, preserving type, arguments,
 result, and position), and it removes the now-unreferenced
 reserved helper declarations (exactly one per used helper).
 Every other body line in the adapted IR is byte-identical to the
@@ -55,12 +63,20 @@ Concretely, from the repository root with the project Mojo environment
 active:
 
 ```bash
-mojo build --emit llvm -o out/xdp_pass.ll examples/xdp_pass/xdp_pass.mojo
+mojo build --emit llvm \
+    --target-cpu znver4 \
+    --target-features +adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,+crc32,+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,+xsavec,+xsaveopt,+xsaves \
+    -o out/xdp_pass.ll examples/xdp_pass/xdp_pass.mojo
 python3 compiler/mojo_ir_adapter.py --input out/xdp_pass.ll \
     --output out/xdp_pass.bpf.ll
 llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/xdp_pass.bpf.ll \
     -o out/xdp_pass.bpf.o
 ```
+
+(The `--target-cpu`/`--target-features` pair is the frozen
+producer shape the exact-match adapter expects — the same
+flags the `mojobpf build` route passes. Every example README
+carries this exact invocation.)
 
 ## Validated subset
 
@@ -106,13 +122,14 @@ demonstrated in a Linux guest; each bullet names its proof.
   register, and the caller-saved clobbers come from backend call
   lowering, plus — for the subprogram shape only — tail calls
   from the entrypoint body to the one callee, which pass through
-  to the backend unlowered. The audit admits nine frozen count
+  to the backend unlowered. The audit admits twelve frozen count
   vectors (the packet classifier, the single-pair map round
   trip, the combined packet workload, the tracepoint counter,
   the tracepoint event emitter, the two reservation emitters,
-  the core relocation probe, and the uprobe register counter,
+  the core relocation probe, the uprobe register counter,
   whose pinned context-word read is pinned alongside its
-  vector), plus the classifier-plus-subprogram shape, which
+  vector, and the three skb shapes: load, store, and
+  load-plus-map), plus the classifier-plus-subprogram shape, which
   reuses the classifier vector with callee/call-site structure,
   plus bounded count
   families: N read-modify-write pairs over dense keys 0 to N-1, N
@@ -407,18 +424,19 @@ below names the current pins. The 0.3.0a1 alpha record (see
 [evidence-0.3.0a1.md](evidence-0.3.0a1.md)) observed the
 measured behaviors on LLVM 22.1.8 with bpftool 7.6.0 /
 libbpf 1.6 under software emulation; the current tree re-proves
-them on the KVM lanes in the pending release matrix, and no
-kernel is claimed until that matrix passes. Other combinations
-are unproven, not supported. Full binary paths and hashes are
-recorded in `toolchains.lock.json`; rerun
+them on the five KVM lanes of the release matrix (197/205
+cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), which
+claims kernels 6.6.0, 6.12.0, 7.0.14, 7.2, and 7.4-rc1. Other
+combinations are unproven, not supported. Full binary paths
+and hashes are recorded in `toolchains.lock.json`; rerun
 `tests/probes/toolchain_inventory.py` to re-probe any machine.
 
 | Role | Pinned identity |
 | --- | --- |
 | Mojo compiler | 1.1.0 (`8189361e`), pixi-pinned from the Modular channel |
-| BPF backend | LLVM `llc` 22.1.8, triple `bpfel-unknown-none`, cpu `v3` |
+| BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, cpu `v3` |
 | Loader/observer | bpftool 7.6.0 with libbpf 1.6, unmodified |
-| Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; candidate kernels 6.12.0, 6.6.0, 7.0.14, 7.2, 7.4-rc1 (pending matrix proof) plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
+| Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; claimed kernels 6.12.0, 6.6.0, 7.0.14, 7.2, 7.4-rc1 plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
 | Host drivers | Python 3.11+ (3.14.8 observed), pixi-managed Mojo environment, standard library only |
 | C reference | Clang 22.1.8 builds the independent C controls and fixtures in `tests/reference_c/` (XDP controls, ring-buffer controls, license witness pair, map references) |
 
@@ -445,7 +463,7 @@ Each layer is a distinct, tested outcome:
 | Backend failure | `llc` exits nonzero | fails its build suite as a named proof failure (`tests/elf/test_minimal_object.py`, `tests/elf/test_map_btf.py`, `tests/probes/run_feasibility.py`) |
 | Loader failure | libbpf/bpftool cannot load the object | `tests/harness/bpf_test_run.py` reports `loader` |
 | Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked), `tests/kernel/test_packet_sdk.py` (unguarded packet load, last-byte address), `tests/kernel/test_array_maps.py` (out-of-bounds, unchecked) |
-| Environment failure | missing tool, denied permission, no guest | every suite exits 2 with `ENVIRONMENT FAILURE`, never a pass |
+| Environment failure | missing tool, denied permission, no guest | never a pass; the signal is per executor: pytest suites exit 1, `mojobpf test` maps env-only failures to exit 3, `run_feasibility.py` exits 2 |
 | Runtime mismatch | test-run returns an unexpected action | `tests/kernel/test_mojo_xdp.py` (stale-object cases) |
 
 Build, check, and inspect steps stay unprivileged. Privileged
@@ -480,15 +498,15 @@ of them is implied by the results above:
   verdicts (see the compatibility documentation); every other
   Mojo/LLVM combination, every `llc` backend version but
   22.1.8, every host architecture but x86-64, and big-endian
-  BPF still need theirs. The candidate x86-64 lanes (6.12.0,
+  BPF still need theirs. The claimed x86-64 lanes (6.12.0,
   6.6.0, 7.0.14, 7.2, 7.4-rc1, all KVM, plus the named
   `v6.12-tcg` fallback) are pinned in `ci/kernels.lock.json`
   and driven by `ci/run_vm_tests.py`, with the 6.6 loop-shape
   verifier boundary pinned per lane (see the compatibility
-  documentation); no lane is claimed until the full 41-suite
-  matrix passes on it. A full-matrix-green verdict is not
-  claimed here; each proof above names the suite that
-  demonstrates it.
+  documentation); each lane is claimed by its full 41-suite
+  matrix pass (197/205 cells; see
+  [evidence-1.0.0.md](evidence-1.0.0.md)). Each proof above
+  names the suite that demonstrates it.
 - CO-RE beyond the proven slice, and multi-program objects:
   unproven. BTF covers map metadata only, with no function
   records and no `.BTF.ext`, except on the CO-RE probe object

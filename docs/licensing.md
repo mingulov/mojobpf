@@ -11,10 +11,13 @@ named diagnostic; nothing is advisory prose.
 
 First-party material uses **Apache-2.0 WITH LLVM-exception**.
 The complete license text is preserved byte-exact in
-[`LICENSE`](../LICENSE), copied without modification from
+[`LICENSE`](../LICENSE): a 223-byte MojoBPF wrapper prefix
+(project license declaration) followed by the upstream text
+verbatim from offset 223, copied without modification from
 `modular/modular` at revision
 `85356f6562ed57bab8762fde38448ba5b50b69c9` (SHA-256
-`077ecef8fc610215df3319c555c2fa1b4d28df60ee67a72946b9338cbc90a8a0`;
+`077ecef8fc610215df3319c555c2fa1b4d28df60ee67a72946b9338cbc90a8a0`
+of the upstream bytes;
 see [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for
 the provenance record). Every first-party source file carries
 an `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`

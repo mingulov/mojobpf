@@ -10,9 +10,10 @@ shortened (the working directory to `<qs>`, user tool
 installations to their bare tool names). Absolute paths on
 your machine will differ; versions, exit codes, and result
 lines must match. The transcribed hashes are from the
-reference run (the installed end-to-end re-proof on the
-current tree is pending the release matrix); the tool and SDK
-versions and the profile list below match the current tree.
+reference run, executed verbatim from a fresh environment
+against the release wheel (see the [1.0.0 release
+notes](release-notes-1.0.0.md)); the tool and SDK versions
+and the profile list below match the current tree.
 
 ## Prerequisites
 
@@ -47,7 +48,8 @@ same-tree builds. The release contents are pinned
 separately in the checksums record (the alpha record is
 [checksums-0.3.0a1.md](checksums-0.3.0a1.md); the 1.0.0
 record lands with the release artifacts). pip's
-`Stored in directory` cache line is elided.)
+`Building wheel ...: started` progress line and the
+`Stored in directory` cache line are elided.)
 
 The counter lowers through the parsed route, which needs the
 `mojobpf-lower` binary (not shipped in the wheel). Build it
@@ -330,11 +332,11 @@ echo "== run x3 =="
 bpftool prog run pinned /sys/fs/bpf/qs-counter data_in <qs>/test-run/pkt.bin data_out <qs>/test-run/out.bin repeat 3
 echo "== map after x3 =="
 MAPID=$(bpftool -j map list | python3 -c "import json,sys; ms=json.load(sys.stdin); print([m['id'] for m in ms if m.get('name')=='mojobpf_map0'][0])")
-bpftool map dump id $MAPID
+bpftool -j map dump id $MAPID
 echo "== run x5 =="
 bpftool prog run pinned /sys/fs/bpf/qs-counter data_in <qs>/test-run/pkt.bin data_out <qs>/test-run/out.bin repeat 5
 echo "== map after x5 =="
-bpftool map dump id $MAPID
+bpftool -j map dump id $MAPID
 echo "== unload =="
 rm /sys/fs/bpf/qs-counter
 EOF
@@ -390,6 +392,6 @@ failure can never pass silently.
   `MBPF219`: build `mojobpf-lower` and export `MOJOBPF_LOWER`
   (see step 1).
 * `mojobpf verify --kernel` without a guest runner fails with
-  an environment report (exit 3), never a pass. Loader and
+  a usage report (exit 2), never a pass. Loader and
   verifier failures both exit 5, classified separately
   (`MBPF501` loader, `MBPF502` verifier).

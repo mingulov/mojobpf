@@ -630,8 +630,9 @@ object's BTF value size before publication
 `tests/compile/test_build_pipeline.py::test_noncore_value_size_keeps_base_behavior`).
 
 End to end in the kernel: identical object bytes load on both
-supported lanes, the relocated read observes each lane's marker
-at its own offset, and each lane executes its own guard arm
+6.x lanes (the only lanes with recorded task_struct layouts),
+the relocated read observes each lane's marker at its own
+offset, and each lane executes its own guard arm
 (`tests/kernel/test_core_layouts.py::test_relocated_read_matches_lane_marker`,
 `tests/kernel/test_core_layouts.py::test_exists_bit_matches_lane_layout`).
 

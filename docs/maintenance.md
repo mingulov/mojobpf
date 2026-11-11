@@ -9,8 +9,9 @@ snapshots.
 
 The v1.0 line covers the eight target profiles
 (`linux-bpfel-v3`, `-core`, `-hash`, `-lru`, `-net`, `-reserve`,
-`-subprog`, `-uprobe`), the ten supported helpers, the four map
-families,
+`-subprog`, `-uprobe`), the twelve supported helpers (IDs 1, 2,
+3, 5, 8, 9, 14, 26, 130, 131, 132, 133), the five map kinds
+(`array`, `percpu_array`, `ringbuf`, `hash`, `lru_hash`),
 and the tracepoint, ring-buffer, and uprobe observers exactly
 as `docs/compatibility.md` claims them. Everything that page
 lists as a non-claim (AArch64 support beyond the portability
@@ -21,7 +22,7 @@ result) stays a non-claim until its own gate passes.
 ## Pin discipline
 
 Toolchain, kernel-lane, and lock updates require a full anchor
-re-proof (fast suites, all five x86 KVM matrix lanes, the three
+re-proof (fast suites, all five x86 KVM matrix lanes, the two
 portability lanes, feasibility, quickstart, revision equality)
 before promotion. Investigational lanes and pins never leak
 into the release pins or the release documentation.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Capped regular-file reads and streamed hashing for untrusted inputs.
 
 The core lives in :mod:`mojobpf.execution` (stdlib only: that module is

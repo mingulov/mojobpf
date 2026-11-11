@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0 WITH LLVM-exception" }
 keywords = ["bpf", "ebpf", "mojo", "xdp"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",

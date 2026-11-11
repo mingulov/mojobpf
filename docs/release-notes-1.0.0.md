@@ -26,7 +26,7 @@ a general eBPF toolchain.
   classifiers, tracepoint counter/events, uprobe counter,
   ring-buffer reserve, and subprogram call.
 * XDP, tracepoint, socket, TC, and uprobe slices with the
-  flipped map types (147 records), the qualified exact
+  flipped capability records (147 records), the qualified exact
   tracepoint counter and fixed-record event emitter with
   loss accounting, lifecycle proofs (classified attach
   failures, exact exit counts, interruption, clean

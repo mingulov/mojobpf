@@ -127,7 +127,7 @@ place (identical sidecars) and across separate checkouts
 input seals).
 
 The tool and SDK versions join the cache key (key version
-6), so objects built under different versions never share a
+7), so objects built under different versions never share a
 cache entry
 (`tests/unit/test_build_commands.py::test_build_stamps_tool_and_sdk_versions`,
 `tests/unit/test_artifact_publication.py::test_schemas_valid_and_conform`).

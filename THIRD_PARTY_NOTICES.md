@@ -10,8 +10,8 @@ The first-party project license is **Apache-2.0 WITH LLVM-exception**. [LICENSE]
 | Upstream | [modular/modular](https://github.com/modular/modular) |
 | Revision | `85356f6562ed57bab8762fde38448ba5b50b69c9` |
 | Exact source | [LICENSE at that revision](https://raw.githubusercontent.com/modular/modular/85356f6562ed57bab8762fde38448ba5b50b69c9/LICENSE) |
-| SHA-256 | `077ecef8fc610215df3319c555c2fa1b4d28df60ee67a72946b9338cbc90a8a0` |
-| Modifications | None |
+| SHA-256 | `077ecef8fc610215df3319c555c2fa1b4d28df60ee67a72946b9338cbc90a8a0` (of the upstream bytes) |
+| Modifications | 223-byte MojoBPF wrapper prefix (project license declaration); the upstream text follows verbatim from offset 223 |
 
 This revision identifies the copied license text; it is not a selected compiler dependency. No third-party implementation code or compiler binaries are currently bundled.
 

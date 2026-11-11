@@ -142,10 +142,12 @@ ARTIFACT_SCHEMA_VERSION = 2
 #: ``modular.cfg``) joined the compiler class: v5 keys covered
 #: only the lockfile's distribution *record*, so two installs
 #: with identical lockfiles but different installed stdlib
-#: bytes shared a v5 key and reusing a v5-keyed object across
-#: a stdlib swap would be a silent hit. The ``v6:`` prefix
-#: keeps old keys disjoint, so pre-fix cache entries never
-#: validate post-fix builds.
+#: bytes shared a v5 key. Bumped to 7 when recorded
+#: environment values became all-sha256 with secret-name keys
+#: dropped: v6 keys covered verbatim values, so v6-keyed
+#: entries could validate post-change builds. The ``v7:``
+#: prefix keeps old keys disjoint, so pre-fix cache entries
+#: never validate post-fix builds.
 CACHE_KEY_VERSION = 7
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"

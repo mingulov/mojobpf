@@ -110,10 +110,12 @@ evidence the test asserts.
 ## Optimization settings
 
 The driver invokes the frontend with fixed release flags (`mojo
-build --emit llvm`, the compiler default) and the backend with
-fixed flags (`llc -mtriple=bpfel -mcpu=v3 -filetype=obj`). There
-is no optimization knob on that route, so no setting can be
-silently changed. Proven by `test_release_settings_identical`,
+build --emit llvm` plus the frozen `--target-cpu znver4` and
+`--target-features` string, the compiler default extended by
+the pinned target) and the backend with fixed flags (`llc
+-mtriple=bpfel -mcpu=v3 -filetype=obj`). There is no
+optimization knob on that route, so no setting can be silently
+changed. Proven by `test_release_settings_identical`,
 `test_no_optimization_rejected_explicitly`,
 `test_debug_info_rejected_explicitly`,
 `test_target_override_rejected_explicitly`,
@@ -130,9 +132,12 @@ silently changed. Proven by `test_release_settings_identical`,
 * Rejected by the frontend: `--target-triple` overrides (the host
   compiler has no such target info).
 * Pinned by the driver: the recorded frontend command carries no
-  optimization, debug or target spelling, and the recorded backend
-  command spells exactly the pinned triple, CPU and file type with
-  no `-O` or `-mllvm` widening. The backend flags are load-bearing
+  optimization or debug spelling and exactly the frozen target
+  flags (`--target-cpu znver4` plus the pinned feature string;
+  the adapter refuses IR emitted without them), and the recorded
+  backend command spells exactly the pinned triple, CPU and file
+  type (`-mtriple=bpfel -mcpu=v3 -filetype=obj`) with no `-O` or
+  `-mllvm` widening. The backend flags are load-bearing
   (an `llc -O0` object differs), so the pin matters.
 
 ## Tracing shapes
@@ -302,7 +307,7 @@ together with the change.
 <!-- SUBSET-TABLE-BEGIN -->
 | case | result | layer | evidence | fixture | tests |
 | --- | --- | --- | --- | --- | --- |
-| loop-sum | accept | kernel | v6.12: test-run actions match the oracle; v6.6 verifier rejects the back edge (pinned log line) | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (8efd104f) |
+| loop-sum | accept | kernel | v6.12/7.0.14/7.2/7.4-rc1: test-run actions match the oracle; v6.6 verifier rejects the back edge (pinned log line) | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (8efd104f) |
 | call-inline | accept | kernel | plain helper inlined; test-run actions match | subset_call_inline.mojo (243fb782) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_call_inline (8efd104f) |
 | stack-array | accept | kernel | initialized array promotes (no alloca); actions match | subset_stack_array.mojo (0af7cfb9) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_stack_array (8efd104f) |
 | casts | accept | kernel | narrow/widen round trip; test-run actions match | subset_casts.mojo (5016d187) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (136e3d41)<br>tests/verifier/test_subset_kernel.py::test_casts (8efd104f) |

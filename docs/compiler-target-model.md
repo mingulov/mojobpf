@@ -5,9 +5,12 @@
 The internal C++ reader can check genuine Mojo 1.1.0 output against
 `mojo-1.1.0-x86_64-bpfel-v3-minimal-v1`. This is source admission on an
 x86-64 build host for a little-endian BPF v3 candidate. Its explicit `lower`
-mode emits verified LLVM IR for the classifier and one-entry array slice.
-The installed build driver retains its existing route. Kernel/verifier,
-runtime and installed-consumer qualification are separate requirements.
+mode emits verified LLVM IR for the eight admitted profiles and their
+map/program contracts (classifier, map, combined, tracepoint, event,
+reservation, subprogram, core, uprobe, and skb shapes, each with a
+proof-table row). The installed build driver retains its existing
+route. Kernel/verifier, runtime and installed-consumer qualification
+are separate requirements.
 
 Build with CMake 3.20+, C++17 and the exact LLVM 22.1.8 development package.
 Python 3.11+ and pytest are required for tests; genuine captures and native
@@ -50,11 +53,20 @@ refused with `MBPF202`. The report's `target_facts.isa_cpu` carries
 the requested values, the resolved CPU and flags, and the `alu32`
 flag.
 
-For the one-entry array, `map` is exactly
-`{"symbol":"mojobpf_map0","type":2,"key_bits":32,"value_bits":64,"max_entries":1,"flags":0}`.
-Other fields, versions, types, map contracts, program types, target models
-and license declarations are rejected. This candidate does not broaden
-the capabilities associated with the existing profile identifier.
+`profile_id` admits the eight profiles (`linux-bpfel-v3`,
+`-subprog`, `-net`, `-hash`, `-lru`, `-uprobe`, `-reserve`,
+`-core`); the program/section contract admits `xdp`/`xdp`,
+`tc`/`classifier`, `socket`/`socket`, `uprobe`/`uprobe`, and
+`tracepoint`/`tracepoint/syscalls/sys_enter_getpid`. For a
+single map, `map` is exactly `{"symbol":"mojobpf_map0",
+"type":2|1|9|6,"key_bits":32,"value_bits":64,
+"max_entries":>=1,"flags":0}` (array, hash, LRU hash, or
+per-CPU array); the 4096-byte core shape (`value_bits` 32768,
+one entry) additionally requires the `-core` profile. Other
+fields, versions, types, map contracts, program types, target
+models and license declarations are rejected. The candidate
+matches the installed driver's admitted surface profile for
+profile; it adds no profile the driver does not admit.
 
 Default invocation retains parse/verify/write round trip:
 `mojobpf-lower --input INPUT --output OUTPUT [--emit llvm|bitcode]`.

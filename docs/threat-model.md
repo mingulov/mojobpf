@@ -98,9 +98,11 @@ traversal escaping the bpffs scope for load or `rm -f`.
 
 Rules:
 
-- Outside explicit discovery mode (lockfile omitted, non-qualifying,
-  nonzero exit), every executed tool byte range carries a hash pin:
-  tools, adapter, runner, QEMU, guest bpftool. An explicitly-selected
+- Outside explicit discovery mode (lockfile omitted, non-qualifying;
+  `check` exits 3, `doctor` always exits 0 as an observational
+  report), every executed tool byte range carries a hash pin:
+  tools, adapter, runner, QEMU. Guest bpftool is observed
+  (`bpftool version` in-guest), never pinned or admitted. An explicitly-selected
   adapter path is a documented opt-in extension outside lock
   qualification (never default-qualified). A lockfile that fails to
   pin a component it should qualify refuses the operation; warnings

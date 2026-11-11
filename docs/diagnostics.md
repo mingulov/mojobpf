@@ -44,8 +44,10 @@ locations, so those stay at the tool level.
 
 The transcript below is the actual output of the installed CLI
 building a program that calls a helper through inline assembly
-instead of the SDK wrapper (`mojobpf` 0.2.0 installed from the
-wheel into a clean virtualenv; paths shortened to the project):
+instead of the SDK wrapper (retained from the 0.2.0 run: the
+`MBPF306` message and remedy are byte-identical in the current
+audit, verified against `compiler/audit.py`; paths shortened
+to the project):
 
 ```
 $ mojobpf build --manifest proj/mojobpf.toml --out-dir out \

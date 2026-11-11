@@ -214,19 +214,19 @@ at the toolchain gate (`MBPF102`) exactly as designed.
 ## Kernel-version boundary: `loop-sum` on 6.6
 
 The bounded-loop subset case `loop-sum` verifies and runs on
-6.12 but is rejected by the 6.6 verifier with the kernel's own
-reason (`back-edge from insn 18 to 19`). Both verdicts are
-pinned exactly: the suite passes on 6.12 only when test-run
-actions match the oracle, and passes on 6.6 only when the
-verifier rejects with that exact log line; any other behavior
-on either lane fails loudly
-(`tests/verifier/test_subset_kernel.py::test_loop_sum`,
-`docs/supported-subset.md` case table, both matrix lanes).
+6.12, 7.0.14, 7.2, and 7.4-rc1 but is rejected by the 6.6
+verifier with the kernel's own reason (`back-edge from insn
+18 to 19`). Every lane verdict is pinned exactly: the suite
+passes on a run lane only when test-run actions match the
+oracle, and passes on 6.6 only when the verifier rejects with
+that exact log line; any other behavior on any lane fails
+loudly (`tests/verifier/test_subset_kernel.py::test_loop_sum`,
+`docs/supported-subset.md` case table, all five matrix lanes).
 
-This is a genuine kernel-version boundary the two-lane matrix
+This is a genuine kernel-version boundary the five-lane matrix
 exists to find — not a skipped lane. Programs whose loops the
 6.6 verifier rejects must be reshaped; the remaining subset
-cases behave identically on both lanes.
+cases behave identically on all five lanes.
 
 ## Measured tracing limitations
 
@@ -302,8 +302,9 @@ existence check (`task_struct.scx`), admitted only under the
 `linux-bpfel-v3-core` profile. The inspection parses and
 validates the relocation record content (an unsupported kind,
 zero records, or a corrupt header each fail with their own
-diagnostic), and identical object bytes load on both lanes with
-the loader resolving each lane's offsets
+diagnostic), and identical object bytes load on both 6.x lanes
+(the only lanes with recorded task_struct layouts) with the
+loader resolving each lane's offsets
 (`tests/core/test_core_object.py::test_core_profile_verdicts`,
 `tests/core/test_core_object.py::test_core_btfext_negatives_refused`,
 `tests/kernel/test_core_layouts.py::test_relocated_read_matches_lane_marker`,
@@ -315,8 +316,8 @@ Everything else under CO-RE stays out (see the unsupported list).
 Hash maps are claimed narrowly in this release: `u32` keys and
 `u64` values in 1-4 entries, admitted only under the
 `linux-bpfel-v3-hash` profile, with the existing lookup, update
-(`BPF_ANY` only), and delete helpers. On both x86-64 lanes the
-four-entry round trip initializes keys 0-3 to 41 and observes
+(`BPF_ANY` only), and delete helpers. On all five x86-64 lanes
+the four-entry round trip initializes keys 0-3 to 41 and observes
 exactly 42 after one run and exact quiesced counts after
 repeated runs; absent keys miss without inserting anything; a
 userspace insert followed by a run increments exactly the
@@ -354,7 +355,7 @@ a suite-owned test executable, reading exactly the pinned x86-64
 first-argument register (`pt_regs` word 14, `rdi`), admitted
 only under the `linux-bpfel-v3-uprobe` profile, with the
 existing lookup and update (`BPF_ANY` only) helpers and a
-two-entry array map. On both x86-64 lanes, with the expected
+two-entry array map. On all five x86-64 lanes, with the expected
 argument 41: 1000 calls carrying 41 are counted exactly 1000
 with every oracle word equal to 41; 500 calls carrying 43 leave
 the counter at 0 with every oracle word equal to 43; the
@@ -396,7 +397,7 @@ in this release: the `("socket", "socket")` and `("tc",
 (`skb_load_bytes`) and 9 (`skb_store_bytes`) in their
 audited shapes (one skb helper call plus its initialized key
 slot; the buffer must be an initialized keyslot and the call
-spelling must match genuine Mojo emission). On both x86-64
+spelling must match genuine Mojo emission). On all five x86-64
 lanes, over a five-frame corpus keyed on byte 14 (42
 matches, 43 does not, plus a short frame): the socket legs
 attach live to `AF_PACKET` and observe exactly the manifest
@@ -427,7 +428,7 @@ socket legs, and XDP attach.
 LRU hash maps are claimed narrowly in this release: `u32`
 keys and `u64` values in 1-4 entries, admitted only under
 the `linux-bpfel-v3-lru` profile, with the existing lookup,
-update (`BPF_ANY` only), and delete helpers. On both x86-64
+update (`BPF_ANY` only), and delete helpers. On all five x86-64
 lanes the one-entry lifecycle shapes initialize key 0 to 41
 and observe exactly 42 after one run with exact quiesced
 counts after repeated runs; absent keys miss without
@@ -489,7 +490,7 @@ checked magic/shift/compare sequences; oracle-word pins;
 `compiler/tests/test_isa_alu32.py`; `ci/run_vm_tests.py --suite
 kernel-isa-alu` and `--suite kernel-isa-alu32`,
 `tests/kernel/test_alu64_qual.py` and
-`tests/kernel/test_alu32_qual.py`, 7/7 per lane on both
+`tests/kernel/test_alu32_qual.py`, 7/7 per lane on all five
 lanes). Variable divisors select the DIV/MOD X-form, which
 the audit refuses, as do signed division/remainder, zero
 divisors, and widths outside 8/16/32/64 (`MBPF319`; same
@@ -610,9 +611,9 @@ host suites, selected-but-refused vectors).
   outside the surface.
 * Per-CPU-hash maps: implemented in-tree but unclaimed (see
   above); the kind is refused under every claimed profile.
-* Every candidate kernel: no kernel is claimed until the full
-  41-suite matrix passes on its lane, and those runs are
-  pending — including 6.6 and 6.12, whose historical alpha
+* Kernels outside the five claimed lanes: only 6.6.0, 6.12.0,
+  7.0.14, 7.2.0, and 7.4.0-rc1 are claimed (each by a full
+  41-suite matrix pass on its lane); the historical alpha
   verdicts do not qualify the current tree.
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header
@@ -622,7 +623,8 @@ host suites, selected-but-refused vectors).
   acceleration, and the one named TCG fallback lane
   (`v6.12-tcg`) exists solely for the no-KVM-dependence
   spot-proof. The historical alpha matrix ran under software
-  emulation; the pending release matrix proves the KVM lanes.
+  emulation; the release matrix proves the KVM lanes (197/205
+  cells; see [evidence-1.0.0.md](evidence-1.0.0.md)).
 
 ## Audit boundaries
 

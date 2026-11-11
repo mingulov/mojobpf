@@ -23,7 +23,8 @@ declares the filter shape: entry 0 is the expected argument as a
 to: it calls `probe_target(value)` N times (each call reporting
 its argument over a FIFO oracle channel) and also carries the
 never-called `probe_never_called` symbol for the zero-hit
-negative. It builds non-PIE so its symbol addresses are fixed:
+negative. It builds non-PIE so its symbol addresses are fixed
+(run from `examples/uprobe_counter/`, where `target.c` lives):
 
 ```bash
 cc -no-pie -fno-pie -O2 -o uprobe_target target.c
