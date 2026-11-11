@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """WP-4 exit gate: hostile inputs replayed end-to-end (Task 13).
 
 One test per gap exit item, each driven through the public CLI (not

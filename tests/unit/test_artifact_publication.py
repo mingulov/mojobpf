@@ -1184,6 +1184,24 @@ def _synthetic_manifest(project):
     return parse_manifest(os.path.join(project, "mojobpf.toml"))
 
 
+def test_all_shipped_schemas_carry_license_markers():
+    # licensing.md: every JSON document carries a top-level
+    # license field or an SPDX $comment marker. The wheel suite
+    # pins the 11 names; this pins the marker on each of them.
+    names = sorted(
+        name for name in os.listdir(SCHEMA_DIR)
+        if name.endswith(".schema.json")
+    )
+    assert len(names) == 11, names
+    for name in names:
+        schema = _load_schema(name)
+        marked = (
+            schema.get("license") == APACHE
+            or "SPDX-License-Identifier" in schema.get("$comment", "")
+        )
+        assert marked, name
+
+
 def test_schemas_valid_and_conform():
     for name in (
         "artifact.schema.json",
@@ -3257,6 +3275,89 @@ def test_snapshot_verify_rejects_tamper_add_remove():
                 assert "went missing" in exc.diagnostic.explanation
             else:
                 raise AssertionError("missing file was accepted")
+        finally:
+            snapshot.dispose()
+
+
+def test_snapshot_verify_refuses_over_cap_plant_without_loading():
+    # A file planted in the staged tree after capture is refused
+    # against the staged-input cap before its bytes are loaded:
+    # the verdict names the cap (sparse file, instant).
+    with _scratch() as parent:
+        project = _project(parent)
+        snapshot = _capture_demo(parent, project)
+        try:
+            planted = os.path.join(
+                snapshot.project_root, "planted.mojo"
+            )
+            with open(planted, "wb") as handle:
+                handle.truncate(inputs_module.MOJO_LIMIT + 1)
+            try:
+                snapshot.verify()
+            except inputs_module.InputError as exc:
+                assert exc.diagnostic.code == "MBPF106"
+                assert exc.diagnostic.stage == "build.inputs"
+                assert str(inputs_module.MOJO_LIMIT) in (
+                    exc.diagnostic.explanation
+                ), exc.diagnostic
+            else:
+                raise AssertionError("over-cap plant was accepted")
+        finally:
+            snapshot.dispose()
+
+
+def test_snapshot_verify_refuses_over_cap_stdlib_growth():
+    # A sealed stdlib file grown past its payload cap after
+    # capture is refused against the cap before its bytes are
+    # loaded (sparse growth, instant).
+    with _scratch() as parent:
+        project = _project(parent)
+        mojo, home = _toolchain_install(parent)
+        manifest = parse_manifest(
+            os.path.join(project, "mojobpf.toml")
+        )
+        toolchain = inputs_module.ToolchainInputs(
+            tools=(
+                inputs_module.SnapshotTool(
+                    name="mojo",
+                    version="Mojo 9.9.9 (fixture)",
+                    sha256="1" * 64,
+                ),
+            ),
+            distribution=("pixi-lock linux-64 " + "3" * 64,),
+            lockfile_sha256="4" * 64,
+            stdlib_payload=inputs_module.stdlib_payload_identities(
+                mojo_binary=mojo, modular_home=home
+            ),
+            stdlib_payload_paths=inputs_module.stdlib_payload_paths(
+                mojo_binary=mojo, modular_home=home
+            ),
+        )
+        sdk = inputs_module.SdkInputs(
+            sdk_dir=parent, version=SDK_VERSION
+        )
+        snapshot = inputs_module.capture_build_inputs(
+            manifest, toolchain, sdk, work_parent=parent
+        )
+        try:
+            assert snapshot.stdlib_seal, "seal binding missing"
+            install = os.path.join(
+                parent, "lib", "mojo", "std.mojoc"
+            )
+            with open(install, "r+b") as handle:
+                handle.truncate(
+                    inputs_module.STDLIB_PAYLOAD_LIMIT + 1
+                )
+            try:
+                snapshot.verify()
+            except inputs_module.InputError as exc:
+                assert exc.diagnostic.code == "MBPF106"
+                assert exc.diagnostic.stage == "build.inputs"
+                assert str(inputs_module.STDLIB_PAYLOAD_LIMIT) in (
+                    exc.diagnostic.explanation
+                ), exc.diagnostic
+            else:
+                raise AssertionError("over-cap growth was accepted")
         finally:
             snapshot.dispose()
 

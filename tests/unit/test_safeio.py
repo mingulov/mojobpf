@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Capped reads and streamed hashing for untrusted file inputs (WP-4 Task 8).
 
 Every test here replays a hostile input end-to-end through the converted
@@ -73,6 +74,13 @@ def _feeder(fifo_path, payload=b"x" * 4096):
 # ---------------------------------------------------------------------------
 # safeio unit contract
 # ---------------------------------------------------------------------------
+
+
+def test_resolve_under_root_nul_returns_none(tmp_path):
+    safeio = _safeio()
+    assert safeio.resolve_under_root(
+        os.path.join(str(tmp_path), "nul\x00name"), str(tmp_path)
+    ) is None
 
 
 def test_read_capped_exact_limit_ok(tmp_path):

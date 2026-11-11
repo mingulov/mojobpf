@@ -1388,6 +1388,32 @@ def test_distribution_dotdot_rejected():
     ), diagnostics
 
 
+def test_distribution_nul_filename_diagnosed_not_uncaught():
+    # A NUL-bearing filename cannot resolve beside the lock; it is
+    # a diagnosed MBPF104 refusal, never an uncaught ValueError
+    # from realpath.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={
+                "file": "nul\x00name.txt",
+                "sha256": "0" * 63 + "1",
+            }
+        ),
+    )
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile,
+        search_paths=(bindir,),
+        names=("mojo",),
+    )
+    assert admitted == {}, diagnostics
+    assert any(
+        item.code == "MBPF104" for item in diagnostics
+    ), diagnostics
+
+
 def test_distribution_symlink_escape_rejected():
     # Lexical containment is not sufficient: a beside-the-lock name
     # resolving outside (symlink) is rejected even when the bytes

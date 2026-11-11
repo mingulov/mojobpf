@@ -3097,6 +3097,17 @@ def test_merge_refuses_malformed_report():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_runner_docstring_discloses_pinned_exclusions():
+    # The module contract statement must disclose the exclusion
+    # map: "Skips never occur" went stale when
+    # LANE_SUITE_EXCLUSIONS started skipping ruled cells loudly
+    # by design.
+    runner = _load_runner()
+    doc = runner.__doc__ or ""
+    assert "LANE_SUITE_EXCLUSIONS" in doc, doc
+    assert "Skips never occur" not in doc, doc
+
+
 def _direct_names():
     return sorted(
         name

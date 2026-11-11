@@ -5169,8 +5169,8 @@ def test_snapshot_capture_root_retired_on_keyboard_interrupt():
 def test_snapshot_capture_reread_oserror_retires_root():
     # An unexpected OSError from the staged reread still retires
     # the root; the fault itself reports as MBPF106 naming the
-    # origin path, never the staged copy.
-    import builtins
+    # origin path, never the staged copy. The fault is injected
+    # at the capped reader, the seam the staged reread uses.
     from mojobpf.manifest import parse_manifest
     parent = tempfile.mkdtemp(prefix="build-reread-")
     manifest_path, _ = write_project(parent)
@@ -5179,19 +5179,14 @@ def test_snapshot_capture_reread_oserror_retires_root():
     sdk = inputs_module.SdkInputs(
         sdk_dir=build_module._sdk_dir(), version="9.9"
     )
-    real_open = builtins.open
+    real_read_capped = inputs_module.read_capped
 
-    def guarded(file, *args, **kwargs):
-        mode = args[0] if args else kwargs.get("mode", "r")
-        if (
-            isinstance(file, str)
-            and "mojobpf-inputs-" in file
-            and mode == "rb"
-        ):
+    def guarded(path, *args, **kwargs):
+        if isinstance(path, str) and "mojobpf-inputs-" in path:
             raise OSError("injected reread fault")
-        return real_open(file, *args, **kwargs)
+        return real_read_capped(path, *args, **kwargs)
 
-    builtins.open = guarded
+    inputs_module.read_capped = guarded
     try:
         try:
             inputs_module.capture_build_inputs(
@@ -5205,7 +5200,7 @@ def test_snapshot_capture_reread_oserror_retires_root():
         else:
             raise AssertionError("reread fault was accepted")
     finally:
-        builtins.open = real_open
+        inputs_module.read_capped = real_read_capped
     assert [
         name for name in os.listdir(parent)
         if name.startswith("mojobpf-inputs-")

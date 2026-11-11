@@ -139,6 +139,35 @@ def test_shipped_set_covers_scrubbed_files():
     print("PASS shipped set covers %d files" % len(shipped))
 
 
+def test_tracked_sources_carry_spdx_headers():
+    # licensing.md: every first-party source file carries an SPDX
+    # header. Sweep all tracked .py/.mojo/.md (shipped and tests
+    # alike); the marker must sit in the first five lines, so a
+    # fixture string deep in a test body cannot satisfy the file.
+    try:
+        raw = subprocess.check_output(
+            ["git", "ls-files", "*.py", "*.mojo", "*.md"],
+            cwd=REPO_ROOT, timeout=120,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AssertionError(
+            "cannot derive tracked files (git ls-files failed): %s" % exc
+        )
+    names = sorted(raw.decode("utf-8").split())
+    assert names, "tracked source set is empty"
+    misses = []
+    for name in names:
+        path = os.path.join(REPO_ROOT, name)
+        with open(path, encoding="utf-8") as handle:
+            head = "".join(
+                line for _, line in zip(range(5), handle)
+            )
+        if "SPDX-License-Identifier" not in head:
+            misses.append(name)
+    assert not misses, "missing SPDX header: %s" % ", ".join(misses)
+    print("PASS SPDX headers in %d tracked sources" % len(names))
+
+
 def test_no_internal_ids_or_private_paths_in_shipped_files():
     hits, scanned, skipped = scan_shipped()
     assert scanned > 200, "guard scanned too few files: %d" % scanned
@@ -160,9 +189,10 @@ def main():
         print("REFUSED: must not run under python -O (asserts stripped)")
         return 2
     failures = 0
-    for name, func in sorted(
+    checks = sorted(
         [(k, v) for k, v in globals().items() if k.startswith("test_")]
-    ):
+    )
+    for name, func in checks:
         try:
             func()
         except AssertionError as exc:
@@ -170,7 +200,7 @@ def main():
             failures += 1
     if failures:
         return 1
-    print("leakage guard: 2 checks pass")
+    print("leakage guard: %d checks pass" % len(checks))
     return 0
 
 

@@ -101,7 +101,8 @@ registers 41 suites: the 28 release-matrix suites plus the 12
 Five kernels are claimed by the current tree: 6.6.0-060600-generic,
 6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic,
 and 7.4.0-070400rc1-generic. A kernel is claimed only when the
-full 41-suite matrix passes on its lane; the v1.0 matrix passes
+full 41-suite matrix passes on its lane apart from the ruled
+exclusions following this paragraph; the v1.0 matrix passes
 197/205 cells with 0 red and 0 unexplained (see
 [evidence-1.0.0.md](evidence-1.0.0.md)). Two ruled cell groups stay
 out of claim: the joint suite (needs libbpf-mojo inputs,
@@ -608,7 +609,7 @@ host suites, selected-but-refused vectors).
   limitations above; reservation: see
   `examples/ringbuf_reserve/README.md` and `sdk.md`'s
   `mojobpf.events`; uprobe: see Measured uprobe behavior
-  below). Other
+  above). Other
   events, other filters, context reads outside the pinned
   uprobe word, and per-CPU counting are refused or unclaimed.
 * Multi-program objects, other map kinds and sizes (LPM
@@ -621,7 +622,8 @@ host suites, selected-but-refused vectors).
   above); the kind is refused under every claimed profile.
 * Kernels outside the five claimed lanes: only 6.6.0, 6.12.0,
   7.0.14, 7.2.0, and 7.4.0-rc1 are claimed (each by a full
-  41-suite matrix pass on its lane); the historical alpha
+  41-suite matrix pass on its lane apart from the ruled
+  exclusions); the historical alpha
   verdicts do not qualify the current tree.
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header

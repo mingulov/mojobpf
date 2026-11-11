@@ -1876,8 +1876,25 @@ class BuildSnapshot:
                     if not os.path.isfile(path):
                         continue
                     try:
-                        with open(path, "rb") as handle:
-                            content = handle.read()
+                        observed[os.path.normpath(path)] = (
+                            hash_file_capped(
+                                path, limit=MOJO_LIMIT,
+                                kind="staged build input",
+                            ).hexdigest()
+                        )
+                    except FileTooLargeError as exc:
+                        raise _fail(
+                            "captured build input %r exceeds the "
+                            "%d-byte staged-input cap during "
+                            "re-verification: %s"
+                            % (
+                                self.display_path(path),
+                                MOJO_LIMIT, exc,
+                            ),
+                            self.display_path(path),
+                            "rebuild without modifying inputs while "
+                            "the build runs",
+                        ) from None
                     except OSError as exc:
                         raise _fail(
                             "captured build input %r became "
@@ -1887,9 +1904,6 @@ class BuildSnapshot:
                             "rebuild without modifying inputs while "
                             "the build runs",
                         ) from None
-                    observed[os.path.normpath(path)] = (
-                        hashlib.sha256(content).hexdigest()
-                    )
         for path in sorted(set(observed) - set(expected)):
             raise _fail(
                 "unexpected file %r appeared in the captured "
@@ -1919,12 +1933,27 @@ class BuildSnapshot:
                 )
         for entry in self.stdlib_seal:
             observed_digest: str | None = None
+            if entry.logical == "modular.cfg":
+                seal_cap = SDK_CONFIG_LIMIT
+                seal_kind = "SDK config"
+            else:
+                seal_cap = STDLIB_PAYLOAD_LIMIT
+                seal_kind = "stdlib payload"
             if entry.path is not None:
                 try:
-                    with open(entry.path, "rb") as handle:
-                        observed_digest = hashlib.sha256(
-                            handle.read()
-                        ).hexdigest()
+                    observed_digest = hash_file_capped(
+                        entry.path, limit=seal_cap, kind=seal_kind,
+                    ).hexdigest()
+                except FileTooLargeError as exc:
+                    raise _fail(
+                        "installed standard library file %r "
+                        "exceeds the %d-byte cap during "
+                        "re-verification: %s"
+                        % (entry.logical, seal_cap, exc),
+                        entry.path,
+                        "rebuild without modifying the toolchain "
+                        "while the build runs",
+                    ) from None
                 except OSError:
                     observed_digest = None
             if (observed_digest or "missing") != entry.sha256:
@@ -1940,10 +1969,18 @@ class BuildSnapshot:
             if entry.staged is None:
                 continue
             try:
-                with open(entry.staged, "rb") as handle:
-                    staged_digest: str | None = hashlib.sha256(
-                        handle.read()
-                    ).hexdigest()
+                staged_digest: str | None = hash_file_capped(
+                    entry.staged, limit=seal_cap, kind=seal_kind,
+                ).hexdigest()
+            except FileTooLargeError as exc:
+                raise _fail(
+                    "staged standard library file %r exceeds "
+                    "the %d-byte cap during re-verification: %s"
+                    % (entry.logical, seal_cap, exc),
+                    entry.staged,
+                    "rebuild without modifying the toolchain "
+                    "while the build runs",
+                ) from None
             except OSError:
                 staged_digest = None
             if staged_digest is None:
@@ -2307,8 +2344,18 @@ def _capture_inside(
             continue
         scanned.add(identity)
         try:
-            with open(current.staged, "rb") as handle:
-                staged_bytes = handle.read()
+            staged_bytes = read_capped(
+                current.staged, limit=MOJO_LIMIT, kind="Mojo source"
+            )
+        except FileTooLargeError as exc:
+            raise _fail(
+                "captured build input %r exceeds the %d-byte "
+                "Mojo source cap during capture: %s"
+                % (current.origin, MOJO_LIMIT, exc),
+                current.origin,
+                "rebuild without modifying inputs while the "
+                "build runs",
+            ) from None
         except OSError as exc:
             raise _fail(
                 "captured build input %r became unreadable "

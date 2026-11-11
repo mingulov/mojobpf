@@ -34,8 +34,9 @@ Exit codes: 0 when every selected suite passed in every selected
 lane; 1 when any suite failed or reported an environment failure;
 2 for setup problems (dirty tree, runner/QEMU mismatch, consumer
 PATH shadowing the locked runner, missing lane cache, bad
-lockfile). Skips never occur: an unrun lane or suite is a
-failure, not a pass.
+lockfile). Only the pinned ``LANE_SUITE_EXCLUSIONS`` cells skip,
+loudly and marked ``excluded``; any other unrun lane or suite is
+a failure, not a pass.
 
 Suites report through the structured result protocol, not line
 scraping: each suite seals a ``test-contracts-v1`` run plan,

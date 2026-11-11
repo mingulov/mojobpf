@@ -1,5 +1,6 @@
 {
   "$comment": "Structural validity is not budget approval. Duplicate-free finite JSON and exact integer version checks are enforced by the collector. Assessment requires independently admitted approval and reproduced report carriers.",
+  "license": "Apache-2.0 WITH LLVM-exception",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "allOf": [

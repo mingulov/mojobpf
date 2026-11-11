@@ -111,9 +111,15 @@ def resolve_under_root(path: str, root: str) -> str | None:
     the comparison; lexical containment alone is never sufficient.
     Resolve-once-compare callers must still treat the window between
     this check and the subsequent open as untrusted input.
+    A path realpath cannot resolve (embedded NUL) has no
+    realpath under any root, so it returns None like any other
+    escape instead of raising.
     """
-    resolved = os.path.realpath(path)
-    anchor = os.path.realpath(root)
+    try:
+        resolved = os.path.realpath(path)
+        anchor = os.path.realpath(root)
+    except ValueError:
+        return None
     if os.path.commonpath([resolved, anchor]) != anchor:
         return None
     return resolved
