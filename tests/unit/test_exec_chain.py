@@ -14,6 +14,7 @@ repository root) or directly (``python3 tests/unit/test_exec_chain.py``).
 
 from contextlib import contextmanager
 import os
+import shutil
 import sys
 import tempfile
 
@@ -149,6 +150,53 @@ def test_cycle_fails_closed():
 def test_deep_chain_fails_closed():
     with _fixture() as fix:
         assert exec_chain.follow_exec_target(fix["deep"]) is None
+
+
+def test_oversized_hop_fails_closed_like_product():
+    # A hop past the 64KiB analysis window refuses in both
+    # resolvers: the harness must never truncate and analyze a
+    # prefix (a late exec line flips the form).
+    with tempfile.TemporaryDirectory(prefix="exec-chain-huge-") as root:
+        binary = os.path.join(root, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        hop = os.path.join(root, "hop")
+        padding = "# pad\n" * 12000
+        with open(hop, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\n%s\nexec \"%s\" \"$@\"\n" % (padding, binary))
+        os.chmod(hop, 0o755)
+        assert os.path.getsize(hop) > 65536, os.path.getsize(hop)
+        launcher = os.path.join(root, "launcher")
+        _write(launcher, "#!/bin/sh\nexec \"%s\" \"$@\"\n" % hop)
+        assert exec_chain.follow_exec_target(launcher) is None
+        captured = execution_module.capture_chain(launcher)
+        assert captured.form == execution_module.FORM_UNKNOWN, captured
+
+
+def test_exact_window_hop_resolves_in_both():
+    # Boundary pin: a hop of exactly 64KiB still resolves in
+    # both the harness and the product (no off-by-one refusal).
+    with tempfile.TemporaryDirectory(prefix="exec-chain-edge-") as root:
+        binary = os.path.join(root, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        hop = os.path.join(root, "hop")
+        tail = "exec \"%s\" \"$@\"\n" % binary
+        head = "#!/bin/sh\n"
+        padding = "#" * (65536 - len(head) - len(tail) - 1) + "\n"
+        with open(hop, "w", encoding="utf-8") as handle:
+            handle.write(head + padding + tail)
+        os.chmod(hop, 0o755)
+        assert os.path.getsize(hop) == 65536, os.path.getsize(hop)
+        launcher = os.path.join(root, "launcher")
+        _write(launcher, "#!/bin/sh\nexec \"%s\" \"$@\"\n" % hop)
+        assert exec_chain.follow_exec_target(launcher) == os.path.realpath(
+            binary
+        )
+        captured = execution_module.capture_chain(launcher)
+        assert captured.form == (
+            execution_module.FORM_EXEC_LAUNCHER
+        ), captured
 
 
 def test_missing_entry_fails_closed():
@@ -700,6 +748,383 @@ def test_window_boundary_launcher_still_admits():
         assert os.path.getsize(launcher) == limit + 2
         captured = execution_module.capture_chain(launcher)
         assert captured.form == execution_module.FORM_EXEC_LAUNCHER, captured
+
+
+def _startup_console_admission(parent, startup_files):
+    """Build a console-script admission tree; return (request, pins).
+
+    ``startup_files`` maps root-relative paths to byte payloads
+    (parent dirs are created). The pinned module itself is
+    always clean; only the listed startup spellings vary.
+    """
+    bindir = os.path.join(parent, "bin")
+    root = os.path.join(parent, "root")
+    os.makedirs(bindir)
+    os.makedirs(root)
+    entry = os.path.join(bindir, "tool")
+    _write(entry, "#!%s\nprint('hi')\n" % sys.executable)
+    mod_path = os.path.join(root, "pkgmod.py")
+    with open(mod_path, "w", encoding="utf-8") as handle:
+        handle.write("VALUE = 1\n")
+    for relpath, payload in startup_files.items():
+        full = os.path.join(root, relpath)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(payload)
+    request = execution_module.ExecutionRequest(
+        name="tool", argv0=entry, allow_path_lookup=False
+    )
+    pins = execution_module.ExecutionPins(
+        entry_sha256=execution_module.sha256_file(entry),
+        interpreter_sha256=execution_module.sha256_file(
+            sys.executable
+        ),
+        interpreter_pin_present=True,
+        modules=(("pkgmod", execution_module.sha256_file(mod_path)),),
+        python_path=(root,),
+    )
+    return request, pins
+
+
+def _startup_payload(parent, spelling):
+    """Honest payload per spelling: importable where feasible."""
+    if spelling.endswith(".pyc"):
+        import py_compile
+        src = os.path.join(parent, "site_src.py")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write("VALUE = 2\n")
+        compiled = os.path.join(parent, "site_compiled.pyc")
+        py_compile.compile(src, cfile=compiled, doraise=True)
+        with open(compiled, "rb") as handle:
+            return handle.read()
+    if spelling.endswith(".py"):
+        return b"VALUE = 3\n"
+    # Extension spellings: FileFinder resolves these by name
+    # (see test_startup_spellings_are_finder_importable), so
+    # placeholder bytes exercise the same guard path a hostile
+    # build would trip; compiling a hostile .so adds no further
+    # refusal signal.
+    return b"placeholder-bytes"
+
+
+def _startup_spellings():
+    import importlib.machinery
+    spellings = []
+    for name in ("sitecustomize", "usercustomize"):
+        spellings.append("%s.py" % name)
+        spellings.append("%s.pyc" % name)
+        spellings.append(os.path.join(name, "__init__.py"))
+        spellings.append(os.path.join(name, "__init__.pyc"))
+        for ext in importlib.machinery.EXTENSION_SUFFIXES:
+            spellings.append("%s%s" % (name, ext))
+            spellings.append(
+                os.path.join(name, "__init__%s" % ext)
+            )
+    return spellings
+
+
+def test_console_root_startup_spellings_refused():
+    for spelling in _startup_spellings():
+        with tempfile.TemporaryDirectory(
+            prefix="exec-chain-startup-"
+        ) as parent:
+            payload = _startup_payload(parent, spelling)
+            request, pins = _startup_console_admission(
+                parent, {spelling: payload}
+            )
+            try:
+                execution_module.admit_execution(request, pins)
+            except execution_module.AdmissionError as exc:
+                assert exc.reason == (
+                    execution_module.REASON_MODULE_MISMATCH
+                ), (spelling, exc)
+                assert "startup" in str(exc), (spelling, exc)
+            else:
+                raise AssertionError(
+                    "admitted root carrying %s" % spelling
+                )
+
+
+def test_startup_spellings_are_finder_importable():
+    # Every refused spelling genuinely resolves through the
+    # interpreter's FileFinder: the guard refuses real import
+    # paths, not phantoms.
+    import importlib.machinery
+    hook = importlib.machinery.FileFinder.path_hook(
+        (
+            importlib.machinery.ExtensionFileLoader,
+            importlib.machinery.EXTENSION_SUFFIXES,
+        ),
+        (
+            importlib.machinery.SourceFileLoader,
+            importlib.machinery.SOURCE_SUFFIXES,
+        ),
+        (
+            importlib.machinery.SourcelessFileLoader,
+            importlib.machinery.BYTECODE_SUFFIXES,
+        ),
+    )
+    for spelling in _startup_spellings():
+        with tempfile.TemporaryDirectory(
+            prefix="exec-chain-startup-truth-"
+        ) as parent:
+            root = os.path.join(parent, "root")
+            os.makedirs(root)
+            payload = _startup_payload(parent, spelling)
+            full = os.path.join(root, spelling)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as handle:
+                handle.write(payload)
+            name = spelling.split(os.path.sep)[0].split(".")[0]
+            spec = hook(root).find_spec(name)
+            assert spec is not None, spelling
+            assert os.path.realpath(spec.origin) == os.path.realpath(
+                full
+            ), (spelling, spec.origin)
+
+
+def test_console_root_clean_admits():
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-startup-clean-"
+    ) as parent:
+        request, pins = _startup_console_admission(parent, {})
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
+
+
+def test_spawn_rescan_refuses_startup_planted_after_admission():
+    # A startup file planted on an admitted root after admission
+    # refuses at spawn time: the run records spawn failure and
+    # the planted bytes never execute.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-rescan-"
+    ) as parent:
+        request, pins = _startup_console_admission(parent, {})
+        admitted = execution_module.admit_execution(request, pins)
+        root = pins.python_path[0]
+        marker = os.path.join(parent, "RESCAN.marker")
+        with open(
+            os.path.join(root, "sitecustomize.py"), "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("open(%r, 'w').write('x')\n" % marker)
+        record = execution_module.run_admitted(admitted, ())
+        assert record.status == (
+            execution_module.STATUS_SPAWN_FAILED
+        ), record
+        assert "sitecustomize.py" in record.log_excerpt, record
+        assert not os.path.exists(marker), "planted bytes executed"
+
+
+def test_spawn_rescan_ignores_inert_files():
+    # Only startup spellings trip the spawn-time rescan: an
+    # inert file planted after admission still spawns cleanly.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-rescan-clean-"
+    ) as parent:
+        request, pins = _startup_console_admission(parent, {})
+        admitted = execution_module.admit_execution(request, pins)
+        root = pins.python_path[0]
+        with open(
+            os.path.join(root, "notes.txt"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("notes\n")
+        record = execution_module.run_admitted(admitted, ())
+        assert record.status == "ok", record
+        assert record.exit_code == 0, record
+
+
+def test_console_root_namespace_startup_dir_admits():
+    # Boundary pin: a bare sitecustomize/ directory with no
+    # __init__ is a namespace package, which executes nothing on
+    # import -- only executable spellings refuse.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-startup-ns-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent, {
+                os.path.join("sitecustomize", "notes.txt"): b"notes",
+                os.path.join("usercustomize", "notes.txt"): b"notes",
+            },
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
+
+
+def test_sha256_file_refuses_fifo_without_hanging():
+    # A FIFO swapped in for a hashed path must refuse promptly,
+    # never block on open: admission hashes untrusted paths.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hash-fifo-"
+    ) as parent:
+        fifo = os.path.join(parent, "input")
+        os.mkfifo(fifo)
+        try:
+            execution_module.sha256_file(fifo)
+        except execution_module.NonRegularFileError:
+            pass
+        else:
+            raise AssertionError("FIFO hashed instead of refused")
+
+
+def test_sha256_file_hashes_regular_and_symlinked_files():
+    # The bounded hash keeps its contract: regular files hash to
+    # the streaming SHA-256, and a symlink to a regular file (the
+    # admission layer binds link identity separately) still hashes.
+    import hashlib
+
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hash-regular-"
+    ) as parent:
+        target = os.path.join(parent, "target.bin")
+        payload = os.urandom(200000)
+        with open(target, "wb") as handle:
+            handle.write(payload)
+        expected = hashlib.sha256(payload).hexdigest()
+        assert (
+            execution_module.sha256_file(target) == expected
+        )
+        link = os.path.join(parent, "link.bin")
+        os.symlink(target, link)
+        assert (
+            execution_module.sha256_file(link) == expected
+        )
+
+
+def _hop_chain(parent, hop_shebang=None, hop_body=None):
+    # Two-hop launcher: entry --exec--> hop1 --exec--> /bin/true.
+    # hop1 runs through a test-owned interpreter copy so a swap
+    # between admission and spawn is observable.
+    interp = os.path.join(parent, "interp")
+    shutil.copy("/bin/sh", interp)
+    hop1 = os.path.join(parent, "hop1")
+    _write(
+        hop1,
+        "#!%s\n%s\n" % (hop_shebang or interp, hop_body or "exec /bin/true"),
+    )
+    entry = os.path.join(parent, "entry")
+    _write(entry, "#!/bin/sh\nexec \"%s\" \"$@\"\n" % hop1)
+    request = execution_module.ExecutionRequest(
+        name="hop",
+        argv0=entry,
+        allow_path_lookup=False,
+        forms=(execution_module.FORM_EXEC_LAUNCHER,),
+    )
+    pins = execution_module.ExecutionPins(
+        exec_sha256=execution_module.sha256_file("/bin/true"),
+        exec_pin_present=True,
+    )
+    return request, pins, interp
+
+
+def test_hop_interpreter_swap_refuses_spawn():
+    # Swapping a hop script's interpreter after admission must
+    # refuse the spawn: the swapped bytes must never execute.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hop-interp-"
+    ) as parent:
+        request, pins, interp = _hop_chain(parent)
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_EXEC_LAUNCHER
+        ), admitted
+        shutil.copy("/bin/false", interp)
+        record = execution_module.run_admitted(admitted, ())
+        assert record.status == (
+            execution_module.STATUS_SPAWN_FAILED
+        ), record
+        assert "drifted since admission" in (
+            record.log_excerpt
+        ), record
+
+
+def test_hop_chain_without_swap_spawns_cleanly():
+    # Control: the same two-hop chain spawns cleanly when
+    # nothing drifts between admission and spawn.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hop-clean-"
+    ) as parent:
+        request, pins, _interp = _hop_chain(parent)
+        admitted = execution_module.admit_execution(request, pins)
+        record = execution_module.run_admitted(admitted, ())
+        assert record.status == "ok", record
+        assert record.exit_code == 0, record
+
+
+def test_hop_with_env_interpreter_refuses_admission():
+    # A hop naming a PATH-resolved interpreter is ambient-
+    # dependent: refused at admission, like the entry rule.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hop-env-"
+    ) as parent:
+        request, pins, _interp = _hop_chain(
+            parent, hop_shebang="/usr/bin/env sh"
+        )
+        try:
+            execution_module.admit_execution(request, pins)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_LAUNCHER_UNKNOWN
+            ), exc
+        else:
+            raise AssertionError("env hop interpreter admitted")
+
+
+def test_hop_with_dangling_interpreter_refuses_admission():
+    # A hop naming an interpreter that cannot be identified
+    # refuses at admission: there is no pin to bind it later.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hop-dangling-"
+    ) as parent:
+        request, pins, _interp = _hop_chain(
+            parent,
+            hop_shebang=os.path.join(parent, "no-such-interp"),
+        )
+        try:
+            execution_module.admit_execution(request, pins)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_UNREADABLE
+            ), exc
+        else:
+            raise AssertionError("dangling hop interpreter admitted")
+
+
+def test_image_interpreter_swap_refuses_spawn():
+    # The terminus image may itself be a script: its
+    # interpreter binds exactly like a hop interpreter.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-image-interp-"
+    ) as parent:
+        interp = os.path.join(parent, "interp")
+        shutil.copy("/bin/sh", interp)
+        final = os.path.join(parent, "final.sh")
+        _write(final, "#!%s\nexit 0\n" % interp)
+        entry = os.path.join(parent, "entry")
+        _write(entry, "#!/bin/sh\nexec \"%s\" \"$@\"\n" % final)
+        request = execution_module.ExecutionRequest(
+            name="hop",
+            argv0=entry,
+            allow_path_lookup=False,
+            forms=(execution_module.FORM_EXEC_LAUNCHER,),
+        )
+        pins = execution_module.ExecutionPins(
+            exec_sha256=execution_module.sha256_file(final),
+            exec_pin_present=True,
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_EXEC_LAUNCHER
+        ), admitted
+        shutil.copy("/bin/false", interp)
+        record = execution_module.run_admitted(admitted, ())
+        assert record.status == (
+            execution_module.STATUS_SPAWN_FAILED
+        ), record
 
 
 def _direct_run():

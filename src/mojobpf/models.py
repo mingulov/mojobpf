@@ -3,7 +3,7 @@
 
 This module is a leaf: it imports only :mod:`mojobpf.diagnostics`
 (the stable diagnostic vocabulary) and :mod:`mojobpf.execution`
-(the ``execution-contract-v1`` command records), and it is imported
+(the ``execution-contract-v2`` command records), and it is imported
 by both :mod:`mojobpf.build` (the driver) and
 :mod:`mojobpf.evidence` (provenance capture and publication). The
 build result/request models used to live in the driver, which

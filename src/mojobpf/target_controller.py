@@ -383,6 +383,10 @@ def load_approved_chain(summary: dict) -> execution.AdmittedExecution:
              "unsupported execution form")
     _require(type(summary["hops"]) is list and type(summary["modules"]) is list,
              "invalid chain identity sequence")
+    _require(type(summary["hop_interpreters"]) is list, "invalid hop interpreter sequence")
+    hop_interpreters = [
+        None if item is None else _file_identity(item) for item in summary["hop_interpreters"]
+    ]
     modules, module_names = [], set()
     for item in summary["modules"]:
         _mapping(item, {"name", "file"})
@@ -423,7 +427,8 @@ def load_approved_chain(summary: dict) -> execution.AdmittedExecution:
         image=_file_identity(summary["image"]), interpreter=(None if summary["interpreter"] is None
                                                             else _file_identity(summary["interpreter"])),
         modules=tuple(modules), version=summary["version"], argv_prefix=prefix,
-        env_unset=unset, env_set=tuple(overlay), digest=summary["digest"])
+        env_unset=unset, env_set=tuple(overlay), digest=summary["digest"],
+        hop_interpreters=tuple(hop_interpreters))
     if admitted.form == execution.FORM_SCRIPT_DATA:
         _require(admitted.interpreter is not None and
                  admitted.argv_prefix == (admitted.interpreter.path, admitted.entry.path),
@@ -433,8 +438,11 @@ def load_approved_chain(summary: dict) -> execution.AdmittedExecution:
     if admitted.form == execution.FORM_EXEC_LAUNCHER:
         _require(bool(admitted.hops) and admitted.hops[0] == admitted.entry and admitted.hops[-1] == admitted.image,
                  "launcher endpoints differ from its hop identities")
+        _require(len(admitted.hop_interpreters) == len(admitted.hops),
+                 "launcher hop interpreters do not parallel its hops")
     else:
         _require(not admitted.hops and admitted.image == admitted.entry, "direct chain has inconsistent image identities")
+        _require(not admitted.hop_interpreters, "direct chain carries hop interpreter identities")
     _require((admitted.interpreter is None) == (admitted.form == execution.FORM_BINARY),
              "execution form has an inconsistent interpreter identity")
     _require(json_equal(execution.summarize(admitted), summary), "execution summary does not roundtrip exactly")

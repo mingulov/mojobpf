@@ -23,7 +23,7 @@ interpolated); owned staging keeps restrictive permissions and is
 removed on success, failure and interruption unless evidence
 retention was requested.
 
-The runner is admitted through ``execution-contract-v1`` before any
+The runner is admitted through ``execution-contract-v2`` before any
 guest boots: the ``vng`` entry, its ``exec`` chain, the Python
 interpreter behind its console script, the ``virtme_ng`` package
 modules it imports, the ``virtme-run`` launcher ``vng`` invokes
@@ -1571,7 +1571,7 @@ def _require_admitted_execution(execution: dict) -> dict:
     """Return the runner record or reject an unapproved chain.
 
     The admission boundary for :func:`verify_bytes`: the three
-    admission records must be genuine ``execution-contract-v1``
+    admission records must be genuine ``execution-contract-v2``
     admissions sharing one kernels-lock trust root, each matching
     that root's pins (names, versions, entry/exec/interpreter
     hashes, module tables, spawn argv and env sanitization) with
@@ -1778,7 +1778,7 @@ def verify_bytes(
     cannot make the attested digest describe bytes the guest never
     ran. ``lane`` is the resolved kernels-lock lane (see
     :func:`resolve_lane`) and ``execution`` is the admitted runner
-    record from admission (the ``execution-contract-v1`` chain
+    record from admission (the ``execution-contract-v2`` chain
     plus its PATH farm); anything else is rejected at the
     admission boundary before any staging or spawn.
 

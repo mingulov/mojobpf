@@ -473,6 +473,50 @@ def test_object_map_specs_missing_and_garbage_files():
         os.remove(path)
 
 
+def test_extra_member_refused():
+    # A map STRUCT carrying the four attributes plus an extra
+    # member fails closed: any other member set is refused.
+    blob, _offsets = _blob_and_offsets(
+        members=(
+            ("type", 3, 0),
+            ("key_size", 5, 32),
+            ("value_size", 7, 64),
+            ("max_entries", 9, 96),
+            ("var", 3, 128),
+        )
+    )
+    try:
+        inspect_module._parse_btf_map_attrs(blob, PATH)
+    except inspect_module._ElfError as exc:
+        assert exc.code == "MBPF402", exc.code
+        assert "unexpected members" in exc.explanation, (
+            exc.explanation
+        )
+    else:
+        raise AssertionError("extra member parsed")
+
+
+def test_duplicate_member_refused():
+    # A repeated member name collapses silently in a dict, so
+    # the parser counts members: duplicates fail closed too.
+    blob, _offsets = _blob_and_offsets(
+        members=(
+            ("type", 3, 0),
+            ("key_size", 5, 32),
+            ("value_size", 7, 64),
+            ("max_entries", 9, 96),
+            ("max_entries", 9, 128),
+        )
+    )
+    try:
+        inspect_module._parse_btf_map_attrs(blob, PATH)
+    except inspect_module._ElfError as exc:
+        assert exc.code == "MBPF402", exc.code
+        assert "duplicate" in exc.explanation, exc.explanation
+    else:
+        raise AssertionError("duplicate member parsed")
+
+
 def _direct_names():
     return sorted(
         name

@@ -2277,8 +2277,9 @@ def test_xdp_build_failure_discards_stages():
     suite._CACHED.clear()
     buffer = io.StringIO()
     try:
-        with contextlib.redirect_stdout(buffer):
-            code = suite.main()
+        with _simulated_admission_env():
+            with contextlib.redirect_stdout(buffer):
+                code = suite.main()
     finally:
         suite.build_object = real_build
         suite.shutil.which = real_which
@@ -3240,20 +3241,27 @@ def test_migrated_suite_preserves_failed_attempt_without_rerun(tmp_path):
     suite.vng_release = lambda: "v6.12"
     suite._RESULT = None
     suite._STAGE = None
+    admission = suite.tool_admission
+    saved_stage_pins = admission.stage_tool_pins
+    admission.stage_tool_pins = (
+        lambda env: dict(_FAKE_ADMISSION_PINS)
+    )
     try:
-        with pytest.raises(suite.ProofFailure):
-            suite.executed()
-        assert suite._STAGE is not None, (
-            "failed attempt preserved no stage"
-        )
-        assert os.path.isdir(suite._STAGE), suite._STAGE
-        with pytest.raises(suite.ProofFailure):
-            suite.executed()
-        assert len(calls) == 1, (
-            "finish evidence must not rerun the guest: %d runs"
-            % len(calls)
-        )
+        with _simulated_admission_env():
+            with pytest.raises(suite.ProofFailure):
+                suite.executed()
+            assert suite._STAGE is not None, (
+                "failed attempt preserved no stage"
+            )
+            assert os.path.isdir(suite._STAGE), suite._STAGE
+            with pytest.raises(suite.ProofFailure):
+                suite.executed()
+            assert len(calls) == 1, (
+                "finish evidence must not rerun the guest: %d runs"
+                % len(calls)
+            )
     finally:
+        admission.stage_tool_pins = saved_stage_pins
         (suite.build_object, suite.build_harness, suite._run_guest,
          suite.check_tools, suite.vng_release,
          suite._RESULT, suite._STAGE) = saved
@@ -3406,6 +3414,7 @@ def test_tracepoint_main_finalizes_cached_assertion_failure(tmp_path):
         injected,
         {"build_object": "obj", "build_harness": "bin"},
         "_run_guest",
+        pin_stub=_FAKE_ADMISSION_PINS,
     )
     assert code == 1, lines
     _plan, parsed, terminal = _parse_emitted(lines)
@@ -3430,6 +3439,7 @@ def test_tracepoint_main_finalizes_cached_lease_refusal(tmp_path):
         injected,
         {"build_object": "obj", "build_harness": "bin"},
         "_run_guest",
+        pin_stub=_FAKE_ADMISSION_PINS,
     )
     assert code == 3, lines
     _plan, parsed, terminal = _parse_emitted(lines)
@@ -3539,13 +3549,14 @@ def test_licenses_main_finalizes_cached_assertion_failure(tmp_path):
     # cases exercise their real parsing paths (recording
     # deterministic outcomes) instead of crashing main.
     injected = AssertionError("injected handoff refusal")
-    code, lines, calls, _suite = _drive_main_with_failing_guest(
-        "tests/verifier/test_helper_licenses.py", tmp_path,
-        injected,
-        {"build_control": "obj", "build_counter": "obj"},
-        "run_guest",
-        obj_bytes=_synthetic_license_object(),
-    )
+    with _simulated_admission_env():
+        code, lines, calls, _suite = _drive_main_with_failing_guest(
+            "tests/verifier/test_helper_licenses.py", tmp_path,
+            injected,
+            {"build_control": "obj", "build_counter": "obj"},
+            "run_guest",
+            obj_bytes=_synthetic_license_object(),
+        )
     assert code == 1, lines
     _plan, parsed, terminal = _parse_emitted(lines)
     assert terminal.decision["verdict"] == "FAIL", terminal.decision
@@ -3572,13 +3583,14 @@ def test_licenses_main_finalizes_cached_lease_refusal(tmp_path):
     injected = suite_probe.guest_proc.TargetLeaseRequired(
         "injected lease refusal"
     )
-    code, lines, calls, _suite = _drive_main_with_failing_guest(
-        "tests/verifier/test_helper_licenses.py", tmp_path,
-        injected,
-        {"build_control": "obj", "build_counter": "obj"},
-        "run_guest",
-        obj_bytes=_synthetic_license_object(),
-    )
+    with _simulated_admission_env():
+        code, lines, calls, _suite = _drive_main_with_failing_guest(
+            "tests/verifier/test_helper_licenses.py", tmp_path,
+            injected,
+            {"build_control": "obj", "build_counter": "obj"},
+            "run_guest",
+            obj_bytes=_synthetic_license_object(),
+        )
     assert code == 1, lines
     _plan, parsed, terminal = _parse_emitted(lines)
     assert terminal.decision["verdict"] == "FAIL", terminal.decision

@@ -299,6 +299,11 @@ and the emitted map type, dimensions, and relocations are exact
 per shape (`tests/elf/test_generalized_maps.py::test_btf_dims_per_shape`,
 `tests/elf/test_generalized_maps.py::test_map_section_and_relocations_per_shape`,
 `tests/elf/test_generalized_maps.py::test_bpftool_accepts_btf_per_shape`).
+Per-CPU-hash maps are implemented in-tree but unclaimed: no
+admitted profile accepts the kind (builds using it are refused
+with `MBPF101`/`MBPF205`), so the per-CPU-hash handle and
+semantics in this section document the frozen SDK surface, not
+a support claim (see [compatibility](compatibility.md)).
 
 * `MapHandle.load()` / `PercpuHandle.load()` /
   `HashHandle.load()` / `LruHandle.load()` /
@@ -361,8 +366,10 @@ the measured counts: hash kernel behavior ran at 4 entries
 (suite) plus an independent 2-entry read-modify-write
 consumer proof, the 1-entry hash shape is a load/unload
 proof, and layout, BTF, and relocation proofs cover every
-count at all 40 shapes. Per-CPU-hash behavior is proven per
-slot on both CPUs: lifecycle, exact counts, miss/insert
+count at all 40 shapes (32 claimed; the 8 per-CPU-hash shapes
+are implementation guards, unclaimed). Per-CPU-hash behavior
+is exercised per slot on both CPUs as implementation guards,
+not as a support claim: lifecycle, exact counts, miss/insert
 scoping, delete, iteration with exact per-slot bytes, the
 full-map `E2BIG` refusal, and CPU isolation
 (`tests/kernel/test_percpu_hash_maps.py::test_lifecycle_init_run_observe`,

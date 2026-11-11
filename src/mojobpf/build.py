@@ -15,7 +15,7 @@ the supported export roots and entry/section pairs
 and license form already gated at parse), validates the license
 declaration pair (``MBPF701``/``703``/``704``), admits ``mojo`` and
 ``llc`` against the pinned lockfile (``MBPF102``/``103``/``104``)
-through ``execution-contract-v1`` (resolved once, hashed,
+through ``execution-contract-v2`` (resolved once, hashed,
 pin-checked -- including the launcher ``exec`` target -- before
 any probe runs), admits the adapter service (the packaged default
 is pin-checked when the lock carries adapter pins; an explicit
@@ -204,6 +204,7 @@ from .execution import (
     identify_file,
     kill_child_group,
     popen_admitted,
+    sha256_file,
     verify_spawn,
 )
 from .inputs import (
@@ -278,7 +279,7 @@ STAGE_BUILD_DIAGNOSE = "build.diagnose"
 
 # Subprocess status vocabulary (``STATUS_*``) and the per-step
 # :class:`CommandRecord` live in :mod:`mojobpf.execution`
-# (``execution-contract-v1``); the versioned build models live in
+# (``execution-contract-v2``); the versioned build models live in
 # :mod:`mojobpf.models`. Both are re-exported here (see the imports
 # above) so existing ``mojobpf.build`` importers keep working.
 
@@ -384,6 +385,16 @@ ENTRY_PROGRAM_SECTIONS = {
     "socket_entry": ("socket", _section_for_program_type("socket")),
     "tc_entry": ("tc", _section_for_program_type("tc")),
 }
+
+# Every section name the capability registry treats as a BPF
+# program section, across all profiles. The staged-object gate
+# refuses an object carrying any of these beyond the one its
+# manifest program declares.
+REGISTRY_PROGRAM_SECTIONS = frozenset(
+    pair[1]
+    for profile in SUPPORTED_PROFILES.values()
+    for pair in profile.allowed_pairs
+)
 
 # Transform names attested in build evidence, in pipeline order. The
 # adapter entry names the route that produced the IR, so evidence
@@ -823,7 +834,7 @@ class _SetupSeal:
     pipeline compiles from the staged paths and the evidence
     capture re-hashes the same staged bytes, rejecting any drift
     against this seal. ``tool_executions`` and
-    ``adapter_execution`` are the ``execution-contract-v1``
+    ``adapter_execution`` are the ``execution-contract-v2``
     admissions every step spawns through; ``adapter_trust``
     records the adapter choice (see :class:`BuildProvenance`).
     ``source_files`` names the origin program paths (for
@@ -964,11 +975,10 @@ def _display_record(
 
 
 def _sha256_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # Delegate to the bounded execution hash: lockfile and tool
+    # paths are caller-supplied, so a FIFO there must refuse
+    # instead of hanging on open (round-4 FIFO race).
+    return sha256_file(path)
 
 
 def _excerpt(stderr: str) -> str:
@@ -1112,7 +1122,7 @@ def _run_step(
     failures become records.
 
     When ``execution`` is given, the step spawns through
-    ``execution-contract-v1``: ``argv`` must start with the
+    ``execution-contract-v2``: ``argv`` must start with the
     admitted prefix (compared by realpath), every captured
     identity is re-verified, and the child runs under the
     sanitized environment. ``execution=None`` is the fenced
@@ -4063,15 +4073,23 @@ def _program_section_outcome(program,
     The adapter emits the entry symbol's section from the
     audited source, so a source whose entry disagrees with the
     manifest program builds an object carrying another program
-    section. The declared section must be present; anything else
+    section. The declared section must be present and no other
+    registry program section may ride along; anything else
     fails closed here (``MBPF216``) instead of publishing a
     mislabeled artifact that disagrees with its manifest.
+    Metadata, debug and loader sections are not program
+    sections and never trip this gate.
     """
     try:
         sections = object_section_names(staged_obj)
     except InspectionError as exc:
         return [exc.diagnostic]
-    if program.section in sections:
+    carried = {
+        name
+        for name in sections
+        if name in REGISTRY_PROGRAM_SECTIONS
+    }
+    if program.section in sections and carried <= {program.section}:
         return []
     return [
         Diagnostic(
@@ -4083,7 +4101,7 @@ def _program_section_outcome(program,
                 "manifest program entry %r declares section %r"
                 % (
                     staged_obj,
-                    sorted(set(sections)),
+                    sorted(carried),
                     program.entry,
                     program.section,
                 )

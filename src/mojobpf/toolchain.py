@@ -11,7 +11,7 @@ the lockfile (and the requested profile, if any, is registered).
 :func:`admit_tools` reuses the same discovery and pin matching to
 admit exactly the named build tools for one locked build.
 
-Admission runs through ``execution-contract-v1``
+Admission runs through ``execution-contract-v2``
 (:mod:`mojobpf.execution`): every tool is resolved once, hashed, and
 compared against its lockfile pin -- including the launcher ``exec``
 target -- before any ``--version`` probe starts, and probes execute
@@ -211,7 +211,7 @@ class ToolInfo:
     and, for launchers, the ``exec_sha256``. A tool rejected against
     its pin before probing carries ``version=None``: the probe never
     ran, so there is no version to report. ``execution`` holds the
-    ``execution-contract-v1`` admission when the tool was fully
+    ``execution-contract-v2`` admission when the tool was fully
     admitted (present and pin-matched), else None. ``dialect`` is
     the frontend-dialect canary verdict for mojo (``"match"``,
     ``"skip"`` or ``"mismatch"``), else None when the canary never
@@ -1030,7 +1030,7 @@ def load_toolchain_document(lockfile_path: str) -> dict | None:
             lockfile_path, limit=LOCK_LIMIT, kind="lockfile"
         ).decode("utf-8")
         data = _parse_lock_document(raw)
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -1175,7 +1175,7 @@ def admit_tools(
     """Admit named build tools against a lockfile for one build.
 
     Admits exactly ``names`` (default the build tools ``mojo`` and
-    ``llc``) through ``execution-contract-v1``: each tool is
+    ``llc``) through ``execution-contract-v2``: each tool is
     resolved once, hashed, and compared against its lockfile pin
     (entry hash, launcher ``exec`` hash, then the version probe
     through the admitted chain). Admission is all-or-nothing: the

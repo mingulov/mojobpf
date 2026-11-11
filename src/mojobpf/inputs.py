@@ -334,7 +334,7 @@ def build_spawn_env(
     """Build a child environment purely from one ambient snapshot.
 
     ``ambient`` is the single spawn-time snapshot. The
-    admission overlay applies first (``execution-contract-v1``
+    admission overlay applies first (``execution-contract-v2``
     sanitization order: unset names dropped, then the ambient
     filtered to the spawn allowlist, then set values
     overlaid), then the snapshot pin (absent names and unpinned

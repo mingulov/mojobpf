@@ -76,13 +76,20 @@ def _has_shebang(path):
 
 
 def _read_script_text(path):
-    """Return the script text, or None when not a readable script."""
+    """Return the script text, or None when not a readable script.
+
+    Mirrors the product's analysis window exactly: a script past
+    the window is unanalyzable (None), never truncated, since a
+    late exec line past the window flips the chain's form.
+    """
     try:
         with open(path, "rb") as handle:
             head = handle.read(2)
             if head != b"#!":
                 return None
-            rest = handle.read(SCRIPT_LIMIT)
+            rest = handle.read(SCRIPT_LIMIT + 1)
+            if len(rest) > SCRIPT_LIMIT:
+                return None
     except OSError:
         return None
     try:

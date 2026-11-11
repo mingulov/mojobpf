@@ -55,9 +55,10 @@ def chain_fixture(tmp_path):
     identity = execution.identify_file(str(image))
     # This historical record is assembled without admission or a version probe.
     summary = {
-        "contract": "execution-contract-v1", "name": "runner", "form": "binary",
+        "contract": "execution-contract-v2", "name": "runner", "form": "binary",
         "trust_root": "fixture-external-approval", "entry": vars(identity),
-        "hops": [], "image": vars(identity), "interpreter": None, "modules": [],
+        "hops": [], "image": vars(identity), "interpreter": None,
+        "hop_interpreters": [], "modules": [],
         "version": "historical observation 7.4", "argv_prefix": [str(image)],
         "env_unset": list(execution.SPAWN_ENV_UNSET),
         "env_set": [list(pair) for pair in execution.PYTHON_ENV_SET],
@@ -186,6 +187,16 @@ def test_summary_roundtrip_and_spawn_reverification(tmp_path, controller):
     assert isinstance(admitted, execution.AdmittedExecution)
     assert execution.summarize(admitted) == summary
     Path(summary["entry"]["path"]).write_bytes(b"replacement")
+    with pytest.raises(controller.ControllerError) as error:
+        controller.load_approved_chain(summary)
+    assert error.value.code == "ADMISSION_REFUSED"
+
+
+def test_summary_rejects_v1_shape_without_hop_interpreters(tmp_path, controller):
+    summary = chain_fixture(tmp_path)
+    summary["contract"] = "execution-contract-v1"
+    del summary["hop_interpreters"]
+    summary["digest"] = digest_of({key: value for key, value in summary.items() if key != "digest"})
     with pytest.raises(controller.ControllerError) as error:
         controller.load_approved_chain(summary)
     assert error.value.code == "ADMISSION_REFUSED"

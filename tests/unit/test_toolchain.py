@@ -299,6 +299,42 @@ def test_missing_lockfile_file_fails_loudly():
     assert report.supported is False
 
 
+def test_deeply_nested_lockfile_diagnosed_not_crash():
+    # Nesting past the recursion limit (inside the 1MB cap) is a
+    # diagnosed refusal at every loader, never an uncaught
+    # RecursionError: load_toolchain_document matches its sibling.
+    # Stock CPython masks this via the C scanner; interpreters
+    # without C speedups use the pure-Python scanner, which raises
+    # RecursionError on deep nesting. Force that scanner here.
+    import json.scanner
+
+    from mojobpf.toolchain import (
+        check_toolchain_distribution,
+        load_toolchain_document,
+    )
+    path = os.path.join(
+        tempfile.mkdtemp(prefix="lockfile-test-"), "toolchains.lock.json"
+    )
+    depth = 2000
+    nested = '{"a":' * depth + "1" + "}" * depth
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write('{"schema_version": 1, "tools": {}, "nest": ' + nested + "}")
+    assert os.path.getsize(path) < 1024 * 1024
+    previous = json.scanner.make_scanner
+    json.scanner.make_scanner = json.scanner.py_make_scanner
+    try:
+        assert load_toolchain_document(path) is None
+        assert check_toolchain_distribution(path) is None
+        bindir, _versions = write_tool_bindir()
+        report = probe_toolchain(
+            ToolchainConfig(lockfile_path=path, search_paths=(bindir,))
+        )
+        assert report.lockfile_status == "unreadable"
+        assert codes(report) == ["MBPF104"]
+    finally:
+        json.scanner.make_scanner = previous
+
+
 def test_invalid_lockfile_json_fails_loudly():
     path = os.path.join(
         tempfile.mkdtemp(prefix="lockfile-test-"), "toolchains.lock.json"
@@ -867,7 +903,7 @@ def test_admit_tools_attaches_executions():
     for name in ("mojo", "llc"):
         execution = admitted[name].execution
         assert execution is not None, name
-        assert execution.contract == "execution-contract-v1", name
+        assert execution.contract == "execution-contract-v2", name
         assert execution.digest, name
         assert execution.argv_prefix[0] == admitted[name].path, name
 

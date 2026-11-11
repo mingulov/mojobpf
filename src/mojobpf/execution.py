@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""execution-contract-v1: admit the complete execution chain before probing it.
+"""execution-contract-v2: admit the complete execution chain before probing it.
 
 Every subprocess the driver runs -- compiler probes and builds, the
 adapter service, the guest runner and its emulator -- flows through
@@ -38,7 +38,8 @@ Supported executable forms (resolved explicitly; anything else is
   invocations and every other shell form are rejected, never
   guessed. The entry itself is executed (preserving ``argv[0]``
   semantics)
-  after every hop's identity is captured, and the same identities
+  after every hop's identity -- and every script hop's own
+  interpreter identity -- is captured, and the same identities
   are re-verified at spawn. Launchers must be pinned: admission
   without an ``exec`` pin, or with an unresolvable chain, is
   rejected.
@@ -57,9 +58,11 @@ Supported executable forms (resolved explicitly; anything else is
   binds to the verified roots before any probe executes: a
   declared root shadowing a verified module (or any ancestor
   package, or the standard library) is rejected without
-  executing. Admitted module roots carrying
-  ``sitecustomize.py``/``usercustomize.py`` are rejected: those
-  files would execute at every spawn.
+  executing. Admitted module roots carrying any importable
+  spelling of ``sitecustomize``/``usercustomize`` (source,
+  bytecode, extension module, or package ``__init__``) are
+  rejected, at admission and again immediately before spawn:
+  those files would execute at every spawn.
 * ``script-data``: a script passed as data to an already-running
   interpreter (the adapter service). Never executed directly; the
   ``argv`` prefix is ``[interpreter, script]``.
@@ -101,7 +104,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from time import monotonic as _monotonic
 
-EXECUTION_CONTRACT_VERSION = "execution-contract-v1"
+EXECUTION_CONTRACT_VERSION = "execution-contract-v2"
 
 
 def resolve_under_root(path: str, root: str) -> str | None:
@@ -582,6 +585,9 @@ class AdmittedExecution:
     overlay applied to the ambient environment, and ``digest`` the
     run-local identity of this admission (canonical JSON over the
     record; paths make it run-local, not portable).
+    ``hop_interpreters`` parallels ``hops`` with each hop's
+    bound interpreter identity (``None`` for a binary hop);
+    the spawn recheck watches every bound entry.
     """
 
     contract: str
@@ -598,9 +604,13 @@ class AdmittedExecution:
     env_unset: tuple[str, ...]
     env_set: tuple[tuple[str, str], ...]
     digest: str = field(compare=False)
+    hop_interpreters: tuple[FileIdentity | None, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hops", tuple(self.hops))
+        object.__setattr__(
+            self, "hop_interpreters", tuple(self.hop_interpreters)
+        )
         object.__setattr__(self, "modules", tuple(self.modules))
         object.__setattr__(self, "argv_prefix", tuple(self.argv_prefix))
         object.__setattr__(self, "env_unset", tuple(self.env_unset))
@@ -616,7 +626,11 @@ class CapturedChain:
     every launcher hop's identity including the final image; for
     non-launcher forms it is empty and ``image`` is the entry
     itself. ``interpreter`` is the shebang interpreter path (or
-    ``None`` for binaries). ``note`` explains ``unknown`` forms.
+    ``None`` for binaries). ``hop_interpreters`` parallels
+    ``hops`` with each hop's own shebang path (``None`` for a
+    binary hop); every script hop executes through its
+    interpreter, so every one binds at admission like the
+    entry's. ``note`` explains ``unknown`` forms.
     """
 
     form: str
@@ -624,14 +638,34 @@ class CapturedChain:
     image: FileIdentity
     interpreter: str | None
     note: str = ""
+    hop_interpreters: tuple[str | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "hops", tuple(self.hops)
+        )
+        object.__setattr__(
+            self, "hop_interpreters", tuple(self.hop_interpreters)
+        )
 
 
 def sha256_file(path: str) -> str:
-    """Return the hex SHA-256 of a file's bytes."""
+    """Return the hex SHA-256 of a regular file's bytes.
+
+    The file is opened through the bounded non-blocking path, so a
+    FIFO swapped in for the hashed path refuses promptly instead of
+    hanging on open; memory stays chunk-bounded either way.
+    """
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
+    fd = _open_bound(path, "hash input")
+    try:
+        while True:
+            chunk = os.read(fd, _CAPPED_CHUNK)
+            if not chunk:
+                break
             digest.update(chunk)
+    finally:
+        os.close(fd)
     return digest.hexdigest()
 
 
@@ -2202,11 +2236,13 @@ def _capture_launcher(
 ) -> CapturedChain:
     """Capture a single-exec launcher's hop chain (no spawn)."""
     hops: list[FileIdentity] = [entry]
+    hop_interps: list[str | None] = [interpreter]
     seen = {entry.realpath}
     current = entry.realpath
     for _ in range(_EXEC_CHAIN_LIMIT):
         text = _read_script_text(current)
         if text is None:
+            hop_interps[-1] = None
             if _has_shebang(current) and not _is_elf(current):
                 return CapturedChain(
                     form=FORM_UNKNOWN,
@@ -2214,6 +2250,7 @@ def _capture_launcher(
                     image=hops[-1],
                     interpreter=interpreter,
                     note="launcher hop %r is not analyzable" % (current,),
+                    hop_interpreters=tuple(hop_interps),
                 )
             if hops and hops[-1].realpath == current:
                 image = hops[-1]
@@ -2227,13 +2264,38 @@ def _capture_launcher(
                         image=hops[-1],
                         interpreter=interpreter,
                         note="launcher target unreadable: %s" % exc.detail,
+                        hop_interpreters=tuple(hop_interps),
                     )
                 hops.append(image)
+                hop_interps.append(None)
             return CapturedChain(
                 form=FORM_EXEC_LAUNCHER,
                 hops=tuple(hops),
                 image=image,
                 interpreter=interpreter,
+                hop_interpreters=tuple(hop_interps),
+            )
+        if len(hops) > 1:
+            # The entry keeps the caller's interpreter: a
+            # re-read here could split-brain the record under
+            # a racing writer (the spawn recheck would still
+            # refuse, but single-source needs no argument).
+            hop_interps[-1] = _text_interpreter(text)
+        hop_interpreter = hop_interps[-1]
+        if hop_interpreter is not None and (
+            os.path.basename(hop_interpreter) == "env"
+            or not os.path.isabs(hop_interpreter)
+        ):
+            return CapturedChain(
+                form=FORM_UNKNOWN,
+                hops=tuple(hops),
+                image=hops[-1],
+                interpreter=interpreter,
+                note="shebang interpreter %r of launcher hop %r "
+                "resolves through PATH; PATH-resolved "
+                "interpreters are never guessed"
+                % (hop_interpreter, current),
+                hop_interpreters=tuple(hop_interps),
             )
         shell = _is_shell_interpreter(_text_interpreter(text))
         unsupported = _unsupported_shell_logic(text, shell)
@@ -2245,6 +2307,7 @@ def _capture_launcher(
                 interpreter=interpreter,
                 note="unsupported shell logic in launcher hop %r: %r"
                 % (current, unsupported[:80]),
+                hop_interpreters=tuple(hop_interps),
             )
         target = _exec_target(text, shell)
         if target is None:
@@ -2258,6 +2321,7 @@ def _capture_launcher(
                     interpreter=interpreter,
                     note="unresolvable exec lines in launcher hop %r"
                     % (current,),
+                    hop_interpreters=tuple(hop_interps),
                 )
             # A chained script with no exec line runs directly:
             # the chain terminus.
@@ -2273,13 +2337,16 @@ def _capture_launcher(
                         image=hops[-1],
                         interpreter=interpreter,
                         note="launcher target unreadable: %s" % exc.detail,
+                        hop_interpreters=tuple(hop_interps),
                     )
                 hops.append(image)
+                hop_interps.append(_text_interpreter(text))
             return CapturedChain(
                 form=FORM_EXEC_LAUNCHER,
                 hops=tuple(hops),
                 image=image,
                 interpreter=interpreter,
+                hop_interpreters=tuple(hop_interps),
             )
         if not os.path.isabs(target):
             return CapturedChain(
@@ -2289,6 +2356,7 @@ def _capture_launcher(
                 interpreter=interpreter,
                 note="relative exec target %r in launcher hop %r"
                 % (target, current),
+                hop_interpreters=tuple(hop_interps),
             )
         if not os.path.isfile(target):
             return CapturedChain(
@@ -2297,6 +2365,7 @@ def _capture_launcher(
                 image=hops[-1],
                 interpreter=interpreter,
                 note="dangling exec target %r" % (target,),
+                hop_interpreters=tuple(hop_interps),
             )
         try:
             resolved = os.path.realpath(target)
@@ -2307,6 +2376,7 @@ def _capture_launcher(
                 image=hops[-1],
                 interpreter=interpreter,
                 note="unresolvable exec target %r" % (target,),
+                hop_interpreters=tuple(hop_interps),
             )
         if resolved in seen:
             return CapturedChain(
@@ -2315,6 +2385,7 @@ def _capture_launcher(
                 image=hops[-1],
                 interpreter=interpreter,
                 note="cyclic exec chain at %r" % (resolved,),
+                hop_interpreters=tuple(hop_interps),
             )
         seen.add(resolved)
         try:
@@ -2332,8 +2403,10 @@ def _capture_launcher(
                 image=hops[-1],
                 interpreter=interpreter,
                 note="launcher hop unreadable: %s" % exc.detail,
+                hop_interpreters=tuple(hop_interps),
             )
         hops.append(hop)
+        hop_interps.append(None)
         current = resolved
     return CapturedChain(
         form=FORM_UNKNOWN,
@@ -2341,6 +2414,7 @@ def _capture_launcher(
         image=hops[-1],
         interpreter=interpreter,
         note="exec chain exceeds the depth bound",
+        hop_interpreters=tuple(hop_interps),
     )
 
 
@@ -2784,6 +2858,64 @@ def _reject_stdlib_shadow(
             )
 
 
+#: Interpreter startup modules ``site`` imports at every spawn.
+_STARTUP_MODULE_NAMES = ("sitecustomize", "usercustomize")
+
+
+def _startup_shadow_relpath(root: str) -> str | None:
+    """Return the startup spelling carried by ``root``, if any.
+
+    Spawns run without ``-S``, so ``site`` imports
+    ``sitecustomize``/``usercustomize`` through the normal
+    FileFinder at every spawn: every importable spelling counts,
+    mirroring :func:`_reject_stdlib_shadow` (source, legacy
+    bytecode, extension modules in any version tag, and package
+    ``__init__`` in source or bytecode form, plus extension
+    package inits, all of which FileFinder consults). A bare
+    directory (namespace package) executes nothing and is not a
+    hit. Returns the root-relative hit path, or None.
+    """
+    for name in _STARTUP_MODULE_NAMES:
+        for spelling in (name + ".py", name + ".pyc"):
+            if os.path.isfile(os.path.join(root, spelling)):
+                return spelling
+        package = os.path.join(root, name)
+        if os.path.isdir(package):
+            for init in ("__init__.py", "__init__.pyc"):
+                relpath = os.path.join(name, init)
+                if os.path.isfile(os.path.join(root, relpath)):
+                    return relpath
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.lower().endswith((".so", ".pyd")):
+            continue
+        top = entry.split(".", 1)[0]
+        if (
+            top in _STARTUP_MODULE_NAMES
+            and os.path.isfile(os.path.join(root, entry))
+        ):
+            return entry
+    for name in _STARTUP_MODULE_NAMES:
+        package = os.path.join(root, name)
+        if not os.path.isdir(package):
+            continue
+        try:
+            inits = sorted(os.listdir(package))
+        except OSError:
+            continue
+        for entry in inits:
+            if not entry.startswith("__init__."):
+                continue
+            if entry.lower().endswith(
+                (".so", ".pyd")
+            ) and os.path.isfile(os.path.join(package, entry)):
+                return os.path.join(name, entry)
+    return None
+
+
 def admit_execution(
     request: ExecutionRequest,
     pins: ExecutionPins,
@@ -2865,6 +2997,30 @@ def admit_execution(
                 "%r interpreter %r does not match the pin"
                 % (entry_path, captured.interpreter),
             )
+    hop_identities: list[FileIdentity | None] = []
+    if captured.form == FORM_EXEC_LAUNCHER:
+        if len(captured.hop_interpreters) != len(captured.hops):
+            raise AdmissionError(
+                REASON_LAUNCHER_UNKNOWN,
+                "%r launcher capture is inconsistent" % (entry_path,),
+            )
+        for index, hop in enumerate(captured.hops):
+            shebang = captured.hop_interpreters[index]
+            if shebang is None:
+                hop_identities.append(None)
+                continue
+            if index == 0:
+                hop_identities.append(interpreter_identity)
+                continue
+            try:
+                hop_identities.append(identify_file(shebang))
+            except AdmissionError as exc:
+                raise AdmissionError(
+                    REASON_UNREADABLE,
+                    "%r hop %r names interpreter %r that cannot "
+                    "be bound: %s"
+                    % (entry_path, hop.path, shebang, exc.detail),
+                )
     modules: list[ModuleIdentity] = []
     if pins.modules:
         if captured.form != FORM_CONSOLE_SCRIPT:
@@ -2883,16 +3039,16 @@ def admit_execution(
                 % (entry_path,),
             )
         for root in pins.python_path:
-            for startup in ("sitecustomize.py", "usercustomize.py"):
-                if os.path.isfile(os.path.join(root, startup)):
-                    raise AdmissionError(
-                        REASON_MODULE_MISMATCH,
-                        "%r admitted module root %r carries %s, "
-                        "which the interpreter would execute at "
-                        "every spawn; admitted roots must not "
-                        "carry startup files"
-                        % (entry_path, root, startup),
-                    )
+            startup = _startup_shadow_relpath(root)
+            if startup is not None:
+                raise AdmissionError(
+                    REASON_MODULE_MISMATCH,
+                    "%r admitted module root %r carries %s, "
+                    "which the interpreter would execute at "
+                    "every spawn; admitted roots must not "
+                    "carry startup files"
+                    % (entry_path, root, startup),
+                )
         roots, stdlib_names = _dump_interpreter_sys_path(
             interpreter_identity, pins.python_path, probe_timeout
         )
@@ -2956,6 +3112,7 @@ def admit_execution(
         hops=captured.hops,
         image=captured.image,
         interpreter=interpreter_identity,
+        hop_interpreters=tuple(hop_identities),
         modules=tuple(modules),
         version=None,
         argv_prefix=argv_prefix,
@@ -2972,6 +3129,7 @@ def admit_execution(
         hops=record.hops,
         image=record.image,
         interpreter=record.interpreter,
+        hop_interpreters=record.hop_interpreters,
         modules=record.modules,
         version=record.version,
         argv_prefix=record.argv_prefix,
@@ -3000,6 +3158,7 @@ def admit_execution(
         hops=record.hops,
         image=record.image,
         interpreter=record.interpreter,
+        hop_interpreters=record.hop_interpreters,
         modules=record.modules,
         version=version,
         argv_prefix=record.argv_prefix,
@@ -3016,6 +3175,7 @@ def admit_execution(
         hops=final.hops,
         image=final.image,
         interpreter=final.interpreter,
+        hop_interpreters=final.hop_interpreters,
         modules=final.modules,
         version=final.version,
         argv_prefix=final.argv_prefix,
@@ -3116,6 +3276,10 @@ def _admission_digest(record: AdmittedExecution) -> str:
             if record.interpreter is not None
             else None
         ),
+        "hop_interpreters": [
+            _identity_json(identity) if identity is not None else None
+            for identity in record.hop_interpreters
+        ],
         "modules": [
             {"name": item.name, "file": _identity_json(item.identity)}
             for item in record.modules
@@ -3146,6 +3310,10 @@ def summarize(execution: AdmittedExecution) -> dict:
             if execution.interpreter is not None
             else None
         ),
+        "hop_interpreters": [
+            _identity_json(identity) if identity is not None else None
+            for identity in execution.hop_interpreters
+        ],
         "modules": [
             {"name": item.name, "file": _identity_json(item.identity)}
             for item in execution.modules
@@ -3219,6 +3387,14 @@ def verify_spawn(execution: AdmittedExecution) -> None:
         watched.append(("image", execution.image))
     if execution.interpreter is not None:
         watched.append(("interpreter", execution.interpreter))
+    seen_realpaths = {identity.realpath for _, identity in watched}
+    for index, identity in enumerate(execution.hop_interpreters):
+        if identity is None or identity.realpath in seen_realpaths:
+            continue
+        seen_realpaths.add(identity.realpath)
+        watched.append(
+            ("hop-%d-interpreter" % index, identity)
+        )
     for module in execution.modules:
         watched.append(("module-%s" % module.name, module.identity))
     for label, identity in watched:
@@ -3229,6 +3405,24 @@ def verify_spawn(execution: AdmittedExecution) -> None:
                 "%s %r drifted since admission: %s"
                 % (label, identity.path, drift),
             )
+    # Startup files planted on an admitted root after admission
+    # would execute at this spawn without tripping any pinned
+    # identity above, so the admitted roots are re-scanned here.
+    # The roots come from the digest-bound record, never ambient.
+    for key, value in execution.env_set:
+        if key != "PYTHONPATH":
+            continue
+        for root in value.split(os.pathsep):
+            if not root:
+                continue
+            startup = _startup_shadow_relpath(root)
+            if startup is not None:
+                raise AdmissionError(
+                    REASON_SPAWN_REFUSED,
+                    "admitted module root %r carries %s since "
+                    "admission; refusing the spawn"
+                    % (root, startup),
+                )
 
 
 def spawn_env(

@@ -76,7 +76,7 @@ retained implementation without claiming the kind.
 
 | Role | Proven identity |
 |---|---|
-| Build/test host | x86-64 Linux; other operating systems are refused with a clear error (`tests/unit/test_build_commands.py::test_cli_refuses_unsupported_platform`) |
+| Build/test host | x86-64 Linux; other operating systems are refused with a clear error (`tests/unit/test_build_commands.py::test_cli_refuses_unsupported_platform`); other Linux architectures pass the gate but are unproven — no gate tests them, so builds there are outside the qualified boundary (see [install](install.md)) |
 | Python driver | 3.11 or later (3.14.8 in the current lock); standard library only |
 | Mojo compiler | 1.1.0 (`8189361e`) |
 | Frontend target | canonical `--target-cpu znver4` plus the frozen feature set (`FRONTEND_TARGET_FLAGS` in `src/mojobpf/build.py`); qualifying captures reproduced byte-identical under the pinned environment, other hosts unproven |

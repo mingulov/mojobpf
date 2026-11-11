@@ -5467,6 +5467,68 @@ def test_qualify_rejects_unhashable_command_status():
             assert "status" in exc.diagnostic.explanation, bad
 
 
+def _xdp_program():
+    from mojobpf.manifest import ProgramEntry
+
+    return ProgramEntry(
+        source="xdp_pass.mojo",
+        entry="xdp_entry",
+        program_type="xdp",
+        section="xdp",
+    )
+
+
+def _section_outcome_with_names(names):
+    from mojobpf import build as build_module
+
+    previous = build_module.object_section_names
+    build_module.object_section_names = lambda _path: tuple(names)
+    try:
+        return build_module._program_section_outcome(
+            _xdp_program(), "staged.bpf.o"
+        )
+    finally:
+        build_module.object_section_names = previous
+
+
+def test_program_section_outcome_rejects_extra_program_section():
+    # An object carrying the declared section plus another
+    # registry program section fails closed (MBPF216): the
+    # undeclared program must never publish (round-4).
+    outcome = _section_outcome_with_names(
+        ("", "xdp", "socket", "license", ".BTF")
+    )
+    assert [item.code for item in outcome] == ["MBPF216"], outcome
+    assert "socket" in outcome[0].explanation, outcome
+
+
+def test_program_section_outcome_rejects_missing_section():
+    # The declared section absent is still MBPF216 (kept pin).
+    outcome = _section_outcome_with_names(
+        ("", "socket", "license", ".BTF")
+    )
+    assert [item.code for item in outcome] == ["MBPF216"], outcome
+
+
+def test_program_section_outcome_accepts_declared_only():
+    # Metadata, debug and loader sections alongside the single
+    # declared program section still publish (no false
+    # positive): the names below are a real built object set.
+    outcome = _section_outcome_with_names(
+        (
+            "", ".strtab", ".text", "xdp", "license",
+            ".debug_abbrev", ".debug_info", ".rel.debug_info",
+            ".debug_str_offsets", ".rel.debug_str_offsets",
+            ".debug_str", ".debug_addr", ".rel.debug_addr",
+            ".BTF", ".rel.BTF", ".BTF.ext", ".rel.BTF.ext",
+            ".debug_frame", ".rel.debug_frame", ".debug_line",
+            ".rel.debug_line", ".debug_line_str",
+            ".llvm_addrsig", ".symtab",
+        )
+    )
+    assert outcome == [], outcome
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

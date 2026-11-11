@@ -1964,6 +1964,12 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                         % member_name,
                         path,
                     )
+            if len(members) != len(attrs):
+                raise ElfError(
+                    "MBPF402",
+                    "BTF map VAR %r has duplicate members" % var_name,
+                    path,
+                )
             if set(attrs) == {"type", "max_entries"}:
                 if attrs["type"] != 27:
                     raise ElfError(
@@ -1986,6 +1992,17 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                             ),
                             path,
                         )
+                extra = sorted(
+                    set(attrs)
+                    - {"type", "key_size", "value_size", "max_entries"}
+                )
+                if extra:
+                    raise ElfError(
+                        "MBPF402",
+                        "BTF map VAR %r carries unexpected "
+                        "members %s" % (var_name, extra),
+                        path,
+                    )
             found[var_name] = attrs
     return found
 
