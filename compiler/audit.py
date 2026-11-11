@@ -26,17 +26,18 @@ Checked model (pre-lowering, on genuine frontend output):
 * module scope limited to ``source_filename``, the target lines,
   attribute group ``#0`` (plus attribute group ``#1`` in the
   subprogram shape only, where the two functions need two
-  attribute sets), and at most the twelve reserved declarations
-  below (ten helper declarations plus two relocation
+  attribute sets), and at most the fourteen reserved declarations
+  below (twelve helper declarations plus two relocation
   declarations; no globals, no other declarations, no
   module-level assembly);
-* body calls limited to twelve exact inline-assembly shapes
+* body calls limited to fourteen exact inline-assembly shapes
   (register reinterpretation, map-address load, key-slot
   preparation for key 0, key-slot preparation for key 1,
   key-slot preparation for keys 2 and above, the per-CPU kind
-  tag, the hash kind tag, value-slot preparation, the ring-buffer
+  tag, the hash kind tag, the LRU kind tag, the per-CPU-hash
+  kind tag, value-slot preparation, the ring-buffer
   map-address load, the ring-size tag, event-slot preparation,
-  and event field views) plus direct calls to the ten reserved
+  and event field views) plus direct calls to the twelve reserved
   helper declarations and the two reserved relocation
   declarations, plus, in the subprogram shape only, tail calls
   from the entrypoint body to the one subprogram (the subprogram

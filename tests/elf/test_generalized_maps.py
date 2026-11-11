@@ -487,8 +487,14 @@ EXPECTED_BTF_KINDS = [2, 1, 3, 1, 2, 3, 2, 3, 2, 3, 4, 14, 15]
 
 
 def test_audit_families_cover_shapes():
+    # built() asserts the audit's recognized family, entries, and
+    # kinds agree with each row; this pins the other direction:
+    # the suite exercises every map family the audit returns.
+    seen = set()
     for name, _source, family, entries, kind, _calls in SHAPES:
         built(name)
+        seen.add(family)
+    assert seen == {"map", "delete", "combined"}, seen
     print("PASS audit families: %d shapes" % len(SHAPES))
 
 

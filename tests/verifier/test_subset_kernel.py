@@ -532,9 +532,9 @@ def guest_run():
             % (returncode, stage, output[-4000:])
         )
     # Retain the raw guest transcript (per-case BEGIN/END JSON)
-    # alongside the staged inputs so observed actions stay auditable
-    # after the run; the stage directory is never cleaned by the
-    # suite itself.
+    # alongside the staged inputs; _finish attaches the output to
+    # the record, then removes the stage, so auditability lives
+    # in the record, not the directory.
     transcript_path = os.path.join(stage, "guest_transcript.log")
     with open(transcript_path, "w", encoding="utf-8") as handle:
         handle.write(output)

@@ -26,6 +26,27 @@ def _workflow_text():
     return WORKFLOW.read_text(encoding='utf-8')
 
 
+def test_test_tree_basenames_are_unique():
+    # Suites import siblings by bare module name (sys.path holds
+    # every suite directory) and pytest collects without
+    # packages: two files sharing a basename collide on import
+    # and break whole-tree collection with import-file-mismatch.
+    seen = {}
+    dupes = set()
+    for root in (ROOT / 'tests', ROOT / 'compiler' / 'tests'):
+        for path in sorted(root.rglob('*.py')):
+            if '__pycache__' in path.parts:
+                continue
+            if path.name in seen:
+                dupes.add(path.name)
+            else:
+                seen[path.name] = path
+    assert not dupes, (
+        'duplicate test-tree basenames collide on bare import: '
+        + ', '.join(sorted(dupes))
+    )
+
+
 def test_workflow_runs_every_lane_through_the_runner():
     # Each lane-owned module executes in exactly one CI job, and
     # every suite runs through the lane runner (module-per-process,
@@ -972,6 +993,8 @@ def test_digest_cache_survives_shadowed_stdlib_json(lanes, tmp_path):
 
 @pytest.mark.parametrize('form', ['journal-overlap', 'symlink-dest', 'relative-dest', 'bare'])
 def test_bwrap_refuses_wholesale(lanes, tmp_path, form):
+    assert shutil.which('bwrap'), (
+        'ENVIRONMENT FAILURE: bwrap required for launcher-refusal proof')
     # bwrap mounts a new filesystem view the host cannot
     # verify, so every form refuses as a launcher.
     link = tmp_path / 'guardlink'
@@ -1397,6 +1420,11 @@ def test_propagated_install_inherits_parent_trust(lanes, tmp_path):
 def test_scratch_roots_snapshot_at_install(lanes, tmp_path):
     # A TMPDIR set after install must not widen ownership: the
     # scratch roots are install-time trust, inherited downhill.
+    # The probe must live OUTSIDE every install-time temp root,
+    # so tmp_path (inside by construction) cannot host it. HOME
+    # is the portable writable outside; the overlap guard below
+    # skips when it is not. Mode 0o700 plus finally-cleanup
+    # bounds the residue to a hard-killed run.
     probe = Path.home() / ('guard-tmpdir-probe-%d' % os.getpid())
     for temp in _HELPER_TEMPS.values():
         if str(probe).startswith(temp + os.sep):
@@ -1724,6 +1752,26 @@ def test_relative_fixture_interpreter_resolves_spawn_cwd(lanes, tmp_path):
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert 'rel-interp-ok' in result.stdout
     assert not marker.exists()
+
+
+def test_clone_stdlib_links_redirect_clone_prefix(tmp_path):
+    # The links are load-bearing on every layout, including
+    # fixed-prefix interpreters whose clones would otherwise
+    # run via the build-prefix fallback: with the links the
+    # clone resolves its OWN prefix (the zone), proving the
+    # helper redirects stdlib resolution instead of merely
+    # accompanying a working fallback.
+    zone = tmp_path / 'prefixzone'
+    zone.mkdir()
+    clone = zone / 'zone-python3'
+    clone.write_bytes(Path(sys.executable).read_bytes())
+    clone.chmod(0o755)
+    _link_clone_stdlib(zone)
+    assert (zone / 'lib').is_symlink() or (zone / 'lib64').is_symlink()
+    proc = subprocess.run([str(clone), '-c', 'import sys; print(sys.prefix)'],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert Path(proc.stdout.strip()).resolve() == zone.resolve(), proc.stdout
 
 
 def test_fixture_rewrite_tracks_executable_override(lanes, tmp_path):

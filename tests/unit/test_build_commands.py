@@ -2296,6 +2296,42 @@ def test_build_request_validation():
         raise AssertionError("non-BuildRequest accepted")
 
 
+def test_build_publish_calls_no_link_tripwire(tmp_path, monkeypatch):
+    # The license payload is checked on the final object, so a
+    # link step after inspection would need a recheck: the
+    # publish path asserts the command list holds no link-like
+    # stage or linker argv before publishing.
+    tripwire = getattr(build_module, "assert_no_link_step", None)
+    assert callable(tripwire), (
+        "publish path never calls assert_no_link_step"
+    )
+    manifest_path, out_dir = write_project(str(tmp_path))
+    calls = []
+
+    def recording(commands):
+        calls.append(list(commands))
+        return tripwire(commands)
+
+    monkeypatch.setattr(
+        build_module, "assert_no_link_step", recording
+    )
+    result = build_fixture(manifest_path, out_dir, str(tmp_path))
+    assert result.success, result.diagnostics
+    assert len(calls) == 1, calls
+    assert calls[0] == list(result.commands)
+
+
+def test_build_commands_contain_no_link_step(tmp_path):
+    # End-to-end pin: today's pipeline has no link step, so the
+    # tripwire passes silently over real build commands.
+    from mojobpf.inspect import assert_no_link_step
+
+    manifest_path, out_dir = write_project(str(tmp_path))
+    result = build_fixture(manifest_path, out_dir, str(tmp_path))
+    assert result.success, result.diagnostics
+    assert_no_link_step(result.commands)
+
+
 def test_publish_leaves_no_temporary_files():
     parent = tempfile.mkdtemp(prefix="build-pub-")
     manifest_path, out_dir = write_project(parent)
@@ -3156,6 +3192,45 @@ def test_cli_build_interrupt_reports_recovery():
     assert "rollback incomplete" in err
     assert "not restored" in err
     assert "partial outputs removed" not in err
+
+
+def test_cli_check_interrupt_exits_130():
+    real_parse = cli_module.parse_manifest
+
+    def raising(_path):
+        raise KeyboardInterrupt("fixture interrupt")
+
+    cli_module.parse_manifest = raising
+    try:
+        code, _, err = run_cli(["check", "--manifest", "m"])
+    finally:
+        cli_module.parse_manifest = real_parse
+    assert code == 130, err
+    assert "Traceback" not in err, err
+    assert "interrupted" in err, err
+
+
+def test_cli_test_interrupt_exits_130():
+    import subprocess as subprocess_module
+
+    parent = tempfile.mkdtemp(prefix="cli-test-interrupt-")
+    os.makedirs(os.path.join(parent, "suite"))
+    real_run = subprocess_module.run
+
+    def raising(*args, **kwargs):
+        raise KeyboardInterrupt("fixture interrupt")
+
+    subprocess_module.run = raising
+    try:
+        code, _, err = run_cli(
+            ["test", "--suite", "suite", "--suite-path", parent]
+        )
+    finally:
+        subprocess_module.run = real_run
+        shutil.rmtree(parent, ignore_errors=True)
+    assert code == 130, err
+    assert "Traceback" not in err, err
+    assert "interrupted" in err, err
 
 
 def test_cli_check_reports_manifest_and_toolchain():

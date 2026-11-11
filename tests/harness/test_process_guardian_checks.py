@@ -560,6 +560,11 @@ def test_bounded_owned_process_control(case, tmp_path):
 
 
 def _model_emergency(monkeypatch, *, discovery_failure=False, exit_race=False):
+    # Model-only: stubs the whole OS surface (Path, getpid,
+    # waitid, pidfd_send_signal, _ready, _kernel_echild,
+    # _own_children). Grounded by the live counterpart
+    # test_bounded_owned_process_control above, which drives
+    # real multi-process orchestration through _run_control.
     from types import SimpleNamespace
     module = sys.modules[__name__]
     dead, signals = [False], []

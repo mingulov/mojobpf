@@ -563,6 +563,68 @@ def test_unsupported_calls():
     assert _codes(report)[1] == ["MBPF407"]
 
 
+def _section_builder(section, entry, code):
+    builder = ElfBuilder()
+    text = builder.add_section(
+        section, SHT_PROGBITS, SHF_EXECINSTR, code, align=8,
+    )
+    builder.add_section(
+        "license", SHT_PROGBITS, 0, APACHE_BYTES, align=1
+    )
+    builder.add_symbol(entry, STT_FUNC, text, size=len(code))
+    return builder
+
+
+def _inspect_net_bytes(content):
+    path = _write_temp_image(content)
+    try:
+        return inspect_module.inspect_object(
+            path, "linux-bpfel-v3-net"
+        )
+    finally:
+        os.remove(path)
+
+
+def test_helper9_refused_outside_classifier_section():
+    # skb-store (9) needs a TC classifier context: the same call
+    # refuses under socket/xdp/tracepoint sections even though
+    # the net profile admits the helper ID.
+    for section, entry in (
+        ("socket", "socket_entry"),
+        ("xdp", "xdp_entry"),
+        (
+            "tracepoint/syscalls/sys_enter_getpid",
+            "trace_entry",
+        ),
+    ):
+        image = _section_builder(
+            section, entry, _call_code(9) + _exit_code()
+        ).build()
+        report = _inspect_net_bytes(image)
+        assert _codes(report)[1] == ["MBPF407"], (section, _codes(report))
+        assert "classifier" in report.unsupported[0].explanation, (
+            report.unsupported[0].explanation
+        )
+
+
+def test_helper9_accepted_in_classifier_section():
+    image = _section_builder(
+        "classifier", "tc_entry", _call_code(9) + _exit_code()
+    ).build()
+    report = _inspect_net_bytes(image)
+    assert "MBPF407" not in _codes(report)[1], _codes(report)
+
+
+def test_other_helpers_unaffected_by_section_gate():
+    # The section gate is helper-9-specific: a map lookup in a
+    # socket section still passes the helper check.
+    image = _section_builder(
+        "socket", "socket_entry", _call_code(1) + _exit_code()
+    ).build()
+    report = _inspect_net_bytes(image)
+    assert "MBPF407" not in _codes(report)[1], _codes(report)
+
+
 def test_license_layer_agrees_on_helper7_object():
     image = _clean_builder(code=_call_code(7) + _exit_code()).build()
     report = _inspect_bytes(image)

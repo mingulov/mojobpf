@@ -14,6 +14,7 @@ no host load, run, or attach commands)::
     mojobpf verify --kernel --object prog.bpf.o [--release v6.12]
         [--prog-type xdp] [--timeout SECS] [--kernels-lock lock.json]
         [--keep-evidence] [--json]
+    mojobpf test --suite SUITE [--suite-path DIR] [--require-kernel]
 
 ``build`` compiles every program in the manifest through the reusable
 :func:`mojobpf.build.build_project` interface and publishes the
@@ -37,6 +38,8 @@ the object, otherwise it only reports. ``verify --kernel`` boots one
 disposable guest through the ``vng`` runner, loads the object there,
 unloads it again, and classifies loader versus verifier failures; it
 never loads on the host, never test-runs, and never attaches a hook.
+``test`` runs one project test suite from the checked-out
+``tests/`` tree (a developer command, not a qualification gate).
 
 Entry (installed console script)::
 
@@ -52,9 +55,12 @@ Exit codes: 0 for successful requested work, 2 for usage or manifest
 errors, 3 for an unavailable environment (unsupported platform,
 missing or broken build tools, lockfile mismatch, missing packaged
 adapter, or a ``verify --kernel`` guest that cannot host the object),
-4 for a compile, structural, declaration, or kernel-verifier failure,
-5 when ``verify --kernel`` proves the loader (not the verifier)
-rejected the object, 130 when interrupted (the build path already
+4 for a compile, structural, or declaration failure,
+5 when ``verify --kernel`` proves the object failed to load,
+whether the loader or the kernel verifier rejected it (MBPF501
+names a loader rejection, MBPF502 a verifier rejection), 6 when
+``test`` ran its suite and the suite failed (MBPF601),
+130 when interrupted (the build path already
 removed its partial outputs and kept no partial result; the verify
 path already killed the guest runner group and removed its owned
 staging unless ``--keep-evidence`` was given).
@@ -67,8 +73,8 @@ a refused spawn all exit 2 with the cause on stderr. Any failure
 after the runner spawns exits 3: a runner that exits before
 producing any guest transcript (no guest kernel observed),
 preflight unavailable, timeout, permission-denied load, or a
-runner fault later in the run; a kernel-verifier rejection exits
-4 and a loader rejection exits 5.
+runner fault later in the run; a kernel-verifier rejection and a
+loader rejection both exit 5, told apart by MBPF502/MBPF501.
 
 Standard library only.
 """
@@ -543,8 +549,15 @@ def _command_verify(args) -> int:
         return EXIT_INTERRUPTED
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        try:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            sys.stderr.write(
+                "mojobpf verify: cannot write --output %r: %s\n"
+                % (args.output, exc)
+            )
+            return EXIT_USAGE
     if args.json:
         sys.stdout.write(text)
     else:
@@ -1005,7 +1018,17 @@ def main(argv=None) -> int:
             "qualified host\n" % (sys.platform,)
         )
         return EXIT_ENVIRONMENT
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        # Verbs with their own recovery story (build's rollback
+        # report) handle interruption themselves; this backstop
+        # keeps every other verb on the 130 contract instead of
+        # dumping a traceback.
+        sys.stderr.write(
+            "mojobpf: interrupted; no partial result kept\n"
+        )
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

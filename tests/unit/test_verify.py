@@ -4656,6 +4656,59 @@ def test_verify_cli_loader_verifier_environment_exits():
             shutil.rmtree(holding, ignore_errors=True)
 
 
+def test_verify_cli_output_writes_report_file():
+    """CLI contract: --output writes the JSON report beside stdout."""
+    from mojobpf import cli as cli_module
+
+    with _fake_guest_run() as (_root, entry, lock_path):
+        holding = tempfile.mkdtemp(prefix="cli-verify-out-")
+        try:
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(b"not-an-elf-object")
+            report = os.path.join(holding, "report.json")
+            code, _out, err = _run_cli(
+                [
+                    "verify", "--kernel", "--object", staged,
+                    "--release", "v9.99", "--vng", entry,
+                    "--kernels-lock", lock_path, "--json",
+                    "--output", report,
+                ]
+            )
+            assert code == cli_module.EXIT_OK, err
+            with open(report, encoding="utf-8") as handle:
+                document = json.load(handle)
+            assert document["status"] == "pass", document
+        finally:
+            shutil.rmtree(holding, ignore_errors=True)
+
+
+def test_verify_cli_output_failure_exits_usage():
+    """CLI contract: an unwritable --output exits 2, no traceback."""
+    from mojobpf import cli as cli_module
+
+    with _fake_guest_run() as (_root, entry, lock_path):
+        holding = tempfile.mkdtemp(prefix="cli-verify-outfail-")
+        try:
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(b"not-an-elf-object")
+            report = os.path.join(holding, "no-such-dir", "report.json")
+            code, _out, err = _run_cli(
+                [
+                    "verify", "--kernel", "--object", staged,
+                    "--release", "v9.99", "--vng", entry,
+                    "--kernels-lock", lock_path, "--json",
+                    "--output", report,
+                ]
+            )
+            assert code == cli_module.EXIT_USAGE, (code, err)
+            assert "Traceback" not in err, err
+            assert report in err or "output" in err, err
+        finally:
+            shutil.rmtree(holding, ignore_errors=True)
+
+
 def test_verify_cli_pass_and_interrupted():
     """CLI contract: a clean run exits 0; interruption exits 130."""
     from mojobpf import cli as cli_module

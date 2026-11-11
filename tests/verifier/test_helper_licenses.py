@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Helper availability and GPL-only restriction proofs.
 
-The helper capability registry records the seven profile helpers
+The helper capability registry records the twelve profile helpers
 as available and non-GPL plus one GPL-only witness (helper 35,
 ``bpf_get_current_task``) admitted by no profile. This suite
 proves the restriction end to end:

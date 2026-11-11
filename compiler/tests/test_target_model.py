@@ -408,6 +408,21 @@ def test_malformed_spec_is_usage_and_preserves_sentinel(tmp_path, change):
     assert report.read_text() == "sentinel"
 
 
+@pytest.mark.parametrize("profile", ["linux-bpfel-v3", "linux-bpfel-v3-subprog", "linux-bpfel-v3-net", "linux-bpfel-v3-hash", "linux-bpfel-v3-lru", "linux-bpfel-v3-uprobe", "linux-bpfel-v3-reserve"])
+def test_core_map_shape_requires_core_profile(tmp_path, profile):
+    request = spec(True, profile=profile)
+    request["map"] = dict(request["map"], value_bits=32768, max_entries=1)
+    result, report = check(tmp_path, module(MAP_BODY, DECLS), request)
+    refusal(result, report, "MBPF202")
+
+
+def test_core_map_shape_accepted_under_core_profile(tmp_path):
+    request = spec(True, profile="linux-bpfel-v3-core")
+    request["map"] = dict(request["map"], value_bits=32768, max_entries=1)
+    result, report = check(tmp_path, module(MAP_BODY, DECLS), request)
+    success(result, report)
+
+
 @pytest.mark.parametrize("text", ["{", "[]", "null"])
 def test_malformed_json_spec_is_usage_and_preserves_sentinel(tmp_path, text):
     source, request, report = (tmp_path / name for name in ("input.ll", "spec.json", "report.json"))

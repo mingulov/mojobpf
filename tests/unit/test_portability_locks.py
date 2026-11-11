@@ -88,7 +88,7 @@ def test_arm64_lane_lock_pins_observed_lane():
     )
     assert lock["notes"] == [
         "AArch64 companion to ci/kernels.lock.json, which keeps the two "
-        "x86-64 lanes and the 25-suite matrix shape. This file is not "
+        "x86-64 lanes and the 41-suite matrix shape. This file is not "
         "consumed by ci/run_vm_tests.py; the portability suite "
         "(tests/kernel/test_arch_portability.py) reads its lane selection "
         "from MOJOBPF_VNG_RELEASE / MOJOBPF_VNG_ARCH / MOJOBPF_VNG_ROOT.",

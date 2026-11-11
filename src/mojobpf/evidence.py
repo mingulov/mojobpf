@@ -129,6 +129,7 @@ from .capabilities import ProfileError, lookup_profile, profile_digest
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
 from .inputs import BuildSnapshot, stable_env_value
 from .inspect import LICENSE_MAPPING_VERSION
+from .safeio import MANIFEST_LIMIT, MOJO_LIMIT, read_capped
 from .manifest import ProjectManifest
 from .safeio import OBJECT_LIMIT
 from .models import BuildResult
@@ -485,17 +486,24 @@ def _relative_under(path: str, root: str) -> str | None:
     return relative.replace(os.sep, "/")
 
 
-def hash_file(path: str, root: str | None = None) -> HashedFile:
+def hash_file(
+    path: str,
+    root: str | None = None,
+    *,
+    limit: int = MOJO_LIMIT,
+    kind: str = "provenance input",
+) -> HashedFile:
     """Hash one file, recording its path stably.
 
     Paths under ``root`` are recorded relative to it; other paths
     (and every path when ``root`` is None) are recorded by basename,
-    so no absolute path enters stable metadata. Missing or
-    unreadable files raise ``EvidenceError`` (``MBPF708``).
+    so no absolute path enters stable metadata. The read is capped
+    like every other product reader: files over ``limit`` refuse
+    instead of exhausting memory. Missing, unreadable, or
+    over-cap files raise ``EvidenceError`` (``MBPF708``).
     """
     try:
-        with open(path, "rb") as handle:
-            content = handle.read()
+        content = read_capped(path, limit=limit, kind=kind)
     except OSError as exc:
         raise _capture_fail(
             "cannot read provenance input %r: %s" % (path, exc),
@@ -711,15 +719,26 @@ def evidence_from_build(
             os.path.realpath(os.path.join(project_dir, program.source))
             for program in manifest.programs
         ]
-    hashed_manifest = hash_file(manifest_file, capture_root)
+    hashed_manifest = hash_file(
+        manifest_file, capture_root,
+        limit=MANIFEST_LIMIT, kind="manifest",
+    )
     sources: list[HashedFile] = []
     for path in source_files:
-        sources.append(hash_file(path, capture_root))
+        sources.append(
+            hash_file(
+                path, capture_root,
+                limit=MOJO_LIMIT, kind="Mojo source",
+            )
+        )
     sdk: list[HashedFile] = []
     for path in sdk_files:
         under = _relative_under(path, sdk_root)
         if under is not None:
-            content_digest = hash_file(path, sdk_root)
+            content_digest = hash_file(
+                path, sdk_root,
+                limit=MOJO_LIMIT, kind="Mojo source",
+            )
             sdk.append(
                 HashedFile(
                     path="sdk/" + content_digest.path,
@@ -728,11 +747,24 @@ def evidence_from_build(
                 )
             )
         else:
-            sdk.append(hash_file(path))
+            sdk.append(
+                hash_file(
+                    path, limit=MOJO_LIMIT, kind="Mojo source"
+                )
+            )
     imports = [
-        hash_file(path, capture_root) for path in imported_sources
+        hash_file(
+            path, capture_root,
+            limit=MOJO_LIMIT, kind="Mojo source",
+        )
+        for path in imported_sources
     ]
-    adapter = [hash_file(path) for path in adapter_files]
+    adapter = [
+        hash_file(
+            path, limit=MOJO_LIMIT, kind="adapter file"
+        )
+        for path in adapter_files
+    ]
     if hashed_manifest.sha256 != sealed.manifest_sha256:
         raise _capture_fail(
             "manifest changed after sealing; recapture rejected",

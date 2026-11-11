@@ -65,11 +65,11 @@ value vocabulary, and helper IDs
 `tests/unit/test_manifest.py::test_uprobe_profile_extends_base_with_uprobe_pair`).
 
 Per-CPU-hash maps are not supported in this release. The
-`linux-bpfel-v3-percpu-hash` registry entry and its
-implementation are retained in-tree but unclaimed: the kind
-lacks the parsed-route lowering proof its support requires,
-so no profile claims it (planned for a later release). The
-base profile still refuses the kind
+kind's implementation is retained in-tree but unclaimed:
+`linux-bpfel-v3-percpu-hash` is not an admitted profile, so
+every gate refuses the id (`MBPF101`; planned for a later
+release once the support proof lands). The base profile
+still refuses the kind
 (`tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`),
 and `tests/kernel/test_percpu_hash_maps.py` guards the
 retained implementation without claiming the kind.
@@ -500,12 +500,12 @@ host suites, selected-but-refused vectors).
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
   `PERCPU_ARRAY` / `RINGBUF` (plus `HASH` under the hash
   capability profile only, plus `LRU_HASH` under the LRU
-  capability profile only; `PERCPU_HASH` is refused under
-  every claimed profile and its capability entry is retained
-  but unclaimed), ring sizes outside
-  4096/131072, key/value vocabulary on ring buffers, and key
-  widths outside the declared dense coverage fail manifest
-  validation with `MBPF205`
+  capability profile only; `PERCPU_HASH` has no admitting
+  profile -- its id refuses with `MBPF101` and the kind is
+  refused with `MBPF205` under every admitted profile), ring
+  sizes outside 4096/131072, key/value vocabulary on ring
+  buffers, and key widths outside the declared dense coverage
+  fail manifest validation with `MBPF205`
   (`tests/unit/test_manifest.py::test_ringbuf_unqualified_size_refused`,
   `tests/unit/test_manifest.py::test_ringbuf_key_vocabulary_refused`,
   `tests/unit/test_manifest.py::test_hash_map_type_refused`,
@@ -515,8 +515,9 @@ host suites, selected-but-refused vectors).
   `tests/unit/test_manifest.py::test_lru_profile_refuses_non_lru_kinds`,
   `tests/unit/test_manifest.py::test_lru_profile_refuses_bad_key_value_sizes`,
   `tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`,
-  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_non_percpu_hash_kinds`,
-  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_bad_key_value_sizes`).
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_refused_until_supported`,
+  `tests/unit/test_manifest.py::test_percpu_hash_manifest_refused_under_percpu_hash_profile`,
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_before_kind_checks`).
 * A five-pair program over dense keys 0–4 passes the IR audit
   under its generic N-pair rule but is refused at build time
   with `MBPF107`: no manifest can declare 5 entries and the

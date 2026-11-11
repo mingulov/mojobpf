@@ -17,7 +17,8 @@ profile/registry drift. :func:`introduced_helper_ids` is the
 distinct introducing-only view: the IDs a profile introduces over
 its base set, which is empty for capability profiles that admit
 helpers purely through inheritance (core, hash, lru, subprog,
-uprobe).
+uprobe; per-CPU hash has no admitted profile, so it is absent
+here -- see the registry note below).
 The older spelling ``mojobpf.helpers.profile_helper_ids`` is that
 same introducing-only view under a misleading "admitted" name;
 new code must call :func:`helpers_for_profile` for admission and
@@ -234,33 +235,12 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         core_supported=False,
         subprog_supported=False,
     ),
-    # Per-CPU hash capability profile: everything the base profile
-    # admits, plus per-CPU hash maps with u32 keys and u64 values in
-    # one- to four-entry sizes. No helper, key/value width,
-    # entry count, or program type beyond the base set: the
-    # per-CPU-hash slice reuses the existing lookup/update/delete
-    # helpers and the dense key coverage, only the emitted map
-    # kind differs.
-    "linux-bpfel-v3-percpu-hash": TargetProfile(
-        profile_id="linux-bpfel-v3-percpu-hash",
-        byte_order="little",
-        cpu="v3",
-        allowed_pairs=(
-            ("xdp", "xdp"),
-            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-        ),
-        allowed_map_types=("array", "percpu_array", "ringbuf", "percpu_hash"),
-        allowed_key_types=("u32",),
-        allowed_value_types=("u64",),
-        allowed_max_entries=(1, 2, 3, 4),
-        allowed_ringbuf_sizes=(4096, 131072),
-        helper_ids=(1, 2, 3, 5, 8, 14, 130),
-        btf_scope="map-only",
-        entry_return="i32",
-        entry_parameters=("ptr",),
-        core_supported=False,
-        subprog_supported=False,
-    ),
+    # No per-CPU-hash profile: the kind is retained in-tree but
+    # unclaimed, so the profile id is refused (MBPF101) at every
+    # gate until its support proof lands. The retained Lane-A
+    # lowering and its guest guard
+    # (tests/kernel/test_percpu_hash_maps.py) bypass the profile
+    # gates and are unaffected.
     # Reservation capability profile: everything the base
     # profile admits, plus explicit ring-buffer reservations
     # (helpers 131, 132, 133). No map kind, key/value width,

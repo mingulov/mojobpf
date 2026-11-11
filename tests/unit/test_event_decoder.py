@@ -382,6 +382,12 @@ def test_accounting_identities():
              gap_total=3),
         dict(attempted=10, successful=7, failed=3, received=7,
              gap_total=2),
+        # Negative counts satisfy the identities but are
+        # impossible: every input is a non-negative count.
+        dict(attempted=-1, successful=0, failed=-1, received=0,
+             gap_total=-1),
+        dict(attempted=0, successful=-2, failed=2, received=-2,
+             gap_total=2),
     ):
         try:
             check_accounting(**kwargs)

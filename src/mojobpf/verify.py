@@ -3097,8 +3097,15 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        try:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            sys.stderr.write(
+                "mojobpf verify: cannot write --output %r: %s\n"
+                % (args.output, exc)
+            )
+            return 2
     if args.json:
         sys.stdout.write(text)
     else:

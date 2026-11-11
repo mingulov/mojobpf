@@ -562,6 +562,9 @@ def guest_run():
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     facts = load_lane_facts()
+    # Lease before staging: an unleased run refuses here,
+    # before any build work, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-core-", dir="/tmp")
     with open(os.path.join(stage, "pkt.bin"), "wb") as handle:
         handle.write(bytes(64))

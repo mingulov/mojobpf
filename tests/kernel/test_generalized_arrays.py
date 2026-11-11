@@ -519,6 +519,9 @@ def guest_run():
             raise EnvironmentFailure("missing repo file: %s" % path)
     if not os.path.isdir(SDK_INCLUDE):
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
+    # Lease before staging: an unleased run refuses here,
+    # before any build work, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-genarray-", dir="/tmp")
     staged = {}
     for entries, source in RMW_SOURCES.items():

@@ -256,9 +256,22 @@ def check_accounting(
     lands in exactly one producer category),
     ``received == successful`` (every success reaches the drain),
     and ``gap_total == failed`` (every failure shows as exactly
-    one missing sequence). Raises :class:`EventCheckError`
-    naming the first broken identity.
+    one missing sequence). Every input is a count, so negatives
+    refuse before the identities run. Raises
+    :class:`EventCheckError` naming the first broken identity.
     """
+    for name, value in (
+        ("attempted", attempted),
+        ("successful", successful),
+        ("failed", failed),
+        ("received", received),
+        ("gap_total", gap_total),
+    ):
+        if value < 0:
+            raise EventCheckError(
+                "%s is negative (%d): counts never go below zero"
+                % (name, value)
+            )
     if attempted != successful + failed:
         raise EventCheckError(
             "attempted %d != successful %d + failed %d"

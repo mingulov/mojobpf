@@ -99,6 +99,8 @@ Error validateSpec(const LoweringSpec &Spec) {
     if (Map.Symbol != "mojobpf_map0" || (Map.Type != 2 && Map.Type != 1 && Map.Type != 9 && Map.Type != 6) || Map.KeyBits != 32 ||
         ((Map.ValueBits != 64 || Map.MaxEntries < 1) && !CoreMap) || Map.Flags != 0)
       return requestFailure("unsupported array/hash/lru/percpu map contract");
+    if (CoreMap && Spec.ProfileID != "linux-bpfel-v3-core")
+      return requestFailure("core map shape requires the linux-bpfel-v3-core profile");
   }
   return Error::success();
 }

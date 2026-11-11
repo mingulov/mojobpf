@@ -702,16 +702,16 @@ Third parties build the shape through the installed package only
   (`tests/unit/test_artifact_publication.py::test_requires_gpl_unknown_inputs`,
   `tests/elf/test_map_contract.py::test_no_foreign_helper_or_map_kind_emitted`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
-* Only `ARRAY`, `PERCPU_ARRAY`, `HASH`, `LRU_HASH`, and
-  `PERCPU_HASH` maps with `u32` keys, `u64` values, and 1-4
-  entries exist (hash only under the hash capability profile,
-  LRU hash only under the LRU capability profile, per-CPU hash
-  only under the per-CPU-hash capability profile; the base
-  profile still refuses all three), plus `RINGBUF` maps in the
-  two qualified sizes for the event program and the single-entry
-  `ARRAY` core map with its 4096-byte opaque value; other
-  sizes, other kinds, and other shapes are refused at manifest
-  validation or the audit
+* Only `ARRAY`, `PERCPU_ARRAY`, `HASH`, and `LRU_HASH`
+  maps with `u32` keys, `u64` values, and 1-4 entries exist
+  (hash only under the hash capability profile, LRU hash only
+  under the LRU capability profile, per-CPU hash under no
+  profile -- its id is unclaimed and refuses outright; the
+  base profile still refuses all three keyed kinds), plus
+  `RINGBUF` maps in the two qualified sizes for the event
+  program and the single-entry `ARRAY` core map with its
+  4096-byte opaque value; other sizes, other kinds, and other
+  shapes are refused at manifest validation or the audit
   (`tests/unit/test_manifest.py::test_hash_map_type_refused`,
   `tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`,
   `tests/unit/test_manifest.py::test_hash_profile_refuses_non_hash_kinds`,
@@ -719,8 +719,9 @@ Third parties build the shape through the installed package only
   `tests/unit/test_manifest.py::test_lru_profile_extends_base_with_lru_vocabulary`,
   `tests/unit/test_manifest.py::test_lru_profile_refuses_non_lru_kinds`,
   `tests/unit/test_manifest.py::test_percpu_hash_map_type_refused`,
-  `tests/unit/test_manifest.py::test_percpu_hash_profile_extends_base_with_percpu_hash_vocabulary`,
-  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_non_percpu_hash_kinds`,
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_refused_until_supported`,
+  `tests/unit/test_manifest.py::test_percpu_hash_manifest_refused_under_percpu_hash_profile`,
+  `tests/unit/test_manifest.py::test_percpu_hash_profile_refuses_before_kind_checks`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * Only `BPF_ANY` updates lower; `BPF_NOEXIST`/`BPF_EXIST`
   spellings are refused, and there is no from-program iteration

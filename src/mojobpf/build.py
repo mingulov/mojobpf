@@ -225,6 +225,7 @@ from .inputs import (
 )
 from .inspect import (
     InspectionError,
+    assert_no_link_step,
     object_has_btf_ext,
     object_map_names,
     object_map_specs,
@@ -2461,13 +2462,15 @@ def _with_unpinned_warning(
     Trust is otherwise silent: a pin-matched default (``"default"``)
     and an explicit opt-in (``"extension"``) need no marker. But a
     result whose pipeline actually spawned the packaged service
-    under ``"default-unpinned"`` trust -- reachable only without
-    any lockfile, since a lockfile without a service pin refuses
-    the default upstream (``MBPF104``) -- says so out loud,
-    last, without disturbing success: nothing release-qualifies
-    on unvetted bytes. Results whose adapter never spawned (an
-    early input failure, a frontend failure, a spawn failure)
-    stay silent: nothing unpinned ran.
+    under ``"default-unpinned"`` trust says so out loud, last,
+    without disturbing success: nothing release-qualifies on
+    unvetted bytes. The marker is defense-in-depth only: tool
+    admission refuses a lockfile-less build (``MBPF104``) before
+    the adapter ever spawns, so end-to-end the unpinned trust
+    level is unreachable and only direct unit probes observe it.
+    Results whose adapter never spawned (an early input failure,
+    a frontend failure, a spawn failure) stay silent: nothing
+    unpinned ran.
     """
     if adapter_trust != ADAPTER_TRUST_DEFAULT_UNPINNED:
         return result
@@ -2942,6 +2945,12 @@ def _publish_generation(
             diagnostics, commands, provenance, work_dir=kept
         )
     entries.append((evidence_name, evidence_staged, "evidence"))
+    # The license payload was checked on the final object: a link
+    # step anywhere in this command list would need a recheck, so
+    # refuse loudly instead of publishing past it. No link step
+    # exists in the pipeline today; when linking lands, this
+    # tripwire is replaced by recheck logic.
+    assert_no_link_step(commands)
     try:
         published = publish_artifacts(entries, request.out_dir)
     except EvidenceError as exc:

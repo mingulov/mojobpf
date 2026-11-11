@@ -1785,6 +1785,29 @@ def test_hash_file_paths_and_missing():
         )
 
 
+def test_hash_file_refuses_over_cap():
+    # Provenance hashing is capped like every other product
+    # reader: one byte over refuses with MBPF708, never an
+    # unbounded read.
+    with _scratch() as parent:
+        exact = os.path.join(parent, "exact.bin")
+        _write(exact, b"x" * 128)
+        hashed = evidence_module.hash_file(
+            exact, parent, limit=128, kind="probe"
+        )
+        assert hashed.size == 128
+        assert hashed.sha256 == hashlib.sha256(b"x" * 128).hexdigest()
+        big = os.path.join(parent, "big.bin")
+        _write(big, b"x" * 129)
+        _expect_error(
+            lambda: evidence_module.hash_file(
+                big, parent, limit=128, kind="probe"
+            ),
+            "MBPF708",
+            "evidence.capture",
+        )
+
+
 def _staged(parent, name, content):
     path = os.path.join(parent, name + ".staged")
     _write(path, content)
@@ -3526,6 +3549,58 @@ def test_publish_recheck_restored_mtime_rewrite_rejected():
             os.lstat = real_lstat
         assert fired, "swap never injected"
         assert checked == [four_leg], checked
+        assert "changed" in exc.diagnostic.explanation
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"OLD"
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
+def test_publish_recheck_truncated_rewrite_rejected():
+    # In-place rewrite that also changes the size (write plus
+    # truncate, mtime restored): the recheck refuses on the
+    # changed identity and rollback restores the backed-up
+    # bytes. Companions the restored-mtime same-size variant.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"STAGED-NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        before = os.stat(victim)
+        checked = []
+
+        def rewrite_truncate(_observed):
+            stamp = os.stat(victim).st_mtime_ns
+            with open(victim, "r+b") as handle:
+                handle.write(b"REPLACEMENT")
+                handle.truncate(11)
+            os.utime(victim, ns=(stamp, stamp))
+            after = os.stat(victim)
+            checked.append((
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns,
+            ))
+
+        wrapper, fired, real_lstat = _swapping_lstat_factory(
+            victim, rewrite_truncate, fire_on=2, order="before"
+        )
+        os.lstat = wrapper
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.lstat = real_lstat
+        assert fired, "swap never injected"
+        assert checked[0][2] == 11, checked
+        assert checked[0][2] != before.st_size, checked
+        assert checked[0][3] == before.st_mtime_ns, checked
         assert "changed" in exc.diagnostic.explanation
         with open(victim, "rb") as handle:
             assert handle.read() == b"OLD"

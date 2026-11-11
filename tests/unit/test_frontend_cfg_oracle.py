@@ -473,6 +473,7 @@ def _direct_run():
         print("REFUSED: must not run under python -O (asserts stripped)")
         return 2
     failures = 0
+    skips = 0
     names = sorted(
         name
         for name in globals()
@@ -482,6 +483,7 @@ def _direct_run():
         try:
             globals()[name]()
         except pytest.skip.Exception as exc:
+            skips += 1
             print("skip %s: %s" % (name, exc))
         except Exception:
             failures += 1
@@ -491,8 +493,18 @@ def _direct_run():
             traceback.print_exc()
         else:
             print("ok %s" % name)
-    print("%d tests, %d failures" % (len(names), failures))
-    return 1 if failures else 0
+    print(
+        "%d tests, %d failures, %d skipped"
+        % (len(names), failures, skips)
+    )
+    if failures:
+        return 1
+    # Skips are not a pass: exit 2 (refused verdict) when any
+    # test skipped, so a direct run with no mojo binary never
+    # reports success with no probe executed.
+    if skips:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

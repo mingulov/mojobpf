@@ -465,6 +465,9 @@ def guest_run():
     """Stage the helper, boot one guest, return parsed case results."""
     if shutil.which("vng") is None:
         raise EnvironmentFailure("vng not found on PATH")
+    # Lease before staging: an unleased run refuses here,
+    # before any guest work, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
     stage = guest_proc.owned_stage(prefix="mojo-percpu-", dir="/tmp")
     helper_path = os.path.join(stage, HELPER_NAME)
     with open(helper_path, "w", encoding="utf-8") as handle:

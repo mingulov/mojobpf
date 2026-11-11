@@ -306,13 +306,20 @@ def test_capabilities_helpers_for_profile_returns_all_admitted():
         "linux-bpfel-v3-core",
         "linux-bpfel-v3-hash",
         "linux-bpfel-v3-lru",
-        "linux-bpfel-v3-percpu-hash",
         "linux-bpfel-v3-subprog",
         "linux-bpfel-v3-uprobe",
     ):
         assert helpers_for_profile(profile_id) == PINNED_PROFILE_IDS, (
             profile_id
         )
+    # No per-CPU-hash profile: the id refuses like any unknown id.
+    try:
+        helpers_for_profile("linux-bpfel-v3-percpu-hash")
+    except ProfileError as exc:
+        assert exc.diagnostic.code == "MBPF101", exc.diagnostic
+        assert exc.diagnostic.stage == "profile.resolve", exc.diagnostic
+    else:
+        raise AssertionError("expected MBPF101 for per-CPU-hash profile")
     for profile_id in capabilities_module.SUPPORTED_PROFILE_IDS:
         admitted = helpers_for_profile(profile_id)
         assert admitted == tuple(sorted(admitted)), profile_id

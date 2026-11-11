@@ -157,13 +157,14 @@ def test_manifest_without_maps_parses():
 
 
 def test_profile_registry_holds_supported_profiles():
+    # Eight profiles: per-CPU hash is retained in-tree but
+    # unclaimed, so its id is absent (refused at every gate).
     assert SUPPORTED_PROFILE_IDS == (
         "linux-bpfel-v3",
         "linux-bpfel-v3-core",
         "linux-bpfel-v3-hash",
         "linux-bpfel-v3-lru",
         "linux-bpfel-v3-net",
-        "linux-bpfel-v3-percpu-hash",
         "linux-bpfel-v3-reserve",
         "linux-bpfel-v3-subprog",
         "linux-bpfel-v3-uprobe",
@@ -249,25 +250,16 @@ def test_lru_profile_extends_base_with_lru_vocabulary():
     assert profile.subprog_supported is False
 
 
-def test_percpu_hash_profile_extends_base_with_percpu_hash_vocabulary():
-    profile = lookup_profile("linux-bpfel-v3-percpu-hash")
-    base = lookup_profile("linux-bpfel-v3")
-    assert profile.byte_order == base.byte_order
-    assert profile.cpu == base.cpu
-    assert profile.allowed_pairs == base.allowed_pairs
-    assert profile.allowed_map_types == (
-        "array", "percpu_array", "ringbuf", "percpu_hash",
-    )
-    assert profile.allowed_key_types == base.allowed_key_types
-    assert profile.allowed_value_types == base.allowed_value_types
-    assert profile.allowed_max_entries == base.allowed_max_entries
-    assert profile.allowed_ringbuf_sizes == base.allowed_ringbuf_sizes
-    assert profile.helper_ids == base.helper_ids
-    assert profile.btf_scope == base.btf_scope
-    assert profile.entry_return == base.entry_return
-    assert profile.entry_parameters == base.entry_parameters
-    assert profile.core_supported is False
-    assert profile.subprog_supported is False
+def test_percpu_hash_profile_refused_until_supported():
+    # No per-CPU-hash profile: the kind is retained in-tree but
+    # unclaimed, so the id refuses (MBPF101) like any unknown id.
+    try:
+        lookup_profile("linux-bpfel-v3-percpu-hash")
+    except ProfileError as exc:
+        assert exc.diagnostic.code == "MBPF101"
+        assert exc.diagnostic.stage == "profile.resolve"
+    else:
+        raise AssertionError("expected MBPF101 for per-CPU-hash profile")
 
 
 def test_reserve_profile_extends_base_with_reserve_helpers():
@@ -629,21 +621,16 @@ def test_lru_profile_refuses_bad_key_value_sizes():
     assert "5" in diagnostic.explanation
 
 
-def test_percpu_hash_manifest_parses_under_percpu_hash_profile():
+def test_percpu_hash_manifest_refused_under_percpu_hash_profile():
+    # The profile id refuses at parse (MBPF101): per-CPU hash is
+    # retained in-tree but unclaimed, so no manifest may select it.
     text = mutate(
         'profile = "linux-bpfel-v3"',
         'profile = "linux-bpfel-v3-percpu-hash"\n',
     )
     text = mutate_in(text, 'map_type = "array"', 'map_type = "percpu_hash"\n')
-    manifest_path, _tmpdir = write_project(text)
-    manifest = parse_manifest(manifest_path)
-    assert manifest.target.profile == "linux-bpfel-v3-percpu-hash"
-    assert len(manifest.maps) == 1
-    mapping = manifest.maps[0]
-    assert mapping.map_type == "percpu_hash"
-    assert mapping.key_type == "u32"
-    assert mapping.value_type == "u64"
-    assert mapping.max_entries == 1
+    diagnostic = expect_code(text, "MBPF101")
+    assert "linux-bpfel-v3-percpu-hash" in diagnostic.explanation
 
 
 def _percpu_hash_text():
@@ -654,30 +641,30 @@ def _percpu_hash_text():
     return mutate_in(text, 'map_type = "array"', 'map_type = "percpu_hash"\n')
 
 
-def test_percpu_hash_profile_refuses_non_percpu_hash_kinds():
-    for refused in ("hash", "lru_hash", "array_of_maps", "prog_array"):
-        text = mutate_in(
+def test_percpu_hash_profile_refuses_before_kind_checks():
+    # The refused profile id short-circuits every vocabulary
+    # check below it: kind, key/value, and count mutations all
+    # refuse with MBPF101, never MBPF205.
+    for text in (
+        mutate_in(
             _percpu_hash_text(), 'map_type = "percpu_hash"',
-            'map_type = "%s"\n' % refused,
-        )
-        diagnostic = expect_code(text, "MBPF205")
-        assert refused in diagnostic.explanation
-
-
-def test_percpu_hash_profile_refuses_bad_key_value_sizes():
-    text = mutate_in(
-        _percpu_hash_text(), 'key_type = "u32"', 'key_type = "u16"\n'
-    )
-    diagnostic = expect_code(text, "MBPF205")
-    assert "u16" in diagnostic.explanation
-    text = mutate_in(
-        _percpu_hash_text(), 'value_type = "u64"', 'value_type = "u32"\n'
-    )
-    diagnostic = expect_code(text, "MBPF205")
-    assert "u32" in diagnostic.explanation
-    text = mutate_in(_percpu_hash_text(), "max_entries = 1", "max_entries = 5\n")
-    diagnostic = expect_code(text, "MBPF205")
-    assert "5" in diagnostic.explanation
+            'map_type = "hash"\n',
+        ),
+        mutate_in(
+            _percpu_hash_text(), 'key_type = "u32"',
+            'key_type = "u16"\n',
+        ),
+        mutate_in(
+            _percpu_hash_text(), 'value_type = "u64"',
+            'value_type = "u32"\n',
+        ),
+        mutate_in(
+            _percpu_hash_text(), "max_entries = 1",
+            "max_entries = 5\n",
+        ),
+    ):
+        diagnostic = expect_code(text, "MBPF101")
+        assert "linux-bpfel-v3-percpu-hash" in diagnostic.explanation
 
 
 def test_percpu_hash_map_type_refused():

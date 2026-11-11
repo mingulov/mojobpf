@@ -191,7 +191,8 @@ def profile_helper_ids(profile_id: str) -> tuple[int, ...]:
 
     Raises :class:`KeyError` for a profile identifier no target
     profile owns. Known profiles that introduce no helpers (core,
-    hash, lru, subprog, uprobe) still return ``()``.
+    hash, lru, subprog, uprobe) still return ``()``; per-CPU
+    hash has no admitted profile and raises like any unknown id.
     """
     # Deferred import: capabilities owns the profile set and
     # imports this module, so a top-level import would cycle.

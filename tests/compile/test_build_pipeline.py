@@ -64,7 +64,9 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_SKB_LOADMAP_ADD_IMMS,
     QUALIFIED_TRACEPOINT_ADD_IMMS,
     QUALIFIED_UPROBE_ADD_IMMS,
+    PARSED_MAP_TYPE_KINDS,
     _discover_imports,
+    _parsed_object_kind,
     _resolves_to_sdk,
     _sdk_dir,
     _verify_gate_outcome,
@@ -75,7 +77,10 @@ from mojobpf.evidence import (  # noqa: E402
     HashedFile,
     cache_key,
 )
-from mojobpf.inspect import object_map_value_sizes  # noqa: E402
+from mojobpf.inspect import (  # noqa: E402
+    object_map_specs,
+    object_map_value_sizes,
+)
 from mojobpf.manifest import parse_manifest  # noqa: E402
 
 REPO_ROOT = os.path.dirname(
@@ -358,6 +363,9 @@ program_type = "xdp"
 section = "xdp"
 {maps}
 """
+# The per-CPU-hash profile id is refused (MBPF101): manifests
+# built from this template exercise the refusal gate, never a
+# build. The retained Lane-A lowering bypasses manifests.
 PERCPUHASH_MANIFEST_TEMPLATE = """\
 schema_version = 1
 
@@ -1698,14 +1706,11 @@ def test_verify_gate_parsed_object_kind_mismatch_rejected():
             shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
-def test_verify_gate_parsed_object_kind_five_rejected():
-    # Per-CPU hash has no parsed lowering (the contract
-    # comparison refuses it with MBPF219 before any object
-    # exists), so a type-5 BTF map on the parsed arm names no
-    # reviewed parsed-route kind: the gate refuses with
-    # MBPF216 instead of reconciling it. The staged object is
-    # an honest Lane-A per-CPU-hash build cross-wired onto
-    # the parsed arm, which honest builds never produce.
+def test_verify_gate_percpuhash_profile_refused():
+    # The per-CPU-hash profile id refuses at the manifest gate
+    # (MBPF101), so a type-5 BTF map can never stage onto the
+    # parsed arm through the driver: the refusal lands before
+    # any object exists.
     check_tools()
     manifest_path, out_dir = write_project(
         PERCPUHASH_RMW_SOURCES[4], "xdp_entry",
@@ -1713,29 +1718,44 @@ def test_verify_gate_parsed_object_kind_five_rejected():
         max_entries=4, map_type="percpu_hash",
         template=PERCPUHASH_MANIFEST_TEMPLATE,
     )
-    result = build(manifest_path, out_dir, save_temps=True)
-    try:
-        assert result.success is True, result.diagnostics
-        assert result.work_dir is not None
-        adapted = os.path.join(
-            result.work_dir, "xdp_entry.adapter", "adapted.ll"
-        )
-        assert os.path.isfile(adapted), adapted
-        staged = os.path.join(
-            result.work_dir, "xdp_entry.bpf.o"
-        )
-        assert os.path.isfile(staged), staged
-        manifest = parse_manifest(manifest_path)
-        program = manifest.programs[0]
-        outcome = _verify_gate_outcome(
-            manifest, program, staged, adapted, "parsed",
-        )
-        assert [item.code for item in outcome] == ["MBPF216"], outcome
-        assert outcome[0].stage == "build.backend", outcome
-        assert "no reviewed parsed-route map kind" in outcome[0].explanation, outcome
-    finally:
-        if result.work_dir is not None:
-            shutil.rmtree(result.work_dir, ignore_errors=True)
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF101", diagnostic
+    assert diagnostic.stage == "profile.resolve", diagnostic
+    assert "linux-bpfel-v3-percpu-hash" in diagnostic.explanation, diagnostic
+
+
+def test_parsed_object_kind_rejects_unreviewed_type():
+    # The parsed-arm kind gate (_parsed_object_kind) still
+    # refuses BTF map types outside its reviewed table with
+    # MBPF216. Per-CPU hash no longer stages through the
+    # driver, so the miss path is pinned with a ring-buffer
+    # map (type 27, likewise unreviewed) from an honest
+    # reserve-profile build.
+    check_tools()
+    out_dir = tempfile.mkdtemp(prefix="build-unreviewed-kind-")
+    result = build(RESERVE_MANIFEST, out_dir)
+    assert result.success is True, result.diagnostics
+    staged = os.path.join(out_dir, "ringbuf_reserve.bpf.o")
+    assert os.path.isfile(staged), staged
+    specs = dict(
+        (name, map_type)
+        for name, map_type, _entries in object_map_specs(staged)
+    )
+    assert specs, staged
+    # The reserve object carries an array companion plus the
+    # ring buffer; the ring buffer's type is the unreviewed one.
+    unreviewed = sorted(
+        name for name, map_type in specs.items()
+        if map_type not in PARSED_MAP_TYPE_KINDS
+    )
+    assert unreviewed, specs
+    kind, refusal = _parsed_object_kind(staged, unreviewed[0])
+    assert kind is None, kind
+    assert refusal is not None and refusal.code == "MBPF216", refusal
+    assert refusal.stage == "build.backend", refusal
+    assert "no reviewed parsed-route map kind" in refusal.explanation, refusal
 
 
 def _check_hash_shape_builds(source, entries, artifact):
@@ -1892,46 +1912,39 @@ def test_array_program_lru_manifest_rejected():
     assert "scans as array" in diagnostic.explanation, diagnostic
 
 
-def _check_percpuhash_shape_builds(source, entries, artifact):
+def _check_percpuhash_shape_refused(source, entries, artifact):
     manifest_path, out_dir = write_project(
         source, "xdp_entry", artifact, True,
         max_entries=entries, map_type="percpu_hash",
         template=PERCPUHASH_MANIFEST_TEMPLATE,
     )
-    result = build(manifest_path, out_dir, save_temps=True)
-    try:
-        assert result.success is True, result.diagnostics
-        assert [item.role for item in result.artifacts] == [
-            "object", "evidence",
-        ]
-        object_path = os.path.join(out_dir, artifact + ".bpf.o")
-        assert os.path.isfile(object_path)
-    finally:
-        if result.work_dir is not None:
-            shutil.rmtree(result.work_dir, ignore_errors=True)
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF101", diagnostic
+    assert diagnostic.stage == "profile.resolve", diagnostic
+    assert "linux-bpfel-v3-percpu-hash" in diagnostic.explanation, diagnostic
 
 
-def test_percpuhash_shapes_build_through_driver():
+def test_percpuhash_shapes_refused_through_driver():
     # Every per-CPU-hash pair shape and every per-CPU-hash
-    # delete probe builds end to end with its matching
-    # per-CPU-hash manifest: audit, adapter, spill gate,
-    # inspection, and kind/count reconciliation all pass under
-    # the per-CPU-hash capability profile.
+    # delete probe refuses at the manifest gate: the profile
+    # id is unclaimed, so no per-CPU-hash manifest builds.
     check_tools()
     for entries, source in sorted(PERCPUHASH_RMW_SOURCES.items()):
-        _check_percpuhash_shape_builds(
+        _check_percpuhash_shape_refused(
             source, entries, "percpuhash_rmw%d_obj" % entries
         )
     for entries, source in sorted(PERCPUHASH_DELETE_SOURCES.items()):
-        _check_percpuhash_shape_builds(
+        _check_percpuhash_shape_refused(
             source, entries, "percpuhash_del%d_obj" % entries
         )
 
 
 def test_percpuhash_kind_mismatch_rejected():
     # A per-CPU-hash pair program paired with an array manifest
-    # fails kind reconciliation with MBPF216 instead of
-    # publishing an artifact that disagrees with its manifest.
+    # refuses at the manifest gate (MBPF101): the profile id is
+    # unclaimed, so kind reconciliation is never reached.
     check_tools()
     manifest_path, out_dir = write_project(
         PERCPUHASH_RMW_SOURCES[4], "xdp_entry",
@@ -1942,18 +1955,15 @@ def test_percpuhash_kind_mismatch_rejected():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF216", diagnostic
-    assert diagnostic.stage == "build.backend", diagnostic
-    assert "percpu_hash map" in diagnostic.explanation, diagnostic
-    assert "map_type = 'array'" in diagnostic.explanation, diagnostic
+    assert diagnostic.code == "MBPF101", diagnostic
+    assert diagnostic.stage == "profile.resolve", diagnostic
+    assert "linux-bpfel-v3-percpu-hash" in diagnostic.explanation, diagnostic
 
 
 def test_array_program_percpuhash_manifest_rejected():
     # An array pair program paired with a per-CPU-hash manifest
-    # never builds. The array program routes parsed, where the
-    # unmigrated per-CPU-hash kind refuses in the contract
-    # comparison (MBPF219) instead of reaching backend kind
-    # reconciliation.
+    # never builds: the profile id refuses at the manifest gate
+    # (MBPF101) before routing or contract comparison.
     check_tools()
     manifest_path, out_dir = write_project(
         RMW_SOURCES[4], "xdp_entry", "array_percpuhash_mismatch_obj",
@@ -1963,9 +1973,9 @@ def test_array_program_percpuhash_manifest_rejected():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF219", diagnostic
-    assert diagnostic.stage == "adapter.transform", diagnostic
-    assert "got 'percpu_hash'" in diagnostic.explanation, diagnostic
+    assert diagnostic.code == "MBPF101", diagnostic
+    assert diagnostic.stage == "profile.resolve", diagnostic
+    assert "linux-bpfel-v3-percpu-hash" in diagnostic.explanation, diagnostic
 
 
 def test_multientry_count_mismatch_rejected():
@@ -2478,8 +2488,9 @@ def test_lru_mixed_kind_rejected_through_driver():
 
 
 def test_percpuhash_mixed_kind_rejected_through_driver():
-    # Array and per-CPU-hash handle loads in one program match
-    # no map count family: MBPF307 at the adapter audit.
+    # Array and per-CPU-hash handle loads in one program refuse
+    # at the manifest gate (MBPF101): the profile id is
+    # unclaimed, so the adapter audit is never reached.
     check_tools()
     manifest_path, out_dir = write_project(
         PERCPUHASH_MIXED_SOURCE, "xdp_entry",
@@ -2490,8 +2501,9 @@ def test_percpuhash_mixed_kind_rejected_through_driver():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF307", diagnostic
-    assert diagnostic.stage == "adapter.audit", diagnostic
+    assert diagnostic.code == "MBPF101", diagnostic
+    assert diagnostic.stage == "profile.resolve", diagnostic
+    assert "linux-bpfel-v3-percpu-hash" in diagnostic.explanation, diagnostic
 
 
 def test_getnext_attempt_rejected_through_driver():

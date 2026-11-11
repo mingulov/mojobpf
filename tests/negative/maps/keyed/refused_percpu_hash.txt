@@ -6,18 +6,19 @@
 # tests/compile/unsupported/*percpuhash*.ll. This file indexes
 # them so reviewers can audit coverage without reading the test
 # bodies. Every vector below names its FIRST rejecting layer:
-# manifest validation (MBPF205), the IR audit at adapter time
-# (MBPF3xx), backend kind reconciliation (MBPF216), the parsed
-# contract comparison (MBPF219), or the kernel (verifier log
-# line / errno). Nothing refused above the kernel reaches a
-# guest; nothing refused by the verifier executes.
+# the profile gate (MBPF101), manifest validation (MBPF205),
+# the IR audit at adapter time (MBPF3xx), backend kind
+# reconciliation (MBPF216), the parsed contract comparison
+# (MBPF219), or the kernel (verifier log line / errno).
+# Nothing refused above the kernel reaches a guest; nothing
+# refused by the verifier executes.
 #
 # Format: <vector> | <asserting test> | <expected outcome>
 
 manifest map_type percpu_hash under base profile | test_percpu_hash_map_type_refused (tests/unit/test_manifest.py) | MBPF205 names percpu_hash
-array program + percpu_hash manifest | test_array_program_percpuhash_manifest_rejected (tests/compile/test_build_pipeline.py) | MBPF219 parsed contract, got 'percpu_hash'
-percpu_hash program + array manifest | test_percpuhash_kind_mismatch_rejected (tests/compile/test_build_pipeline.py) | MBPF216 backend reconciliation
-mixed array + per-CPU-hash handles, maps_percpuhash_mixed.mojo | test_percpuhash_mixed_kind_rejected_through_driver (tests/compile/test_build_pipeline.py) | MBPF307 adapter.audit
+array program + percpu_hash manifest | test_array_program_percpuhash_manifest_rejected (tests/compile/test_build_pipeline.py) | MBPF101 profile.resolve, unclaimed profile id
+percpu_hash program + array manifest | test_percpuhash_kind_mismatch_rejected (tests/compile/test_build_pipeline.py) | MBPF101 profile.resolve, unclaimed profile id
+mixed array + per-CPU-hash handles, maps_percpuhash_mixed.mojo | test_percpuhash_mixed_kind_rejected_through_driver (tests/compile/test_build_pipeline.py) | MBPF101 profile.resolve, unclaimed profile id
 mixed array + per-CPU-hash handles, maps_percpuhash_mixed.mojo | test_mixed_percpuhash_kind_refused (tests/elf/test_generalized_maps.py) | MBPF307
 mixed per-CPU + per-CPU-hash tags, maps_percpuhash_kind_mixed.mojo | test_mixed_percpuhash_percpu_refused (tests/elf/test_generalized_maps.py) | MBPF307
 update with BPF_NOEXIST, maps_percpuhash_noexist.mojo | test_percpuhash_update_noexist_refused (tests/elf/test_map_contract.py) | MBPF314
