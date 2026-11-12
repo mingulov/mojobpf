@@ -2701,9 +2701,8 @@ def _first_shadow_root(
 
     Any winning sibling spelling shadows: ``stem.py``,
     ``stem.pyc``, ``stem/__init__.py``,
-    ``stem/__init__.pyc``, a platform-tagged
-    ``stem.*.so``/``stem.pyd`` or a platform-tagged
-    ``stem/__init__.*.so``/``stem/__init__.pyd`` (the first
+    ``stem/__init__.pyc``, a platform-tagged ``stem.*.so``
+    or a platform-tagged ``stem/__init__.*.so`` (the first
     path entry carrying any match wins import selection, so a
     same-name module beats a package and an extension beats
     source across roots). A bare directory without an
@@ -2735,7 +2734,7 @@ def _first_shadow_root(
         for entry in entries:
             if (
                 entry.startswith(leaf + ".")
-                and entry.lower().endswith((".so", ".pyd"))
+                and entry.endswith(".so")
                 and os.path.isfile(os.path.join(parent, entry))
             ):
                 return root
@@ -2746,9 +2745,9 @@ def _first_shadow_root(
         for entry in inits:
             if not entry.startswith("__init__."):
                 continue
-            if entry.lower().endswith(
-                (".so", ".pyd")
-            ) and os.path.isfile(os.path.join(base, entry)):
+            if entry.endswith(".so") and os.path.isfile(
+                os.path.join(base, entry)
+            ):
                 return root
     return None
 
@@ -2756,10 +2755,14 @@ def _first_shadow_root(
 def _extension_entry(directory: str, stem: str) -> str | None:
     """Return a same-stem extension file in a directory, if any.
 
-    ``stem.<tag>.so``/``stem.pyd`` beats ``stem.py``/``stem.pyc``
-    within its level (extensions beat source and bytecode), so
-    beside a verified source or bytecode file it wins import
-    selection. Returns the entry name, or None.
+    ``stem.<tag>.so`` beats ``stem.py``/``stem.pyc`` within
+    its level (extensions beat source and bytecode), so beside
+    a verified source or bytecode file it wins import
+    selection. Matching is posix-exact (case-sensitive, no
+    ``.pyd``: the file finder has no such suffix on Linux)
+    but tag-agnostic: tags vary across the interpreter
+    versions a pin may name, so any tag refuses. Returns the
+    entry name, or None.
     """
     try:
         entries = os.listdir(directory)
@@ -2768,7 +2771,7 @@ def _extension_entry(directory: str, stem: str) -> str | None:
     for entry in entries:
         if (
             entry.startswith(stem + ".")
-            and entry.lower().endswith((".so", ".pyd"))
+            and entry.endswith(".so")
             and os.path.isfile(os.path.join(directory, entry))
         ):
             return entry
@@ -2778,9 +2781,11 @@ def _extension_entry(directory: str, stem: str) -> str | None:
 def _package_init_extension(package_dir: str) -> str | None:
     """Return a package extension init in a directory, if any.
 
-    ``__init__.<tag>.so``/``__init__.pyd`` beats every other
-    ``__init__`` spelling, so beside a verified ``__init__.py``
-    or ``__init__.pyc`` it wins import selection. Returns the
+    ``__init__.<tag>.so`` beats every other ``__init__``
+    spelling, so beside a verified ``__init__.py`` or
+    ``__init__.pyc`` it wins import selection. Matching is
+    posix-exact (case-sensitive, no ``.pyd``) but
+    tag-agnostic, like :func:`_extension_entry`. Returns the
     entry name, or None.
     """
     try:
@@ -2790,7 +2795,7 @@ def _package_init_extension(package_dir: str) -> str | None:
     for entry in entries:
         if not entry.startswith("__init__."):
             continue
-        if entry.lower().endswith((".so", ".pyd")) and os.path.isfile(
+        if entry.endswith(".so") and os.path.isfile(
             os.path.join(package_dir, entry)
         ):
             return entry
@@ -3038,7 +3043,7 @@ def _reject_stdlib_shadow(
                 # A sourceless top-level ``X.pyc`` is imported
                 # as ``X`` (legacy layout, no __pycache__).
                 top, hit = name[:-4], os.path.isfile(full)
-            elif name.lower().endswith((".so", ".pyd")):
+            elif name.endswith(".so"):
                 top = name.split(".", 1)[0]
                 hit = os.path.isfile(full)
             else:
@@ -3056,9 +3061,7 @@ def _reject_stdlib_shadow(
                     for entry in inits:
                         if not entry.startswith("__init__."):
                             continue
-                        if entry.lower().endswith(
-                            (".so", ".pyd")
-                        ) and os.path.isfile(
+                        if entry.endswith(".so") and os.path.isfile(
                             os.path.join(full, entry)
                         ):
                             hit = True
@@ -3106,7 +3109,7 @@ def _startup_shadow_relpath(root: str) -> str | None:
     except OSError:
         return None
     for entry in entries:
-        if not entry.lower().endswith((".so", ".pyd")):
+        if not entry.endswith(".so"):
             continue
         top = entry.split(".", 1)[0]
         if (
@@ -3125,9 +3128,9 @@ def _startup_shadow_relpath(root: str) -> str | None:
         for entry in inits:
             if not entry.startswith("__init__."):
                 continue
-            if entry.lower().endswith(
-                (".so", ".pyd")
-            ) and os.path.isfile(os.path.join(package, entry)):
+            if entry.endswith(".so") and os.path.isfile(
+                os.path.join(package, entry)
+            ):
                 return os.path.join(name, entry)
     return None
 
@@ -5061,7 +5064,7 @@ def _record_import_stems(record_text: str) -> list[str]:
             stems.append(rel[:-3])
         elif lowered.endswith(".pyc"):
             stems.append(rel[:-4])
-        elif lowered.endswith((".so", ".pyd")):
+        elif rel.endswith(".so"):
             stems.append(rel)
     return stems
 
@@ -5105,7 +5108,7 @@ def _reject_dependency_shadow(
                 "the verified bytes would not be the imported "
                 "bytes" % (name, top),
             )
-        if stem.lower().endswith((".so", ".pyd")):
+        if stem.endswith(".so"):
             prefixes = _extension_prefix_paths(stem)
         else:
             prefixes = _module_prefix_paths(stem.split("/"))
@@ -5113,7 +5116,7 @@ def _reject_dependency_shadow(
             (prefix, _first_shadow_root(prefix, earlier_roots))
             for prefix in prefixes
         ]
-        if stem.lower().endswith((".so", ".pyd")):
+        if stem.endswith(".so"):
             # The platform-tagged filename wins as a whole.
             winners.append(
                 (
@@ -5254,7 +5257,7 @@ def _reject_dependency_local_shadow(
                 if (
                     entry != base
                     and entry.startswith(first + ".")
-                    and entry.lower().endswith((".so", ".pyd"))
+                    and entry.endswith(".so")
                     and os.path.isfile(
                         os.path.join(leaf_dir, entry)
                     )
@@ -5344,7 +5347,7 @@ def _reject_dependency_local_shadow(
         elif lowered.endswith(".pyc"):
             kind = "bytecode"
             stem = rel[:-4]
-        elif lowered.endswith((".so", ".pyd")):
+        elif rel.endswith(".so"):
             kind = "extension"
             stem = "/".join(
                 segments[:-1] + [segments[-1].split(".", 1)[0]]

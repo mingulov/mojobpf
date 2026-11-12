@@ -362,10 +362,14 @@ def test_validation_sources_sync():
 def test_schemas_shipped_byte_identical():
     # The wheel ships every tree schema: a contract schema added
     # to schemas/ without a packaging pin fails here, never
-    # silently absent from installed environments.
+    # silently absent from installed environments. The walk is
+    # recursive so a schema in a subdirectory cannot evade the
+    # pin either.
+    schemas_dir = os.path.join(REPO_ROOT, "schemas")
     tree_schemas = sorted(
-        entry
-        for entry in os.listdir(os.path.join(REPO_ROOT, "schemas"))
+        os.path.relpath(os.path.join(found, entry), schemas_dir)
+        for found, _, files in os.walk(schemas_dir)
+        for entry in files
         if entry.endswith(".schema.json")
     )
     assert tuple(tree_schemas) == PINNED_SCHEMA_DATA, tree_schemas

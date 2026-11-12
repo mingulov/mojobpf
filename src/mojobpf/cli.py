@@ -1012,8 +1012,8 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument(
         "--require-kernel",
         action="store_true",
-        help="fail when kernel execution is unavailable, or no "
-        "kernel test executes, instead of skipping",
+        help="fail instead of exiting 0 when no kernel test "
+        "executes (a missing vng runner always fails)",
     )
     test.set_defaults(func=_command_test)
     return parser

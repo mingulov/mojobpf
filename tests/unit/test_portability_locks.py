@@ -5,7 +5,7 @@ Pins the AArch64 lane lock (``ci/kernels.arm64.lock.json``) and
 the investigational compiler lock
 (``ci/toolchains.investigational.lock.json``) field by field, and
 guards the release freeze around them: the release toolchain
-pins, the four-lane x86-64 matrix lock (three KVM lanes plus the
+pins, the six-lane x86-64 matrix lock (five KVM lanes plus the
 named TCG fallback), the 41-suite matrix shape, and the
 compatibility document's tested-only claims.
 The portability guest suite itself stays out of the matrix

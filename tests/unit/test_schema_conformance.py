@@ -535,28 +535,54 @@ def test_size_budget_conforms():
 
 
 def test_every_schema_file_has_conformance_coverage():
-    # Closed sweep: every schemas/*.schema.json must be loaded
-    # by a conformance test above (via _load_schema), so a new
-    # schema file without a test fails here, never silently.
+    # Closed sweep: every schemas/*.schema.json at any depth
+    # must be asserted by a conformance test above (a literal
+    # _load_schema load inside a test_* function that also
+    # calls an assert helper), so a new schema file without a
+    # test fails here, never silently. A bare load with no
+    # assertions does not count. No src loader globs schemas/
+    # (all use exact names), so stray non-schema files stay
+    # inert and out of scope.
     import ast
 
     with open(__file__, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
     covered = set()
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_load_schema"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
+        if not (
+            isinstance(node, ast.FunctionDef)
+            and node.name.startswith("test_")
         ):
-            covered.add(node.args[0].value)
-    on_disk = sorted(
-        entry[: -len(".schema.json")]
-        for entry in os.listdir(SCHEMAS)
-        if entry.endswith(".schema.json")
-    )
+            continue
+        loads = set()
+        asserted = False
+        for child in ast.walk(node):
+            if not (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+            ):
+                continue
+            if child.func.id == "_load_schema" and child.args:
+                arg = child.args[0]
+                if isinstance(arg, ast.Constant):
+                    loads.add(arg.value)
+            elif child.func.id in (
+                "_assert_conforms",
+                "_assert_union_covered",
+            ):
+                asserted = True
+        if asserted:
+            covered |= loads
+    on_disk = []
+    for found, _, files in os.walk(SCHEMAS):
+        for entry in sorted(files):
+            if entry.endswith(".schema.json"):
+                on_disk.append(
+                    os.path.relpath(
+                        os.path.join(found, entry), SCHEMAS
+                    )[: -len(".schema.json")]
+                )
+    on_disk.sort()
     assert on_disk, "no schemas found"
     missing = [name for name in on_disk if name not in covered]
     assert not missing, missing

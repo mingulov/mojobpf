@@ -14,6 +14,7 @@ repository root) or directly (``python3 tests/unit/test_exec_chain.py``).
 
 from contextlib import contextmanager
 import dataclasses
+import importlib.machinery
 import os
 import shutil
 import sys
@@ -1254,6 +1255,146 @@ def test_admission_missing_root_refuses_admission_error():
             ), exc
         else:
             raise AssertionError("missing root admitted")
+
+
+def test_admission_ignores_pyd_sibling():
+    # A ``stem.pyd`` beside the pinned module can never be
+    # selected on Linux (FileFinder has no .pyd suffix here),
+    # so it admits instead of refusing as a shadow.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-pyd-sibling-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent, {"pkgmod.pyd": b"not-an-extension"}
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
+
+
+def test_admission_ignores_uppercase_so_sibling():
+    # Posix matching is case-sensitive: ``stem.SO`` never
+    # selects, so it admits instead of refusing as a shadow.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-upper-so-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent, {"pkgmod.SO": b"not-an-extension"}
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
+
+
+def test_admission_ignores_pyd_stdlib_shadow():
+    # A stdlib-named ``.pyd`` is equally unselectable here.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-pyd-stdlib-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent, {"json.pyd": b"not-an-extension"}
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
+
+
+def test_admission_refuses_bogus_tag_so_sibling():
+    # Any ``stem.<tag>.so`` still refuses: tags vary across
+    # interpreter versions the pin may name, so only exact
+    # platform truth (.so case, no .pyd) is trusted, never a
+    # tag allowlist that could rot.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-bogus-tag-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent, {"pkgmod.bar.so": b"not-an-extension"}
+        )
+        try:
+            execution_module.admit_execution(request, pins)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_MODULE_MISMATCH
+            ), exc
+        else:
+            raise AssertionError("bogus-tag .so shadow admitted")
+
+
+def test_admission_refuses_real_extension_sibling():
+    # A true extension suffix beside the pinned source still
+    # refuses: the tightening only drops spellings the file
+    # finder can never select.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-real-ext-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent,
+            {
+                "pkgmod"
+                + importlib.machinery.EXTENSION_SUFFIXES[0]: (
+                    b"not-an-extension"
+                )
+            },
+        )
+        try:
+            execution_module.admit_execution(request, pins)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_MODULE_MISMATCH
+            ), exc
+        else:
+            raise AssertionError("real extension shadow admitted")
+
+
+def test_admission_ignores_pyd_startup_spelling():
+    # ``sitecustomize.pyd`` can never be startup-imported on
+    # Linux, so it admits instead of refusing as a startup
+    # shadow.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-pyd-startup-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent, {"sitecustomize.pyd": b"not-an-extension"}
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
+
+
+def test_admission_ignores_uppercase_so_startup_spelling():
+    # ``sitecustomize.SO`` never selects on posix either.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-upper-startup-"
+    ) as parent:
+        request, pins = _startup_console_admission(
+            parent, {"sitecustomize.SO": b"not-an-extension"}
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
+
+
+def test_record_import_stems_ignores_pyd_and_uppercase_so():
+    # RECORD entries the file finder can never select on
+    # Linux (``.pyd``, upper-case ``.SO``) contribute no
+    # import stems; real spellings still do.
+    record = (
+        "a.pyd,,\n"
+        "b.SO,,\n"
+        "c.so,,\n"
+        "d.py,,\n"
+        "e.pyc,,\n"
+    )
+    assert execution_module._record_import_stems(record) == [
+        "c.so",
+        "d",
+        "e",
+    ]
 
 
 def test_admission_nonstring_root_refuses_admission_error():

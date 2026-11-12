@@ -478,6 +478,48 @@ IMPORT_PROBES = (
         False,
         None,
     ),
+    (
+        "compat_import_multi_spaced_ok",
+        "import mojobpf.packet, mojobpf . core\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
+    (
+        "compat_import_multi_spaced_bad_second",
+        "import mojobpf.packet, mojobpf . _impl\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
+    (
+        "compat_import_multi_spaced_bad_deeper",
+        "import mojobpf.packet, mojobpf . packet . sub\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "not a package",
+    ),
+    (
+        "compat_import_multi_spaced_bad_alias",
+        "import mojobpf.packet, mojobpf . _impl as e\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
+    (
+        "compat_import_string_hide_ok",
+        "def entry() -> Int32:\n"
+        '    var x = "a\\\n'
+        "from mojobpf import _impl\\\n"
+        'b"\n'
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
 )
 
 
@@ -544,6 +586,8 @@ def test_frontend_import_negatives():
                     proc.stdout,
                     proc.stderr,
                 )
+                static = sdk_module.check_mojo_imports(source)
+                assert static == (), (stem, static)
                 continue
             assert proc.returncode != 0, (stem, proc.stdout)
             assert "error:" in proc.stderr.lower(), (

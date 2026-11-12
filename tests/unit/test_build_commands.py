@@ -6742,12 +6742,33 @@ def test_test_kernel_require_executed_passes():
     assert code == 0, out
 
 
+def test_test_require_kernel_help_matches_behavior():
+    # The flag fails when no kernel test executes; a missing
+    # vng runner fails with or without it. Pin the help so it
+    # cannot promise skipping again.
+    code, out, _ = run_cli(["test", "--help"])
+    assert code == 0
+    start = out.index("  --require-kernel")
+    rest = out[start:]
+    end = rest.find("\n  --", 1)
+    chunk = rest[:end] if end != -1 else rest
+    text = " ".join(chunk.split())
+    assert "no kernel test executes" in text, text
+    assert "always" in text and "vng" in text, text
+
+
 def test_test_kernel_all_skipped_without_require_passes():
     parent = tempfile.mkdtemp(prefix="cli-test-skippass-")
     root = os.path.join(parent, "tests")
     _write_skipping_suite(root, "kernel")
+    bindir = tempfile.mkdtemp(prefix="vng-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "vng"),
+        "#!/bin/sh\necho vng-stub\n",
+    )
     code, out, _ = run_cli(
-        ["test", "--suite", "kernel", "--suite-path", root]
+        ["test", "--suite", "kernel", "--suite-path", root],
+        path=bindir,
     )
     assert code == 0, out
 
@@ -7400,6 +7421,68 @@ def test_read_source_excerpt_fifo_returns_none_without_blocking():
         worker.join(5.0)
         assert not worker.is_alive(), (
             "excerpt read blocked on a FIFO"
+        )
+        assert outcome == [None], outcome
+
+
+def test_read_source_excerpt_swap_inside_open_never_blocks():
+    # Fault injection: swap regular->FIFO inside the open call,
+    # i.e. after any path check and before the open resolves.
+    # Both open seams are hooked (the C-level builtin open and
+    # os.open) so the swap fires whichever primitive the code
+    # uses: a path-bound check-then-open hangs here, while the
+    # fd-bound open returns None instead.
+    import builtins
+    import threading
+
+    with tempfile.TemporaryDirectory(
+        prefix="build-excerpt-inject-"
+    ) as parent:
+        target = os.path.join(parent, "source.mojo")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("one\ntwo\n")
+
+        def swap_target(path):
+            if path != target:
+                return
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            try:
+                os.mkfifo(path)
+            except OSError:
+                pass
+
+        real_os_open = os.open
+        real_builtin_open = builtins.open
+
+        def swapping_os_open(path, flags, *args, **kwargs):
+            swap_target(path)
+            return real_os_open(path, flags, *args, **kwargs)
+
+        def swapping_builtin_open(file, *args, **kwargs):
+            swap_target(file)
+            return real_builtin_open(file, *args, **kwargs)
+
+        outcome = []
+        os.open = swapping_os_open
+        builtins.open = swapping_builtin_open
+        try:
+            worker = threading.Thread(
+                target=lambda: outcome.append(
+                    build_module._read_source_excerpt(target, 2)
+                ),
+                daemon=True,
+            )
+            worker.start()
+            worker.join(5.0)
+            blocked = worker.is_alive()
+        finally:
+            os.open = real_os_open
+            builtins.open = real_builtin_open
+        assert not blocked, (
+            "excerpt blocked on an injected FIFO swap"
         )
         assert outcome == [None], outcome
 

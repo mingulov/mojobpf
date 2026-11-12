@@ -608,6 +608,28 @@ def test_duplicate_btf_sections_refused_by_inspection():
     ), [item.code for item in report.structural]
 
 
+def test_duplicate_btf_ext_sections_refused_by_inspection():
+    # Two .BTF.ext sections would split first-vs-last readers,
+    # so inspection fails the object closed instead of
+    # validating relocation shapes against the last copy.
+    image = _elf_image([
+        (".BTF", _valid_blob()),
+        (".BTF.ext", b"\x00" * 32),
+        (".BTF.ext", b"\x00" * 32),
+        (".maps", b"\x00" * 32),
+    ])
+    path = _write_image(image)
+    try:
+        report = inspect_module.inspect_object(path, PROFILE)
+    finally:
+        os.remove(path)
+    assert any(
+        "duplicate" in item.explanation
+        and ".BTF.ext" in item.explanation
+        for item in report.structural
+    ), [item.code for item in report.structural]
+
+
 def test_duplicate_btf_sections_refused_by_map_specs():
     image = _elf_image([
         (".BTF", _trivial_blob()),

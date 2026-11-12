@@ -160,6 +160,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -2244,15 +2245,34 @@ def _read_source_excerpt(path: str, lineno: int) -> str | None:
     """Return source line ``lineno`` of ``path``, if readable.
 
     Best-effort: anything unreadable -- including a FIFO or
-    other non-regular file swapped in for the source -- yields
-    ``None`` instead of hanging the build on a blocking open.
+    other non-regular file swapped in for the source, even
+    between the check and the open -- yields ``None`` instead
+    of hanging the build. The open is non-blocking and the
+    regularity check binds the open file descriptor (not the
+    path), mirroring :func:`mojobpf.execution._open_bound`,
+    so no swap timing can wedge it.
     """
     if lineno < 1:
         return None
-    if not os.path.isfile(path):
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+    except (OSError, ValueError):
         return None
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        os.close(fd)
+        return None
+    if not is_regular:
+        os.close(fd)
+        return None
+    os.set_blocking(fd, True)
+    try:
+        with os.fdopen(
+            fd, "r", encoding="utf-8", errors="replace"
+        ) as handle:
             for number, text in enumerate(handle, 1):
                 if number == lineno:
                     return text.rstrip("\r\n")

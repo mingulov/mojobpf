@@ -727,6 +727,14 @@ class ImportViolation:
 
 
 def _split_import_names(body: str) -> list[str]:
+    """Split a comma-separated name list; one joined name per entry.
+
+    A trailing ``as`` alias pair drops off; every other word of the
+    entry joins whitespace-free, because Mojo allows whitespace
+    around dots (``mojobpf . _impl`` names ``mojobpf._impl``).
+    Taking only the first word would truncate such entries to
+    bare ``mojobpf`` and skip them silently.
+    """
     cleaned = body.strip()
     if cleaned.startswith("(") and cleaned.endswith(")"):
         cleaned = cleaned[1:-1]
@@ -735,13 +743,16 @@ def _split_import_names(body: str) -> list[str]:
         token = chunk.strip().strip("() ")
         if not token:
             continue
-        found.append(token.split()[0])
+        words = token.split()
+        if len(words) >= 3 and words[-2] == "as":
+            words = words[:-2]
+        found.append("".join(words))
     return found
 
 
-def _lex_segments(line: str, in_triple: bool
-                ) -> tuple[list[tuple[str, int]], bool, bool]:
-    """Lex one line to ([(code, delta)], in-triple, continues).
+def _lex_segments(line: str, in_triple: bool, in_dstring: bool
+                ) -> tuple[list[tuple[str, int]], bool, bool, bool]:
+    """Lex one line to ([(code, delta)], in-triple, continues, in-dstring).
 
     Code text keeps every non-comment character (string
     contents included); only the paren delta masks string
@@ -753,14 +764,23 @@ def _lex_segments(line: str, in_triple: bool
     joining away the statement below. A ``;`` in code state
     ends a segment (Mojo accepts it as a statement separator);
     a ``;`` inside any string span or comment is content, never
-    a split. ``continues`` reports a code-state trailing
-    backslash run of odd length: the line joins the next one,
-    exactly as the compiler joins it.
+    a split. ``continues`` reports a trailing backslash run of
+    odd length in code or double-quoted-string state: the line
+    joins the next one, exactly as the compiler joins it (the
+    frontend compiles backslash-newline inside ``"..."``).
+    Single-quote state never continues: the spelling is
+    invalid Mojo, so carrying it could only hide a statement
+    below. A backslash does not continue a comment either.
     """
     segments: list[tuple[str, int]] = []
     out: list[str] = []
     delta = 0
-    state = "tstring" if in_triple else "code"
+    if in_triple:
+        state = "tstring"
+    elif in_dstring:
+        state = "dstring"
+    else:
+        state = "code"
     escaped = False
     index = 0
     size = len(line)
@@ -833,8 +853,14 @@ def _lex_segments(line: str, in_triple: bool
         if char != "\\":
             break
         run += 1
-    continues = state == "code" and run % 2 == 1
-    return segments, state == "tstring", continues
+    joinable = state == "code" or state == "dstring"
+    continues = joinable and run % 2 == 1
+    return (
+        segments,
+        state == "tstring",
+        continues,
+        state == "dstring" and continues,
+    )
 
 
 def _join_logical_lines(text: str) -> list[tuple[int, str]]:
@@ -848,19 +874,21 @@ def _join_logical_lines(text: str) -> list[tuple[int, str]]:
     statement text is unchanged apart from string-aware
     comment stripping. Each ``;``-separated segment judges on
     its own once its parens balance, so a forbidden import
-    after a semicolon is still reported. A code-state trailing
-    backslash joins the next line into the current segment
-    (the backslash itself is dropped), so a continued import
-    judges as one statement.
+    after a semicolon is still reported. A trailing backslash
+    in code or double-quoted-string state joins the next line
+    into the current segment (the backslash itself is dropped),
+    so a continued import judges as one statement while string
+    content never judges as code.
     """
     logical: list[tuple[int, str]] = []
     buffer = ""
     start = 0
     depth = 0
     in_triple = False
+    in_dstring = False
     for lineno, raw in enumerate(text.splitlines(), start=1):
-        segments, in_triple, continues = _lex_segments(
-            raw, in_triple
+        segments, in_triple, continues, in_dstring = (
+            _lex_segments(raw, in_triple, in_dstring)
         )
         for position, (code, delta) in enumerate(segments):
             hold = continues and position == len(segments) - 1

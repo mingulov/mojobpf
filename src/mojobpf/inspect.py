@@ -1544,10 +1544,18 @@ def _inspect_parsed(path: str, elf: Elf,
             % (maps_present, btf_present),
         )
     )
-    ext_section = None
-    for section in elf.sections:
-        if section.name == ".BTF.ext":
-            ext_section = section
+    try:
+        ext_section = _sole_section(elf, path, ".BTF.ext", "records")
+    except ElfError as exc:
+        structural.append(
+            _object_finding(
+                exc.code,
+                exc.explanation,
+                "section:.BTF.ext",
+                "rebuild the object with the pinned backend",
+            )
+        )
+        ext_section = None
     try:
         btf_section = _sole_btf_section(elf, path)
     except ElfError as exc:
@@ -1768,6 +1776,29 @@ def _btf_string(strings: bytes, off: int, path: str) -> str:
         raise ElfError("MBPF402", "non-ASCII BTF string", path) from None
 
 
+def _sole_section(elf: Elf, path: str, name: str, what: str):
+    """Return the single ``name`` section, or None when absent.
+
+    Every consumer must read the same ``what``, so an object
+    carrying more than one such section fails closed
+    (:class:`ElfError` ``MBPF402``) instead of splitting
+    first-vs-last readers.
+    """
+    found = None
+    for section in elf.sections:
+        if section.name != name:
+            continue
+        if found is not None:
+            raise ElfError(
+                "MBPF402",
+                "duplicate %s sections; every consumer must "
+                "read the same %s" % (name, what),
+                path,
+            )
+        found = section
+    return found
+
+
 def _sole_btf_section(elf: Elf, path: str):
     """Return the single ``.BTF`` section, or None when absent.
 
@@ -1776,19 +1807,7 @@ def _sole_btf_section(elf: Elf, path: str):
     (:class:`ElfError` ``MBPF402``) instead of splitting
     first-vs-last readers.
     """
-    found = None
-    for section in elf.sections:
-        if section.name != ".BTF":
-            continue
-        if found is not None:
-            raise ElfError(
-                "MBPF402",
-                "duplicate .BTF sections; every consumer must "
-                "read the same types",
-                path,
-            )
-        found = section
-    return found
+    return _sole_section(elf, path, ".BTF", "types")
 
 
 def _parse_btf_types(blob: bytes, path: str

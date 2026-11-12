@@ -129,6 +129,29 @@ CHECKER_CASES = (
     ("import mojobpf . packet\n", 0),
     ("from mojobpf . _impl import x\n", 1),
     ("import mojobpf.packet; \\\nfrom mojobpf import _impl\n", 1),
+    # Spaced dots in 2nd+ comma-separated modules: the frontend
+    # resolves them (rejecting evil), so the checker must too.
+    ("import mojobpf.packet, mojobpf . _impl\n", 1),
+    ("import mojobpf.packet, mojobpf . packet . sub\n", 1),
+    ("import mojobpf.packet, mojobpf . _impl as e\n", 1),
+    ("import mojobpf.packet, mojobpf . core\n", 0),
+    # A backslash-newline inside a double-quoted string is string
+    # content (the frontend compiles it): an import spelled there
+    # is never a statement.
+    (
+        "def entry() -> Int32:\n"
+        '    var x = "a\\\n'
+        "from mojobpf import _impl\\\n"
+        'b"\n'
+        "    return Int32(0)\n",
+        0,
+    ),
+    # A backslash does not continue a comment: the import below
+    # is code and still reported.
+    (
+        "# trailing comment \\\nfrom mojobpf import _impl\n",
+        1,
+    ),
 )
 
 
