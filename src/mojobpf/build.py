@@ -2250,7 +2250,9 @@ def _read_source_excerpt(path: str, lineno: int) -> str | None:
     of hanging the build. The open is non-blocking and the
     regularity check binds the open file descriptor (not the
     path), mirroring :func:`mojobpf.execution._open_bound`,
-    so no swap timing can wedge it.
+    so no swap timing can wedge it. Setup failures (the
+    blocking-mode reset, the stream wrap) likewise yield
+    None without leaking the descriptor.
     """
     if lineno < 1:
         return None
@@ -2268,16 +2270,19 @@ def _read_source_excerpt(path: str, lineno: int) -> str | None:
     if not is_regular:
         os.close(fd)
         return None
-    os.set_blocking(fd, True)
     try:
-        with os.fdopen(
-            fd, "r", encoding="utf-8", errors="replace"
-        ) as handle:
+        os.set_blocking(fd, True)
+        handle = os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        os.close(fd)
+        return None
+    with handle:
+        try:
             for number, text in enumerate(handle, 1):
                 if number == lineno:
                     return text.rstrip("\r\n")
-    except OSError:
-        return None
+        except OSError:
+            return None
     return None
 
 

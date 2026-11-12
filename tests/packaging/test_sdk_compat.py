@@ -555,6 +555,12 @@ def test_additive_only_within_major():
             ), (module, key)
 
 
+def test_import_probe_count_matches_unit_header():
+    # tests/unit/test_sdk_surface.py documents this count in
+    # the CHECKER_CASES header; update both together.
+    assert len(IMPORT_PROBES) == 21, len(IMPORT_PROBES)
+
+
 def test_frontend_import_negatives():
     _check_tools()
     parent = tempfile.mkdtemp(prefix="mojobpf-compat-imports-")

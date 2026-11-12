@@ -90,20 +90,25 @@ PINNED_PAYLOAD = (
 
 # Contract schemas shipped as wheel data files under
 # share/mojobpf/schemas (wheel path carries the versioned
-# "<dist>.data/data/" prefix), pinned by basename. A new,
-# removed, or renamed shipped schema fails here until reviewed.
+# "<dist>.data/data/" prefix), pinned as (tree-relative
+# source, flattened wheel name) pairs: setuptools data-files
+# install by basename, so the wheel name is explicit data,
+# never derived. A new, removed, or renamed shipped schema --
+# in schemas/ or any subdirectory -- fails here until
+# reviewed. Duplicate wheel names (a silent zip clobber) are
+# refused outright.
 PINNED_SCHEMA_DATA = (
-    "artifact.schema.json",
-    "capability.schema.json",
-    "cost.schema.json",
-    "diagnostics.schema.json",
-    "evidence.schema.json",
-    "fixture.schema.json",
-    "manifest.schema.json",
-    "result.schema.json",
-    "run-plan.schema.json",
-    "size-budget.schema.json",
-    "target.schema.json",
+    ("artifact.schema.json", "artifact.schema.json"),
+    ("capability.schema.json", "capability.schema.json"),
+    ("cost.schema.json", "cost.schema.json"),
+    ("diagnostics.schema.json", "diagnostics.schema.json"),
+    ("evidence.schema.json", "evidence.schema.json"),
+    ("fixture.schema.json", "fixture.schema.json"),
+    ("manifest.schema.json", "manifest.schema.json"),
+    ("result.schema.json", "result.schema.json"),
+    ("run-plan.schema.json", "run-plan.schema.json"),
+    ("size-budget.schema.json", "size-budget.schema.json"),
+    ("target.schema.json", "target.schema.json"),
 )
 
 # Wheel path -> tree path for byte-identity checks. The table
@@ -365,6 +370,10 @@ def test_schemas_shipped_byte_identical():
     # silently absent from installed environments. The walk is
     # recursive so a schema in a subdirectory cannot evade the
     # pin either.
+    sources = [source for source, _ in PINNED_SCHEMA_DATA]
+    assert len(set(sources)) == len(sources), sources
+    flattened = [name for _, name in PINNED_SCHEMA_DATA]
+    assert len(set(flattened)) == len(flattened), flattened
     schemas_dir = os.path.join(REPO_ROOT, "schemas")
     tree_schemas = sorted(
         os.path.relpath(os.path.join(found, entry), schemas_dir)
@@ -372,24 +381,24 @@ def test_schemas_shipped_byte_identical():
         for entry in files
         if entry.endswith(".schema.json")
     )
-    assert tuple(tree_schemas) == PINNED_SCHEMA_DATA, tree_schemas
+    assert tree_schemas == sorted(sources), tree_schemas
     prefix = "mojobpf-%s.data/data/share/mojobpf/schemas/" % (
         tree_version()
     )
     shipped = sorted(
         name for name in wheel_names() if name.startswith(prefix)
     )
-    assert shipped == [prefix + name for name in PINNED_SCHEMA_DATA], (
+    assert shipped == sorted(prefix + name for name in flattened), (
         shipped
     )
-    for name in shipped:
+    for source, name in PINNED_SCHEMA_DATA:
         with open(
-            os.path.join(
-                REPO_ROOT, "schemas", os.path.basename(name)
-            ),
+            os.path.join(REPO_ROOT, "schemas", source),
             "rb",
         ) as handle:
-            assert wheel_bytes(name) == handle.read(), name
+            assert wheel_bytes(prefix + name) == handle.read(), (
+                source
+            )
 
 
 def main():

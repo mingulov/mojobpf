@@ -5045,7 +5045,9 @@ def _record_import_stems(record_text: str) -> list[str]:
     modules (kept whole: the platform tag is part of the
     winning filename). Distribution metadata, ``__pycache__``
     bytecode, data files and out-of-root entries never win
-    import selection and are skipped.
+    import selection and are skipped. Suffix matching is
+    posix-exact: ``.PY``/``.PYC`` spellings never win import
+    selection, so they contribute no stems.
     """
     stems: list[str] = []
     for row in csv.reader(record_text.splitlines()):
@@ -5059,10 +5061,9 @@ def _record_import_stems(record_text: str) -> list[str]:
             continue
         if "__pycache__" in segments:
             continue
-        lowered = rel.lower()
-        if lowered.endswith(".py"):
+        if rel.endswith(".py"):
             stems.append(rel[:-3])
-        elif lowered.endswith(".pyc"):
+        elif rel.endswith(".pyc"):
             stems.append(rel[:-4])
         elif rel.endswith(".so"):
             stems.append(rel)
@@ -5163,9 +5164,11 @@ def _reject_dependency_local_shadow(
     spelling on a later root. A verified file beaten even by
     another verified file fails closed (a ``RECORD`` listing
     both ``stem.py`` and legacy ``stem.pyc`` binds nothing
-    for the loser). Raises :class:`AdmissionError`
-    (``module-mismatch``) naming the shadow, before any probe
-    executes.
+    for the loser). Suffix matching is posix-exact (see
+    :func:`_record_import_stems`): ``.PY``/``.PYC`` spellings
+    never win import selection, so they are skipped. Raises
+    :class:`AdmissionError` (``module-mismatch``) naming the
+    shadow, before any probe executes.
     """
 
     def _refuse(rel: str, beater: str, detail: str) -> None:
@@ -5340,11 +5343,10 @@ def _reject_dependency_local_shadow(
             continue
         if "__pycache__" in segments:
             continue
-        lowered = rel.lower()
-        if lowered.endswith(".py"):
+        if rel.endswith(".py"):
             kind = "source"
             stem = rel[:-3]
-        elif lowered.endswith(".pyc"):
+        elif rel.endswith(".pyc"):
             kind = "bytecode"
             stem = rel[:-4]
         elif rel.endswith(".so"):

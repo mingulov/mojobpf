@@ -42,26 +42,30 @@ SDK_ROOT = os.path.join(
 SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 
 # Checker truth table: (source, expected violation count).
-# Sixteen rows are re-verified against the genuine Mojo 1.1.0
+# Twenty-one rows are re-verified against the genuine Mojo 1.1.0
 # frontend on every run of the packaging compatibility suite
 # (``mojo build --emit llvm -I <sdk>``): the plain accept, the
 # parenthesized-list accept, the ``as``-alias accept, the
 # unknown name, the unknown module, the wrong-module name, the
 # deeper path, the five multi-module plain-import rows, the
-# semicolon accept/evil pair, and the backslash and spaced-dots
-# accepts
+# four multi-module spaced-dots rows (one accept, three evil),
+# the semicolon accept/evil pair, and the backslash, spaced-dots
+# and string-hide accepts
 # (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``).
-# The twenty-five static rows (module-only imports, ``std.*``
+# The twenty-eight static rows (module-only imports, ``std.*``
 # ignores, the empty import, the alternate unknown-module
 # spellings, the core-module accept/reject rows, the
-# string-paren line-join rows, and the quote/comment masking
+# string-paren line-join rows, the non-joining invalid-word
+# rows, the comment backslash row, and the quote/comment masking
 # rows) rest on one-time manual observation against the same
 # frontend, except the seven masking rows: those pin static
 # masking behavior only (no compiler on the audit host), and
 # the single-quote rows use invalid-Mojo spellings (Mojo has
 # no single-quote strings) that hostile input could carry.
 # Accept rows exit 0; reject rows exit 1 with a source-layer
-# diagnostic.
+# diagnostic. Row counts are pinned by
+# test_checker_case_count_matches_header: update this comment
+# when adding rows.
 CHECKER_CASES = (
     ("from mojobpf.packet import XDP_PASS\n", 0),
     ("from mojobpf.core import core_read_task_pid\n", 0),
@@ -152,6 +156,11 @@ CHECKER_CASES = (
         "# trailing comment \\\nfrom mojobpf import _impl\n",
         1,
     ),
+    # Words that are not dot-separated are invalid Mojo (the
+    # frontend rejects them); they must never join into an
+    # exported name by accident.
+    ("from mojobpf import pack et\n", 1),
+    ("from mojobpf.packet import XDP_PASS EXTRA\n", 1),
 )
 
 
@@ -256,6 +265,12 @@ def test_no_underscore_names_exported():
     for entry in sorted(os.listdir(package)):
         assert not entry.startswith("_"), entry
         assert entry.endswith(".mojo"), entry
+
+
+def test_checker_case_count_matches_header():
+    # The header above documents the row budget by category;
+    # update both together when adding rows.
+    assert len(CHECKER_CASES) == 56, len(CHECKER_CASES)
 
 
 def test_import_checker_truth_table():

@@ -6744,8 +6744,10 @@ def test_test_kernel_require_executed_passes():
 
 def test_test_require_kernel_help_matches_behavior():
     # The flag fails when no kernel test executes; a missing
-    # vng runner fails with or without it. Pin the help so it
-    # cannot promise skipping again.
+    # vng runner fails with or without it. The flag only gates
+    # the kernel suite and is a no-op elsewhere: pin the help
+    # so it cannot promise skipping -- or enforcement for
+    # non-kernel suites -- again.
     code, out, _ = run_cli(["test", "--help"])
     assert code == 0
     start = out.index("  --require-kernel")
@@ -6755,6 +6757,8 @@ def test_test_require_kernel_help_matches_behavior():
     text = " ".join(chunk.split())
     assert "no kernel test executes" in text, text
     assert "always" in text and "vng" in text, text
+    assert "--suite kernel" in text, text
+    assert "ignored for other suites" in text, text
 
 
 def test_test_kernel_all_skipped_without_require_passes():
@@ -7485,6 +7489,64 @@ def test_read_source_excerpt_swap_inside_open_never_blocks():
             "excerpt blocked on an injected FIFO swap"
         )
         assert outcome == [None], outcome
+
+
+def test_read_source_excerpt_setup_failure_returns_none_without_leak():
+    # Fault injection: os.set_blocking / os.fdopen raising must
+    # keep the best-effort contract (None, never raise) and must
+    # not leak the opened descriptor.
+    with tempfile.TemporaryDirectory(
+        prefix="build-excerpt-setup-"
+    ) as parent:
+        target = os.path.join(parent, "source.mojo")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("one\ntwo\n")
+        real_os_open = os.open
+        real_set_blocking = os.set_blocking
+        real_fdopen = os.fdopen
+        opened = []
+
+        def tracking_os_open(path, flags, *args, **kwargs):
+            fd = real_os_open(path, flags, *args, **kwargs)
+            if path == target:
+                opened.append(fd)
+            return fd
+
+        def failing_set_blocking(fd, flag):
+            raise OSError("injected set_blocking failure")
+
+        def failing_fdopen(fd, *args, **kwargs):
+            raise OSError("injected fdopen failure")
+
+        def _closed(fd):
+            try:
+                os.fstat(fd)
+            except OSError:
+                return True
+            return False
+
+        os.open = tracking_os_open
+        try:
+            os.set_blocking = failing_set_blocking
+            try:
+                assert (
+                    build_module._read_source_excerpt(target, 1)
+                    is None
+                )
+            finally:
+                os.set_blocking = real_set_blocking
+            os.fdopen = failing_fdopen
+            try:
+                assert (
+                    build_module._read_source_excerpt(target, 1)
+                    is None
+                )
+            finally:
+                os.fdopen = real_fdopen
+        finally:
+            os.open = real_os_open
+        assert len(opened) == 2, opened
+        assert all(_closed(fd) for fd in opened), opened
 
 
 def _direct_run():

@@ -78,10 +78,28 @@ def _wheel_tree_paths():
         if not name.startswith("mojobpf/"):
             raise AssertionError("unexpected wheel payload entry: %r" % name)
         paths.add("src/" + name)
-    for name in pins["PINNED_SCHEMA_DATA"]:
-        if "/" in name or not name.endswith(".json"):
-            raise AssertionError("unexpected wheel schema entry: %r" % name)
-        paths.add("schemas/" + name)
+    for entry in pins["PINNED_SCHEMA_DATA"]:
+        if (
+            not isinstance(entry, (tuple, list))
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not isinstance(entry[1], str)
+        ):
+            raise AssertionError(
+                "unexpected wheel schema entry: %r" % (entry,)
+            )
+        source, shipped = entry
+        if (
+            source.startswith("/")
+            or source.startswith("..")
+            or not source.endswith(".json")
+            or "/" in shipped
+            or not shipped.endswith(".json")
+        ):
+            raise AssertionError(
+                "unexpected wheel schema entry: %r" % (entry,)
+            )
+        paths.add("schemas/" + source)
     return paths
 
 

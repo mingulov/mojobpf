@@ -1379,22 +1379,66 @@ def test_admission_ignores_uppercase_so_startup_spelling():
         ), admitted
 
 
-def test_record_import_stems_ignores_pyd_and_uppercase_so():
+def test_record_import_stems_ignores_unselectable_suffixes():
     # RECORD entries the file finder can never select on
-    # Linux (``.pyd``, upper-case ``.SO``) contribute no
-    # import stems; real spellings still do.
+    # Linux (``.pyd``, upper-case ``.SO``/``.PY``/``.PYC``)
+    # contribute no import stems; real spellings still do.
     record = (
         "a.pyd,,\n"
         "b.SO,,\n"
         "c.so,,\n"
         "d.py,,\n"
         "e.pyc,,\n"
+        "f.PY,,\n"
+        "g.PYC,,\n"
+        "h.Py,,\n"
     )
     assert execution_module._record_import_stems(record) == [
         "c.so",
         "d",
         "e",
     ]
+
+
+def test_local_shadow_ignores_unselectable_suffix_spellings():
+    # Twin of the RECORD-stems suffix rule: ``.PY``/``.PYC``
+    # entries never win import selection, so same-root
+    # beaters beside them refuse nothing; real ``.py``/``.pyc``
+    # spellings still refuse.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-local-shadow-case-"
+    ) as dist_root:
+        for name in (
+            "w.pyc",
+            "w.py",
+            "x.PY",
+            "x.cpython-311-x86_64-linux-gnu.so",
+            "y.cpython-311-x86_64-linux-gnu.so",
+            "y.py",
+            "z.PYC",
+            "z.py",
+        ):
+            with open(os.path.join(dist_root, name), "wb") as handle:
+                handle.write(b"probe")
+        execution_module._reject_dependency_local_shadow(
+            "probe", "x.PY,,\n", dist_root, []
+        )
+        execution_module._reject_dependency_local_shadow(
+            "probe", "z.PYC,,\n", dist_root, []
+        )
+        for rel in ("y.py,,\n", "w.pyc,,\n"):
+            try:
+                execution_module._reject_dependency_local_shadow(
+                    "probe", rel, dist_root, []
+                )
+            except execution_module.AdmissionError as exc:
+                assert exc.reason == (
+                    execution_module.REASON_MODULE_MISMATCH
+                ), exc
+            else:
+                raise AssertionError(
+                    "same-root beater admitted for %r" % rel
+                )
 
 
 def test_admission_nonstring_root_refuses_admission_error():

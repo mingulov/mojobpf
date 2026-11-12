@@ -726,6 +726,20 @@ class ImportViolation:
     explanation: str
 
 
+def _is_spaced_dotted(words: list[str]) -> bool:
+    """True when words form ``ident(.ident)*`` around dots.
+
+    Dots may be attached (``mojobpf._impl``) or spaced
+    (``mojobpf . _impl``, ``mojobpf. core``); anything else
+    (``pack et``) is invalid Mojo the frontend rejects.
+    """
+    for piece in " ".join(words).split("."):
+        text = piece.strip()
+        if not text or not text.isidentifier():
+            return False
+    return True
+
+
 def _split_import_names(body: str) -> list[str]:
     """Split a comma-separated name list; one joined name per entry.
 
@@ -733,7 +747,9 @@ def _split_import_names(body: str) -> list[str]:
     entry joins whitespace-free, because Mojo allows whitespace
     around dots (``mojobpf . _impl`` names ``mojobpf._impl``).
     Taking only the first word would truncate such entries to
-    bare ``mojobpf`` and skip them silently.
+    bare ``mojobpf`` and skip them silently. Words that are not
+    dot-separated (``pack et``) keep a space instead, so invalid
+    spellings can never join into an exported name by accident.
     """
     cleaned = body.strip()
     if cleaned.startswith("(") and cleaned.endswith(")"):
@@ -746,7 +762,10 @@ def _split_import_names(body: str) -> list[str]:
         words = token.split()
         if len(words) >= 3 and words[-2] == "as":
             words = words[:-2]
-        found.append("".join(words))
+        if len(words) > 1 and not _is_spaced_dotted(words):
+            found.append(" ".join(words))
+        else:
+            found.append("".join(words))
     return found
 
 

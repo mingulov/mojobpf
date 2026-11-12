@@ -14,11 +14,13 @@ repository root) or directly (``python3 tests/unit/test_<name>.py``).
 Uses only the standard library.
 """
 
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 import sys
+import tempfile
 import tomllib
 
 sys.path.insert(
@@ -534,21 +536,19 @@ def test_size_budget_conforms():
     _assert_union_covered(schema, [accepted], "size-budget")
 
 
-def test_every_schema_file_has_conformance_coverage():
-    # Closed sweep: every schemas/*.schema.json at any depth
-    # must be asserted by a conformance test above (a literal
-    # _load_schema load inside a test_* function that also
-    # calls an assert helper), so a new schema file without a
-    # test fails here, never silently. A bare load with no
-    # assertions does not count. No src loader globs schemas/
-    # (all use exact names), so stray non-schema files stay
-    # inert and out of scope.
-    import ast
+def _sweep_covered_names(path):
+    """Schema names the closed sweep credits in ``path``.
 
-    with open(__file__, encoding="utf-8") as handle:
+    Only module-level ``test_*`` bodies count (pytest parity:
+    nested ``test_*`` defs never run), and nested scopes
+    (``def``/``lambda``) inside them are not descended into:
+    a load or assertion that may never execute credits no
+    coverage.
+    """
+    with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
     covered = set()
-    for node in ast.walk(tree):
+    for node in tree.body:
         if not (
             isinstance(node, ast.FunctionDef)
             and node.name.startswith("test_")
@@ -556,23 +556,81 @@ def test_every_schema_file_has_conformance_coverage():
             continue
         loads = set()
         asserted = False
-        for child in ast.walk(node):
-            if not (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
+        stack = list(node.body)
+        while stack:
+            child = stack.pop()
+            if isinstance(
+                child,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                ),
             ):
                 continue
-            if child.func.id == "_load_schema" and child.args:
-                arg = child.args[0]
-                if isinstance(arg, ast.Constant):
-                    loads.add(arg.value)
-            elif child.func.id in (
-                "_assert_conforms",
-                "_assert_union_covered",
+            if isinstance(child, ast.Call) and isinstance(
+                child.func, ast.Name
             ):
-                asserted = True
+                if child.func.id == "_load_schema" and child.args:
+                    arg = child.args[0]
+                    if isinstance(arg, ast.Constant):
+                        loads.add(arg.value)
+                elif child.func.id in (
+                    "_assert_conforms",
+                    "_assert_union_covered",
+                ):
+                    asserted = True
+            stack.extend(ast.iter_child_nodes(child))
         if asserted:
             covered |= loads
+    return covered
+
+
+def test_sweep_credits_only_executed_module_level_loads():
+    # Guard regression: loads and assertions inside nested
+    # scopes (a helper def, a lambda) or inside a nested
+    # test_* def never execute under pytest, so the closed
+    # sweep must not credit them; only module-level test_
+    # bodies count.
+    probe = (
+        "def test_outer():\n"
+        "    schema = _load_schema(\"outer\")\n"
+        "    def helper():\n"
+        "        schema = _load_schema(\"inner\")\n"
+        "        _assert_conforms(schema, {}, \"inner\")\n"
+        "    _assert_conforms(schema, {}, \"outer\")\n"
+        "    _assert_union_covered(schema, [{}], \"outer\")\n"
+        "def factory():\n"
+        "    def test_nested():\n"
+        "        schema = _load_schema(\"nested\")\n"
+        "        _assert_conforms(schema, {}, \"nested\")\n"
+        "        _assert_union_covered(schema, [{}], \"nested\")\n"
+        "def test_lambda():\n"
+        "    schema = _load_schema(\"lam\")\n"
+        "    _assert_conforms(schema, {}, \"lam\")\n"
+        "    _assert_union_covered(schema, [{}], \"lam\")\n"
+        "    thunk = lambda: _load_schema(\"laminner\")\n"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="schema-sweep-probe-"
+    ) as parent:
+        path = os.path.join(parent, "probe_conform.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(probe)
+        assert _sweep_covered_names(path) == {"outer", "lam"}
+
+
+def test_every_schema_file_has_conformance_coverage():
+    # Closed sweep: every schemas/*.schema.json at any depth
+    # must be asserted by a conformance test above (a literal
+    # _load_schema load in a module-level test_* body that
+    # also calls an assert helper outside any nested scope),
+    # so a new schema file without a test fails here, never
+    # silently. A bare load with no assertions does not
+    # count. No src loader globs schemas/ (all use exact
+    # names), so stray non-schema files stay inert and out
+    # of scope.
+    covered = _sweep_covered_names(__file__)
     on_disk = []
     for found, _, files in os.walk(SCHEMAS):
         for entry in sorted(files):
