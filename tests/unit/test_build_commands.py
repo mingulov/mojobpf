@@ -7715,7 +7715,9 @@ def test_read_source_excerpt_open_failure_returns_none():
     # The open-failure clause (nonexistent path, failing
     # os.open) returns None; no descriptor exists yet, so
     # there is nothing to leak or close. Also pins the
-    # lineno guard.
+    # lineno guard (short-circuit before any open) and the
+    # open ValueError branch (a NUL path raises ValueError
+    # from os.open itself, no injection needed).
     with tempfile.TemporaryDirectory(
         prefix="build-excerpt-open-"
     ) as parent:
@@ -7724,23 +7726,56 @@ def test_read_source_excerpt_open_failure_returns_none():
             build_module._read_source_excerpt(missing, 1)
             is None
         )
+        assert (
+            build_module._read_source_excerpt(
+                "a\x00b", 1
+            )
+            is None
+        )
         target = os.path.join(parent, "source.mojo")
         with open(target, "w", encoding="utf-8") as handle:
             handle.write("one\n")
-        assert (
-            build_module._read_source_excerpt(target, 0)
-            is None
-        )
-        assert (
-            build_module._read_source_excerpt(target, -3)
-            is None
-        )
         real_os_open = os.open
+        opened = []
+
+        def tracking_os_open(path, flags, *args, **kwargs):
+            opened.append((path, flags))
+            return real_os_open(path, flags, *args, **kwargs)
+
+        try:
+            os.open = tracking_os_open
+            assert (
+                build_module._read_source_excerpt(target, 0)
+                is None
+            )
+            assert (
+                build_module._read_source_excerpt(target, -3)
+                is None
+            )
+            assert opened == [], opened
+            assert (
+                build_module._read_source_excerpt(target, 99)
+                is None
+            )
+            assert len(opened) == 1, opened
+        finally:
+            os.open = real_os_open
 
         def failing_os_open(path, flags, *args, **kwargs):
             raise OSError("injected open failure")
 
+        def failing_os_open_value(path, flags, *args, **kwargs):
+            raise ValueError("injected open failure")
+
         os.open = failing_os_open
+        try:
+            assert (
+                build_module._read_source_excerpt(target, 1)
+                is None
+            )
+        finally:
+            os.open = real_os_open
+        os.open = failing_os_open_value
         try:
             assert (
                 build_module._read_source_excerpt(target, 1)

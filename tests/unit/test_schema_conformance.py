@@ -540,7 +540,12 @@ _SWEEP_NESTED_SCOPES = (
     ast.FunctionDef,
     ast.AsyncFunctionDef,
     ast.Lambda,
+    ast.ClassDef,
 )
+
+# ``type X = ...`` exists only on 3.12+; None below, where the
+# statement is a syntax error and there is nothing to model.
+_TYPE_ALIAS = getattr(ast, "TypeAlias", None)
 
 _SWEEP_TERMINATORS = (
     ast.Return,
@@ -558,6 +563,38 @@ _SWEEP_ASSERTS = (
 _SWEEP_ABORTS = ("skip", "fail", "exit", "_exit")
 
 
+def _sweep_stmt_abort_call(stmt):
+    """Abort call ``stmt`` evaluates unconditionally, else None.
+
+    Bare abort expression statements, assignments whose value
+    is an abort call (the targets never bind: the call raises
+    first), returns of an abort call, and ``if``/``while``
+    statements whose test is an abort call (both branches are
+    dead). Anything subtler (an abort buried in a container
+    or a message expression) is not recognized.
+    """
+    if isinstance(stmt, ast.Expr):
+        candidate = stmt.value
+    elif isinstance(stmt, ast.Return):
+        candidate = stmt.value
+    elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+        candidate = stmt.value
+    elif isinstance(stmt, (ast.If, ast.While)):
+        candidate = stmt.test
+    else:
+        return None
+    if not isinstance(candidate, ast.Call):
+        return None
+    func = candidate.func
+    if isinstance(func, ast.Name):
+        abort = func.id in _SWEEP_ABORTS
+    elif isinstance(func, ast.Attribute):
+        abort = func.attr in _SWEEP_ABORTS
+    else:
+        abort = False
+    return candidate if abort else None
+
+
 def _sweep_is_abort_call(stmt):
     """Whether ``stmt`` unconditionally aborts the test.
 
@@ -565,17 +602,7 @@ def _sweep_is_abort_call(stmt):
     their bare/``os`` spellings by call name. A helper that
     merely shares the name over-prunes (fail closed).
     """
-    if not (
-        isinstance(stmt, ast.Expr)
-        and isinstance(stmt.value, ast.Call)
-    ):
-        return False
-    func = stmt.value.func
-    if isinstance(func, ast.Name):
-        return func.id in _SWEEP_ABORTS
-    if isinstance(func, ast.Attribute):
-        return func.attr in _SWEEP_ABORTS
-    return False
+    return _sweep_stmt_abort_call(stmt) is not None
 
 
 def _sweep_is_skipped(decorators):
@@ -583,16 +610,19 @@ def _sweep_is_skipped(decorators):
 
     Plain ``skip`` (any receiver, including bare) always
     skips; ``skipif``/``skipIf`` skip on a true constant,
-    ``skipUnless`` on a false one. Unknown decorators are
-    assumed to run the body.
+    ``skipUnless`` on a false one, whether the condition
+    is positional or a ``condition=`` keyword. Unknown
+    decorators are assumed to run the body.
     """
     for decorator in decorators:
         if isinstance(decorator, ast.Call):
             func = decorator.func
             args = decorator.args
+            keywords = decorator.keywords
         else:
             func = decorator
             args = []
+            keywords = []
         if isinstance(func, ast.Attribute):
             name = func.attr
         elif isinstance(func, ast.Name):
@@ -601,19 +631,22 @@ def _sweep_is_skipped(decorators):
             continue
         if name == "skip":
             return True
-        if (
-            name in ("skipif", "skipIf")
-            and args
-            and isinstance(args[0], ast.Constant)
-            and args[0].value
-        ):
-            return True
-        if (
-            name == "skipUnless"
-            and args
-            and isinstance(args[0], ast.Constant)
-            and not args[0].value
-        ):
+        if name not in ("skipif", "skipIf", "skipUnless"):
+            continue
+        condition = _SWEEP_MISSING
+        if args:
+            condition = args[0]
+        else:
+            for keyword in keywords:
+                if keyword.arg == "condition":
+                    condition = keyword.value
+                    break
+        if not isinstance(condition, ast.Constant):
+            continue
+        if name == "skipUnless":
+            if not condition.value:
+                return True
+        elif condition.value:
             return True
     return False
 
@@ -626,9 +659,11 @@ def _sweep_merge_paths(env, paths):
 
     A name keeps its binding only when every path binds
     the same literal; any divergence (including unbound
-    on some path) drops the name, fail closed.
+    on some path, or on every path while the pre-branch
+    binding lingers in ``env``) drops the name, fail
+    closed.
     """
-    names = set()
+    names = set(env)
     for path in paths:
         names |= set(path)
     for name in names:
@@ -658,15 +693,35 @@ def _sweep_load_literal(node):
 def _sweep_credit_call(node, env, covered):
     """Credit the bindings an assert-helper call observes.
 
-    Names resolve in evaluation order: a walrus inside the
-    arguments binds for later uses, comprehension loop
+    Only the schema position counts: the first positional
+    argument, or an explicit ``schema=`` keyword. A bound
+    name smuggled into the document, the label, or any
+    other keyword is never the asserted schema. Inside the
+    schema argument, names resolve in evaluation order: a
+    walrus binds for later uses, comprehension loop
     variables shadow outer bindings (their first iterable
     still evaluates outside), and anything else resolves
-    in ``env``.
+    in ``env``. Conditional expressions (``IfExp``,
+    ``BoolOp``) observe exactly one branch, so only names
+    credited on every branch count, like branch joins.
     """
     arg_binds = {}
 
-    def _args(child, shadowed):
+    def _join_branch_binds(branches):
+        merged = {}
+        names = set()
+        for branch in branches:
+            names |= set(branch)
+        for name in names:
+            first = branches[0].get(name, _SWEEP_MISSING)
+            if first is not _SWEEP_MISSING and all(
+                branch.get(name, _SWEEP_MISSING) == first
+                for branch in branches
+            ):
+                merged[name] = first
+        return merged
+
+    def _args(child, shadowed, credit, binds):
         if isinstance(
             child,
             _SWEEP_NESTED_SCOPES + (ast.GeneratorExp,),
@@ -675,12 +730,12 @@ def _sweep_credit_call(node, env, covered):
         if isinstance(child, ast.NamedExpr) and isinstance(
             child.target, ast.Name
         ):
-            _args(child.value, shadowed)
+            _args(child.value, shadowed, credit, binds)
             literal = _sweep_load_literal(child.value)
             if literal is not None:
-                arg_binds[child.target.id] = literal
+                binds[child.target.id] = literal
             else:
-                arg_binds.pop(child.target.id, None)
+                binds.pop(child.target.id, None)
             return
         if isinstance(
             child,
@@ -691,40 +746,79 @@ def _sweep_credit_call(node, env, covered):
             ),
         ):
             for generator in child.generators:
-                _args(generator.iter, shadowed)
+                _args(generator.iter, shadowed, credit, binds)
                 shadowed = shadowed | set(
                     found.id
                     for found in ast.walk(generator.target)
                     if isinstance(found, ast.Name)
                 )
                 for cond in generator.ifs:
-                    _args(cond, shadowed)
+                    _args(cond, shadowed, credit, binds)
             if isinstance(child, ast.DictComp):
-                _args(child.key, shadowed)
-                _args(child.value, shadowed)
+                _args(child.key, shadowed, credit, binds)
+                _args(child.value, shadowed, credit, binds)
             else:
-                _args(child.elt, shadowed)
+                _args(child.elt, shadowed, credit, binds)
+            return
+        if isinstance(child, ast.IfExp):
+            _args(child.test, shadowed, credit, binds)
+            body_credit = set()
+            orelse_credit = set()
+            body_binds = dict(binds)
+            orelse_binds = dict(binds)
+            _args(
+                child.body, shadowed, body_credit, body_binds
+            )
+            _args(
+                child.orelse,
+                shadowed,
+                orelse_credit,
+                orelse_binds,
+            )
+            credit |= body_credit & orelse_credit
+            binds.clear()
+            binds.update(
+                _join_branch_binds([body_binds, orelse_binds])
+            )
+            return
+        if isinstance(child, ast.BoolOp):
+            branch_credits = []
+            branch_binds = []
+            for value in child.values:
+                sub_credit = set()
+                sub_binds = dict(binds)
+                _args(value, shadowed, sub_credit, sub_binds)
+                branch_credits.append(sub_credit)
+                branch_binds.append(sub_binds)
+            credit |= set.intersection(*branch_credits)
+            binds.clear()
+            binds.update(_join_branch_binds(branch_binds))
             return
         if isinstance(child, ast.Name):
             if child.id not in shadowed:
-                if child.id in arg_binds:
-                    covered.add(arg_binds[child.id])
+                if child.id in binds:
+                    credit.add(binds[child.id])
                 elif child.id in env:
-                    covered.add(env[child.id])
+                    credit.add(env[child.id])
             return
         for _field, entry in ast.iter_fields(child):
             if isinstance(entry, list):
                 for item in entry:
                     if isinstance(item, ast.AST):
-                        _args(item, shadowed)
+                        _args(item, shadowed, credit, binds)
             elif isinstance(entry, ast.AST):
-                _args(entry, shadowed)
+                _args(entry, shadowed, credit, binds)
 
-    for arg in node.args:
-        _args(arg, frozenset())
+    if node.args:
+        _args(node.args[0], frozenset(), covered, arg_binds)
     for keyword in node.keywords:
-        if keyword.value is not None:
-            _args(keyword.value, frozenset())
+        if (
+            keyword.arg == "schema"
+            and keyword.value is not None
+        ):
+            _args(
+                keyword.value, frozenset(), covered, arg_binds
+            )
 
 
 def _sweep_covered_names(path):
@@ -733,18 +827,27 @@ def _sweep_covered_names(path):
     Only module-level sync ``test_*`` bodies count (pytest
     parity: nested ``test_*`` defs never run, and async
     tests skip without a plugin, so they fail closed).
-    Skip-decorated bodies never credit. Inside a counted
-    body, bindings flow in program order: each assert
-    credits the binding in effect at its position, so
+    Test-class methods and ``test_*`` defs under any other
+    statement are not swept either (pytest would collect
+    ``Test*`` methods, so such coverage reports missing:
+    keep it module-level). Skip-decorated bodies never
+    credit. Inside a counted body, bindings flow in program
+    order: each assert credits the schema in effect at its
+    position (first argument, or ``schema=``), so
     sequential rebinds credit each value at its own
-    assert. Divergent branch joins (``if``/``try``/loops/
-    ``match``) drop the name, fail closed; same-value
-    joins keep it. Nested scopes, lazy generator
-    expressions, post-terminator and post-abort
+    assert. Divergent joins (``if``/``try``/loops/``match``
+    branches, ``IfExp``/``BoolOp``/assert-message/
+    comprehension-interior bindings) drop the name, fail
+    closed; same-value joins keep it. Nested scopes
+    (including class bodies), lazy generator expressions,
+    post-terminator, post-``assert False`` and post-abort
     statements, and unsatisfiable constant guards are
-    pruned. Every live binding form counts (plain,
+    pruned. Comprehension loop variables shadow outer
+    bindings (their first iterable still evaluates
+    outside). Every live binding form counts (plain,
     multi-target, tuple-unpack, walrus, annotated);
-    any other rebinding poisons the name.
+    any other rebinding (including ``type`` aliases)
+    poisons the name.
     """
     with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
@@ -836,8 +939,18 @@ def _sweep_covered_names(path):
                         if isinstance(entry, ast.AST):
                             _walk_node(entry)
                     return
-                if _sweep_is_abort_call(stmt):
-                    _walk_node(stmt)
+                if (
+                    isinstance(stmt, ast.Assert)
+                    and isinstance(stmt.test, ast.Constant)
+                    and not stmt.test.value
+                ):
+                    for _field, entry in ast.iter_fields(stmt):
+                        if isinstance(entry, ast.AST):
+                            _walk_node(entry)
+                    return
+                abort = _sweep_stmt_abort_call(stmt)
+                if abort is not None:
+                    _walk_node(abort)
                     return
                 _walk_node(stmt)
 
@@ -898,7 +1011,10 @@ def _sweep_covered_names(path):
                     env, [dict(env), body_env, orelse_env]
                 )
                 return
-            if isinstance(child, ast.With):
+            if isinstance(child, (ast.With, ast.AsyncWith)):
+                # (AsyncWith is unreachable in real sync test
+                # bodies -- a syntax error -- but probes
+                # parse, so model it like With.)
                 for item in child.items:
                     _walk_node(item.context_expr)
                     if item.optional_vars is not None:
@@ -954,11 +1070,75 @@ def _sweep_covered_names(path):
                 return
             if isinstance(child, (ast.Import, ast.ImportFrom)):
                 for entry in child.names:
+                    if entry.name == "*":
+                        # A star import may rebind any name
+                        # (whatever the module exports), so
+                        # drop every binding, fail closed.
+                        # (Unreachable in real test bodies:
+                        # a function-level star import is a
+                        # syntax error.)
+                        env.clear()
+                        continue
                     bound = entry.asname or entry.name.split(
                         ".", 1
                     )[0]
-                    if bound != "*":
-                        env.pop(bound, None)
+                    env.pop(bound, None)
+                return
+            if _TYPE_ALIAS is not None and isinstance(
+                child, _TYPE_ALIAS
+            ):
+                # The alias value evaluates lazily, so only
+                # the rebinding matters: poison the target.
+                if isinstance(child.name, ast.Name):
+                    env.pop(child.name.id, None)
+                return
+            if isinstance(child, ast.IfExp):
+                # The test always evaluates; each branch
+                # binds conditionally, so join them.
+                _walk_node(child.test)
+                body_env = dict(env)
+                _walk_node_in(child.body, body_env)
+                orelse_env = dict(env)
+                _walk_node_in(child.orelse, orelse_env)
+                _sweep_merge_paths(
+                    env, [body_env, orelse_env]
+                )
+                return
+            if isinstance(child, ast.BoolOp):
+                # The first operand always evaluates; each
+                # later one binds conditionally, so join it
+                # with the fall-through binding in turn.
+                _walk_node(child.values[0])
+                for value in child.values[1:]:
+                    pre_env = dict(env)
+                    branch_env = dict(env)
+                    _walk_node_in(value, branch_env)
+                    _sweep_merge_paths(
+                        env, [pre_env, branch_env]
+                    )
+                return
+            if isinstance(child, ast.Assert):
+                # The message evaluates only when the test
+                # is falsy, so its bindings join with the
+                # fall-through ones. (Constant-false asserts
+                # never reach here: _walk_block ends their
+                # block first.)
+                _walk_node(child.test)
+                if child.msg is not None:
+                    pre_env = dict(env)
+                    msg_env = dict(env)
+                    _walk_node_in(child.msg, msg_env)
+                    _sweep_merge_paths(env, [pre_env, msg_env])
+                return
+            if isinstance(
+                child,
+                (
+                    ast.ListComp,
+                    ast.SetComp,
+                    ast.DictComp,
+                ),
+            ):
+                _walk_comprehension(child)
                 return
             _collect(child)
             for field, entry in ast.iter_fields(child):
@@ -973,6 +1153,56 @@ def _sweep_covered_names(path):
                             _walk_node(item)
                 elif isinstance(entry, ast.AST):
                     _walk_node(entry)
+
+        def _walk_comprehension(child):
+            # Eager comprehensions run inline, but their loop
+            # variables shadow outer bindings everywhere
+            # inside except the first iterable (which
+            # evaluates outside). The loop may run zero
+            # times, so bindings made inside join with the
+            # pre-loop ones (same-value keeps, else drops);
+            # a walrus to a loop variable drops the outer
+            # binding, fail closed.
+            generators = child.generators
+            if generators:
+                _walk_node(generators[0].iter)
+            bound = set()
+            for generator in generators:
+                for found in ast.walk(generator.target):
+                    if isinstance(found, ast.Name):
+                        bound.add(found.id)
+            tainted = set()
+            for found in ast.walk(child):
+                if (
+                    isinstance(found, ast.NamedExpr)
+                    and isinstance(found.target, ast.Name)
+                    and found.target.id in bound
+                ):
+                    tainted.add(found.target.id)
+            saved = {}
+            pre_loop = dict(env)
+            for name in bound:
+                if name in env:
+                    saved[name] = env.pop(name)
+            try:
+                for index, generator in enumerate(generators):
+                    if index:
+                        _walk_node(generator.iter)
+                    for cond in generator.ifs:
+                        _walk_node(cond)
+                if isinstance(child, ast.DictComp):
+                    _walk_node(child.key)
+                    _walk_node(child.value)
+                else:
+                    _walk_node(child.elt)
+            finally:
+                inner = dict(env)
+                for name in bound:
+                    inner.pop(name, None)
+                for name, value in saved.items():
+                    if name not in tainted:
+                        inner[name] = value
+                _sweep_merge_paths(env, [pre_loop, inner])
 
         def _swap_env(foreign, action):
             saved = dict(env)
@@ -1121,10 +1351,11 @@ def test_sweep_pairs_loads_to_asserts_in_program_order():
 
 def test_sweep_prunes_lazy_scopes_shadowing_aborts_and_dead_guards():
     # Execution, not lexical presence: lazy generator
-    # expressions never credit (eager comprehensions do), a
-    # comprehension loop variable shadowing a bound name
-    # credits nothing (outer names still do), abort calls
-    # end their block, and unsatisfiable match guards prune.
+    # expressions never credit (eager comprehensions do:
+    # list here, set/dict in round two), a comprehension
+    # loop variable shadowing a bound name credits nothing
+    # (outer names still do), abort calls end their block,
+    # and unsatisfiable match guards prune.
     probe = (
         "def test_genexp():\n"
         "    schema = _load_schema(\"g0\")\n"
@@ -1169,10 +1400,11 @@ def test_sweep_prunes_lazy_scopes_shadowing_aborts_and_dead_guards():
 
 
 def test_sweep_binding_forms_and_decorators():
-    # Every live binding form counts (multi-target,
-    # tuple-unpack, walrus, decorator walrus); rebinds
-    # without a load poison the name; skip-decorated bodies
-    # never credit (skipif-False still runs).
+    # Live binding forms count (multi-target,
+    # tuple-unpack, walrus, decorator walrus; annotated in
+    # round two); rebinds without a load poison the name;
+    # skip-decorated bodies never credit (skipif-False
+    # still runs).
     probe = (
         "def test_multitarget():\n"
         "    s1 = s2 = _load_schema(\"mt1\")\n"
@@ -1264,8 +1496,15 @@ def test_sweep_abort_names():
         "sys.exit(1)": True,
         "exit(1)": True,
         "os._exit(1)": True,
+        "x = pytest.skip(\"x\")": True,
+        "x: int = pytest.fail(\"x\")": True,
+        "return pytest.skip(\"x\")": True,
+        "if pytest.skip(\"x\"): pass": True,
+        "while sys.exit(1): pass": True,
         "print(\"x\")": False,
         "x = 1": False,
+        "x = [pytest.skip(\"x\")]": False,
+        "assert ok, pytest.skip(\"x\")": False,
     }
     for source, expected in cases.items():
         stmt = ast.parse(source).body[0]
@@ -1279,9 +1518,14 @@ def test_sweep_skip_decorators():
         "@unittest.skip(\"x\")\ndef f(): pass": True,
         "@pytest.mark.skipif(True)\ndef f(): pass": True,
         "@pytest.mark.skipif(False)\ndef f(): pass": False,
+        "@pytest.mark.skipif(condition=True)\ndef f(): pass": True,
+        "@pytest.mark.skipif(condition=False)\ndef f(): pass": False,
+        "@pytest.mark.skipif(reason=\"x\")\ndef f(): pass": False,
         "@unittest.skipIf(True)\ndef f(): pass": True,
         "@unittest.skipUnless(False)\ndef f(): pass": True,
         "@unittest.skipUnless(True)\ndef f(): pass": False,
+        "@unittest.skipUnless(condition=False)\ndef f(): pass": True,
+        "@unittest.skipUnless(condition=True)\ndef f(): pass": False,
         "@pytest.mark.slow\ndef f(): pass": False,
         "def f(): pass": False,
     }
@@ -1290,6 +1534,393 @@ def test_sweep_skip_decorators():
         assert (
             _sweep_is_skipped(node.decorator_list) is expected
         ), source
+
+
+def test_sweep_drops_names_unbound_on_every_path():
+    # A name every path drops (both-branch del, or
+    # both-branch non-load rebind) must not keep its stale
+    # pre-branch binding; one-path drops already work.
+    probe = (
+        "def test_both_del():\n"
+        "    schema = _load_schema(\"pre\")\n"
+        "    if cond:\n"
+        "        del schema\n"
+        "    else:\n"
+        "        del schema\n"
+        "    _assert_conforms(schema, {}, \"pre\")\n"
+        "def test_both_rebind():\n"
+        "    schema = _load_schema(\"pre2\")\n"
+        "    if cond:\n"
+        "        schema = compute()\n"
+        "    else:\n"
+        "        schema = compute()\n"
+        "    _assert_conforms(schema, {}, \"pre2\")\n"
+        "def test_one_del():\n"
+        "    schema = _load_schema(\"pre3\")\n"
+        "    if cond:\n"
+        "        del schema\n"
+        "    else:\n"
+        "        pass\n"
+        "    _assert_conforms(schema, {}, \"pre3\")\n"
+    )
+    assert _run_sweep_probe(probe) == set()
+
+
+def test_sweep_prunes_class_bodies():
+    # Class bodies never execute in the test's scope: a
+    # class-level load must not leak into the function env
+    # (the equivalent real code NameErrors).
+    probe = (
+        "def test_cls():\n"
+        "    class C:\n"
+        "        schema = _load_schema(\"cls\")\n"
+        "    _assert_conforms(schema, {}, \"cls\")\n"
+    )
+    assert _run_sweep_probe(probe) == set()
+
+
+def test_sweep_abort_forms_end_their_block():
+    # Abort calls end their block beyond bare expression
+    # statements: assigned aborts (targets never bind) and
+    # abort tests (both branches dead) prune what follows.
+    probe = (
+        "def test_abort_assign():\n"
+        "    schema = _load_schema(\"a1\")\n"
+        "    _assert_conforms(schema, {}, \"a1\")\n"
+        "    x = pytest.skip(\"done\")\n"
+        "    schema = _load_schema(\"adead\")\n"
+        "    _assert_conforms(schema, {}, \"adead\")\n"
+        "def test_abort_if():\n"
+        "    schema = _load_schema(\"a2\")\n"
+        "    _assert_conforms(schema, {}, \"a2\")\n"
+        "    if pytest.skip(\"done\"):\n"
+        "        schema = _load_schema(\"adead2\")\n"
+        "    schema = _load_schema(\"adead3\")\n"
+        "    _assert_conforms(schema, {}, \"adead3\")\n"
+    )
+    assert _run_sweep_probe(probe) == {"a1", "a2"}
+
+
+def test_sweep_skip_condition_keyword():
+    # pytest accepts the condition as a keyword too:
+    # skipif(condition=True) and skipUnless(condition=False)
+    # skip their bodies like the positional forms.
+    probe = (
+        "@pytest.mark.skipif(condition=True)\n"
+        "def test_skip_kw():\n"
+        "    schema = _load_schema(\"sk\")\n"
+        "    _assert_conforms(schema, {}, \"sk\")\n"
+        "@unittest.skipUnless(condition=False)\n"
+        "def test_unless_kw():\n"
+        "    schema = _load_schema(\"su\")\n"
+        "    _assert_conforms(schema, {}, \"su\")\n"
+    )
+    assert _run_sweep_probe(probe) == set()
+
+
+def test_sweep_credits_schema_position_only():
+    # A bound name smuggled into the document argument or a
+    # non-schema keyword is never the asserted schema: only
+    # the first positional argument (and an explicit schema=
+    # keyword) credit.
+    probe = (
+        "def test_smuggle():\n"
+        "    real = _load_schema(\"real\")\n"
+        "    smuggled = _load_schema(\"smuggled\")\n"
+        "    _assert_conforms(real, {\"k\": smuggled}, \"real\")\n"
+        "def test_smuggle_kw():\n"
+        "    real = _load_schema(\"real2\")\n"
+        "    smuggled = _load_schema(\"smuggled2\")\n"
+        "    _assert_conforms(real, {}, \"w\", what=smuggled)\n"
+        "def test_schema_kw():\n"
+        "    real = _load_schema(\"real3\")\n"
+        "    _assert_conforms({}, {}, \"w\", schema=real)\n"
+    )
+    assert _run_sweep_probe(probe) == {"real", "real2", "real3"}
+
+
+def test_sweep_joins_conditional_expressions():
+    # IfExp/BoolOp observe exactly one branch: only names
+    # credited on every branch count (divergent joins drop,
+    # like branch statements; same-value joins keep).
+    probe = (
+        "def test_ifexp():\n"
+        "    s1 = _load_schema(\"i1\")\n"
+        "    s2 = _load_schema(\"i2\")\n"
+        "    _assert_conforms(s1 if cond else s2, {}, \"i\")\n"
+        "def test_ifexp_same():\n"
+        "    s1 = _load_schema(\"j1\")\n"
+        "    _assert_conforms(s1 if cond else s1, {}, \"j\")\n"
+        "def test_boolop():\n"
+        "    s1 = _load_schema(\"b1\")\n"
+        "    s2 = _load_schema(\"b2\")\n"
+        "    _assert_conforms(s1 or s2, {}, \"b\")\n"
+    )
+    assert _run_sweep_probe(probe) == {"j1"}
+
+
+def test_sweep_assert_false_ends_its_block():
+    # ``assert False`` always raises: loads after it are
+    # dead, while a live (non-constant) assert falls
+    # through.
+    probe = (
+        "def test_af():\n"
+        "    assert False\n"
+        "    schema = _load_schema(\"af\")\n"
+        "    _assert_conforms(schema, {}, \"af\")\n"
+        "def test_live_assert():\n"
+        "    schema = _load_schema(\"la\")\n"
+        "    assert schema\n"
+        "    _assert_conforms(schema, {}, \"la\")\n"
+    )
+    assert _run_sweep_probe(probe) == {"la"}
+
+
+def test_sweep_type_alias_poisons():
+    # ``type schema = ...`` (3.12+) rebinds the name: the
+    # stale load must not survive. Below 3.12 the statement
+    # is a syntax error, so there is nothing to pin.
+    if _TYPE_ALIAS is None:
+        return
+    probe = (
+        "def test_ta():\n"
+        "    schema = _load_schema(\"o\")\n"
+        "    type schema = int\n"
+        "    _assert_conforms(schema, {}, \"o\")\n"
+    )
+    assert _run_sweep_probe(probe) == set()
+
+
+def test_sweep_binding_forms_round_two():
+    # Remaining binding forms: annotated assigns count,
+    # augmented assigns poison, starred/mismatched unpacks
+    # poison, a non-load walrus poisons, a walrus in assert
+    # Name use, fail closed), subscript/attribute assigns
+    # retain, set/dict comprehensions credit eagerly,
+    # from/as/dotted imports poison, star imports drop
+    # every binding, and async-with poisons like with.
+    probe = (
+        "def test_annassign():\n"
+        "    schema: object = _load_schema(\"an1\")\n"
+        "    _assert_conforms(schema, {}, \"an1\")\n"
+        "def test_augassign():\n"
+        "    schema = _load_schema(\"au0\")\n"
+        "    schema += 1\n"
+        "    _assert_conforms(schema, {}, \"au0\")\n"
+        "def test_starred():\n"
+        "    s1, *rest = _load_schema(\"st1\"), _load_schema(\"st2\")\n"
+        "    _assert_conforms(s1, {}, \"st1\")\n"
+        "def test_mismatch():\n"
+        "    s1, s2 = _load_schema(\"mm1\"),\n"
+        "    _assert_conforms(s1, {}, \"mm1\")\n"
+        "def test_walrus_poison():\n"
+        "    schema = _load_schema(\"wp0\")\n"
+        "    if (schema := compute()):\n"
+        "        pass\n"
+        "    _assert_conforms(schema, {}, \"wp0\")\n"
+        "def test_walrus_arg():\n"
+        "    _assert_conforms((s := _load_schema(\"wa1\")), {}, \"wa1\")\n"
+        "    _assert_conforms(s, {}, \"wa1\")\n"
+        "def test_sub_attr():\n"
+        "    schema = _load_schema(\"sa1\")\n"
+        "    schema[\"k\"] = 1\n"
+        "    namespace.attr = schema\n"
+        "    _assert_conforms(schema, {}, \"sa1\")\n"
+        "def test_setcomp():\n"
+        "    schema = _load_schema(\"sc1\")\n"
+        "    {_assert_conforms(schema, {}, \"sc1\") for _ in [1]}\n"
+        "def test_dictcomp():\n"
+        "    schema = _load_schema(\"dc1\")\n"
+        "    {\"k\": _assert_conforms(schema, {}, \"dc1\")"
+        " for _ in [1]}\n"
+        "def test_importfrom():\n"
+        "    schema = _load_schema(\"im0\")\n"
+        "    from m import schema\n"
+        "    _assert_conforms(schema, {}, \"im0\")\n"
+        "def test_import_as():\n"
+        "    schema = _load_schema(\"ia0\")\n"
+        "    import m as schema\n"
+        "    _assert_conforms(schema, {}, \"ia0\")\n"
+        "def test_import_dotted():\n"
+        "    schema = _load_schema(\"id0\")\n"
+        "    import schema.sub\n"
+        "    _assert_conforms(schema, {}, \"id0\")\n"
+        "def test_import_star():\n"
+        "    schema = _load_schema(\"is0\")\n"
+        "    from m import *\n"
+        "    _assert_conforms(schema, {}, \"is0\")\n"
+        "def test_async_with():\n"
+        "    schema = _load_schema(\"aw0\")\n"
+        "    async with open(\"x\") as schema:\n"
+        "        pass\n"
+        "    _assert_conforms(schema, {}, \"aw0\")\n"
+    )
+    assert _run_sweep_probe(probe) == {
+        "an1", "wa1", "sa1", "sc1", "dc1",
+    }
+
+
+def test_sweep_control_flow_round_two():
+    # Remaining control flow: if-True/while-True run inline,
+    # break/continue/raise end their block, while/for joins
+    # keep same-value bindings and drop the rest, try
+    # orelse/finally flow in order, except handlers poison
+    # after the try too, and match captures poison.
+    probe = (
+        "def test_iftrue():\n"
+        "    if True:\n"
+        "        schema = _load_schema(\"it1\")\n"
+        "    _assert_conforms(schema, {}, \"it1\")\n"
+        "def test_whiletrue():\n"
+        "    while True:\n"
+        "        schema = _load_schema(\"wt1\")\n"
+        "        break\n"
+        "    _assert_conforms(schema, {}, \"wt1\")\n"
+        "def test_break():\n"
+        "    for i in docs:\n"
+        "        schema = _load_schema(\"bk1\")\n"
+        "        _assert_conforms(schema, {}, \"bk1\")\n"
+        "        break\n"
+        "        schema = _load_schema(\"bkdead\")\n"
+        "def test_continue():\n"
+        "    for i in docs:\n"
+        "        schema = _load_schema(\"ct1\")\n"
+        "        _assert_conforms(schema, {}, \"ct1\")\n"
+        "        continue\n"
+        "        schema = _load_schema(\"ctdead\")\n"
+        "def test_raise():\n"
+        "    schema = _load_schema(\"rz1\")\n"
+        "    _assert_conforms(schema, {}, \"rz1\")\n"
+        "    raise ValueError(\"x\")\n"
+        "    schema = _load_schema(\"rzdead\")\n"
+        "def test_for_same():\n"
+        "    schema = _load_schema(\"fs1\")\n"
+        "    for i in docs:\n"
+        "        schema = _load_schema(\"fs1\")\n"
+        "    _assert_conforms(schema, {}, \"fs1\")\n"
+        "def test_for_diverge():\n"
+        "    for i in docs:\n"
+        "        schema = _load_schema(\"fd1\")\n"
+        "    _assert_conforms(schema, {}, \"fd1\")\n"
+        "def test_while_same():\n"
+        "    schema = _load_schema(\"ws1\")\n"
+        "    while cond:\n"
+        "        schema = _load_schema(\"ws1\")\n"
+        "    _assert_conforms(schema, {}, \"ws1\")\n"
+        "def test_while_diverge():\n"
+        "    while cond:\n"
+        "        schema = _load_schema(\"wd1\")\n"
+        "    _assert_conforms(schema, {}, \"wd1\")\n"
+        "def test_try_finally():\n"
+        "    try:\n"
+        "        schema = _load_schema(\"tf1\")\n"
+        "    finally:\n"
+        "        schema = _load_schema(\"tf2\")\n"
+        "    _assert_conforms(schema, {}, \"tf2\")\n"
+        "def test_try_orelse():\n"
+        "    try:\n"
+        "        schema = _load_schema(\"to1\")\n"
+        "    except ValueError:\n"
+        "        schema = _load_schema(\"to1\")\n"
+        "    else:\n"
+        "        pass\n"
+        "    _assert_conforms(schema, {}, \"to1\")\n"
+        "def test_except_after():\n"
+        "    schema = _load_schema(\"ea0\")\n"
+        "    try:\n"
+        "        pass\n"
+        "    except ValueError as schema:\n"
+        "        pass\n"
+        "    _assert_conforms(schema, {}, \"ea0\")\n"
+        "def test_match_as():\n"
+        "    schema = _load_schema(\"mc0\")\n"
+        "    match cmd:\n"
+        "        case str() as schema:\n"
+        "            pass\n"
+        "    _assert_conforms(schema, {}, \"mc0\")\n"
+        "def test_match_star():\n"
+        "    schema = _load_schema(\"ms0\")\n"
+        "    match cmd:\n"
+        "        case [first, *schema]:\n"
+        "            pass\n"
+        "    _assert_conforms(schema, {}, \"ms0\")\n"
+        "def test_match_rest():\n"
+        "    schema = _load_schema(\"mr0\")\n"
+        "    match cmd:\n"
+        '        case {"k": value, **schema}:\n'
+        "            pass\n"
+        "    _assert_conforms(schema, {}, \"mr0\")\n"
+    )
+    assert _run_sweep_probe(probe) == {
+        "it1", "wt1", "bk1", "ct1", "rz1", "fs1", "ws1",
+        "tf2", "to1",
+    }
+
+
+def test_sweep_conditional_expression_bindings_join():
+    # Bindings made in conditional-expression positions
+    # join like branches: IfExp/BoolOp/assert-message
+    # walrus and comprehension-interior walrus drop unless
+    # the fall-through binding agrees; eager positions
+    # (IfExp test, first BoolOp operand, first
+    # comprehension iterable) bind unconditionally, and a
+    # shadowed outer binding survives the comprehension.
+    probe = (
+        "def test_ifexp_walrus():\n"
+        "    value = (u := _load_schema(\"u\")) if cond else other\n"
+        "    _assert_conforms(u, {}, \"u\")\n"
+        "def test_ifexp_walrus_same():\n"
+        "    u = _load_schema(\"us\")\n"
+        "    value = (u := _load_schema(\"us\")) if cond else other\n"
+        "    _assert_conforms(u, {}, \"us\")\n"
+        "def test_ifexp_test_walrus():\n"
+        "    value = x if (u := _load_schema(\"ut\")) else y\n"
+        "    _assert_conforms(u, {}, \"ut\")\n"
+        "def test_boolop_walrus():\n"
+        "    value = flag or (u := _load_schema(\"ub\"))\n"
+        "    _assert_conforms(u, {}, \"ub\")\n"
+        "def test_boolop_first_walrus():\n"
+        "    value = (u := _load_schema(\"uf\")) or flag\n"
+        "    _assert_conforms(u, {}, \"uf\")\n"
+        "def test_assert_msg_walrus():\n"
+        "    assert ok, (u := _load_schema(\"um\"))\n"
+        "    _assert_conforms(u, {}, \"um\")\n"
+        "def test_comp_walrus():\n"
+        "    [(u := _load_schema(\"uc\")) for i in docs]\n"
+        "    _assert_conforms(u, {}, \"uc\")\n"
+        "def test_comp_first_walrus():\n"
+        "    [x for i in (u := _load_schema(\"ue\"))]\n"
+        "    _assert_conforms(u, {}, \"ue\")\n"
+        "def test_comp_same():\n"
+        "    u = _load_schema(\"uo\")\n"
+        "    [(u := _load_schema(\"uo\")) for i in docs]\n"
+        "    _assert_conforms(u, {}, \"uo\")\n"
+        "def test_comp_shadow_survives():\n"
+        "    other = _load_schema(\"ss\")\n"
+        "    [x for other in docs]\n"
+        "    _assert_conforms(other, {}, \"ss\")\n"
+    )
+    assert _run_sweep_probe(probe) == {
+        "us", "ut", "uf", "ue", "uo", "ss",
+    }
+
+
+def test_sweep_statement_comprehension_shadows_loop_vars():
+    # A comprehension loop variable shadows the outer
+    # binding everywhere inside (not just in assert
+    # arguments): the outer load credits nothing, while the
+    # first iterable still evaluates outside.
+    probe = (
+        "def test_comp_stmt_shadow():\n"
+        "    other = _load_schema(\"sh0\")\n"
+        "    [_assert_conforms(other, {}, \"sh0\")"
+        " for other in docs]\n"
+        "def test_comp_first_iter_outer():\n"
+        "    schema = _load_schema(\"fi1\")\n"
+        "    [_assert_conforms(schema, {}, \"fi1\")"
+        " for _ in schema]\n"
+    )
+    assert _run_sweep_probe(probe) == {"fi1"}
 
 
 def test_every_schema_file_has_conformance_coverage():

@@ -74,6 +74,10 @@ REQUIRED_SHIPPED = (
 
 _PIN_NAMES = ("PINNED_PAYLOAD", "PINNED_SCHEMA_DATA")
 
+# ``type X = ...`` exists only on 3.12+; None below, where the
+# statement is a syntax error and there is nothing to refuse.
+_TYPE_ALIAS = getattr(ast, "TypeAlias", None)
+
 
 def _read_wheel_pins(path):
     """Read the wheel contract pins from ``path``.
@@ -82,15 +86,22 @@ def _read_wheel_pins(path):
     nested assignments never override it, duplicates fail
     instead of silently winning, non-literal values fail
     as AssertionError, and any other rebinding form
-    (annotated, augmented, def/class, import, loop/with/
-    except targets, walrus, match captures, ``del``)
-    anywhere outside nested local scopes fails loudly
-    instead of diverging from the runtime value. A
-    ``global`` pin declaration inside a nested scope
-    fails too.
+    (annotated, augmented, def/class, import including
+    star, loop/with/except targets, walrus, match
+    captures, ``del``, ``type`` aliases) anywhere outside
+    nested local scopes fails loudly instead of diverging
+    from the runtime value. A ``global`` pin declaration
+    inside a nested scope fails too. Unreadable files
+    (missing, undecodable, unparsable) fail as
+    AssertionError, never as a bare traceback.
     """
-    with open(path, encoding="utf-8") as handle:
-        tree = ast.parse(handle.read(), path)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), path)
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise AssertionError(
+            "wheel contract unreadable: %s (%s)" % (path, exc)
+        )
     pinset = set(_PIN_NAMES)
     pins = {}
     accepted = set()
@@ -223,11 +234,26 @@ def _read_wheel_pins(path):
                 _refuse_targets(sub.targets)
             elif isinstance(sub, (ast.Import, ast.ImportFrom)):
                 for entry in sub.names:
+                    if entry.name == "*":
+                        # A star import may rebind any pin at
+                        # runtime (whatever the module
+                        # exports), so any star import fails.
+                        raise AssertionError(
+                            "star import in %s" % path
+                        )
                     bound = entry.asname or entry.name.split(
                         ".", 1
                     )[0]
                     if bound in pinset:
                         _refuse("rebound", bound)
+            elif _TYPE_ALIAS is not None and isinstance(
+                sub, _TYPE_ALIAS
+            ):
+                if (
+                    isinstance(sub.name, ast.Name)
+                    and sub.name.id in pinset
+                ):
+                    _refuse("redefined", sub.name.id)
             elif isinstance(
                 sub, (ast.MatchAs, ast.MatchStar)
             ):
@@ -252,12 +278,14 @@ def _validate_schema_source(source):
 
     The source joins under ``schemas/`` on this Linux
     host, so only ``..`` segments (plus absolute, empty,
-    non-string, and non-json spellings) can escape; bare
-    ``..foo``/``.`` names are harmless and stay allowed.
+    NUL-bearing, non-string, and non-json spellings) can
+    escape; bare ``..foo``/``.`` names are harmless and
+    stay allowed.
     """
     if (
         not isinstance(source, str)
         or not source
+        or "\x00" in source
         or source.startswith("/")
         or ".." in source.split("/")
         or not source.endswith(".json")
@@ -268,14 +296,33 @@ def _validate_schema_source(source):
 
 
 def _wheel_tree_paths():
-    """Map the wheel payload pin back to tree-relative paths."""
+    """Map the wheel payload pin back to tree-relative paths.
+
+    Pins are literals, not necessarily strings: mistyped
+    pins fail as AssertionError here, never as a
+    TypeError/AttributeError traceback downstream.
+    """
     pins = _read_wheel_pins(WHEEL_CONTRACT)
     paths = set()
-    for name in pins["PINNED_PAYLOAD"]:
+    payload = pins["PINNED_PAYLOAD"]
+    if not isinstance(payload, (tuple, list)):
+        raise AssertionError(
+            "unexpected wheel payload pin: %r" % (payload,)
+        )
+    for name in payload:
+        if not isinstance(name, str):
+            raise AssertionError(
+                "unexpected wheel payload entry: %r" % (name,)
+            )
         if not name.startswith("mojobpf/"):
             raise AssertionError("unexpected wheel payload entry: %r" % name)
         paths.add("src/" + name)
-    for entry in pins["PINNED_SCHEMA_DATA"]:
+    schemas = pins["PINNED_SCHEMA_DATA"]
+    if not isinstance(schemas, (tuple, list)):
+        raise AssertionError(
+            "unexpected wheel schema pin: %r" % (schemas,)
+        )
+    for entry in schemas:
         if (
             not isinstance(entry, (tuple, list))
             or len(entry) != 2
@@ -300,8 +347,14 @@ def _wheel_tree_paths():
 
 def shipped_tracked_files():
     """Return the sorted shipped set: manifests union, tracked only."""
-    with open(SDIST_PIN, encoding="utf-8") as handle:
-        members = json.load(handle)
+    try:
+        with open(SDIST_PIN, encoding="utf-8") as handle:
+            members = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise AssertionError(
+            "sdist member pin unreadable: %s (%s)"
+            % (SDIST_PIN, exc)
+        )
     if not isinstance(members, list) or not members:
         raise AssertionError("sdist member pin is empty: %s" % SDIST_PIN)
     try:
@@ -336,7 +389,7 @@ def scan_shipped():
         try:
             with open(path, "rb") as handle:
                 body = handle.read()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise AssertionError("shipped member unreadable: %s (%s)" % (name, exc))
         try:
             text = body.decode("utf-8")
@@ -429,9 +482,12 @@ def test_wheel_pin_reader_ignores_nested_and_refuses_duplicates():
 def test_wheel_pin_reader_refuses_rebinding_forms():
     # Only a single plain module-level assignment per pin
     # is accepted: any other rebinding form (annotated,
-    # augmented, def/class, import, loop/with/except
-    # targets, walrus) fails loudly instead of silently
-    # diverging from the runtime value.
+    # augmented, def/class, import including star, del,
+    # match captures, global declarations, conditional
+    # assigns, loop/with/except targets, walrus including
+    # default/decorator positions, and ``type`` aliases)
+    # fails loudly instead of silently diverging from the
+    # runtime value.
     rebinding = (
         "PINNED_PAYLOAD: tuple = (\"mojobpf/a.py\",)\n",
         "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
@@ -459,7 +515,35 @@ def test_wheel_pin_reader_refuses_rebinding_forms():
         "    pass\n",
         "y = (PINNED_PAYLOAD := (\"mojobpf/evil.py\",))\n"
         "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "from os import *\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "del PINNED_PAYLOAD\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "match command:\n"
+        "    case PINNED_PAYLOAD:\n"
+        "        pass\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "def factory():\n"
+        "    global PINNED_PAYLOAD\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "if cond:\n"
+        "    PINNED_PAYLOAD = (\"mojobpf/evil.py\",)\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "def factory(x=(PINNED_PAYLOAD := (\"mojobpf/evil.py\",))):\n"
+        "    pass\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "@dec(PINNED_PAYLOAD := (\"mojobpf/evil.py\",))\n"
+        "def factory():\n"
+        "    pass\n",
     )
+    if _TYPE_ALIAS is not None:
+        # Below 3.12 the statement is a syntax error, so
+        # only pin the refusal where it parses.
+        rebinding += (
+            "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+            "type PINNED_PAYLOAD = tuple\n",
+        )
     schema = (
         "PINNED_SCHEMA_DATA = "
         "((\"s.schema.json\", \"s.schema.json\"),)\n"
@@ -481,6 +565,36 @@ def test_wheel_pin_reader_refuses_rebinding_forms():
                 raise AssertionError(
                     "rebinding form accepted: %r" % (body,)
                 )
+
+
+def test_wheel_pin_reader_ignores_comprehension_targets():
+    # A comprehension loop variable never rebinds the
+    # module global (its scope is the comprehension), so a
+    # pin-named loop target is accepted -- and a runtime
+    # exec proves the pin value survives it.
+    probe = (
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "PINNED_SCHEMA_DATA = "
+        "((\"s.schema.json\", \"s.schema.json\"),)\n"
+        "seen = [PINNED_PAYLOAD for PINNED_PAYLOAD in [1]]\n"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-comp-"
+    ) as parent:
+        path = os.path.join(parent, "comp_contract.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(probe)
+        assert _read_wheel_pins(path) == {
+            "PINNED_PAYLOAD": ("mojobpf/a.py",),
+            "PINNED_SCHEMA_DATA": (
+                ("s.schema.json", "s.schema.json"),
+            ),
+        }
+        namespace = {}
+        exec(probe, namespace)
+        assert namespace["PINNED_PAYLOAD"] == (
+            "mojobpf/a.py",
+        ), namespace
 
 
 def test_wheel_pin_reader_multi_target_and_non_literal():
@@ -515,11 +629,112 @@ def test_wheel_pin_reader_multi_target_and_non_literal():
             raise AssertionError("non-literal pin accepted")
 
 
+def test_wheel_tree_paths_rejects_non_string_pins():
+    # Pin values are literals, not necessarily strings: an
+    # int payload, a tuple-of-int payload, or a non-list
+    # schema pin must fail as AssertionError here, never
+    # as a TypeError/AttributeError traceback downstream.
+    bodies = (
+        "PINNED_PAYLOAD = 3\n"
+        "PINNED_SCHEMA_DATA = "
+        "((\"s.schema.json\", \"s.schema.json\"),)\n",
+        "PINNED_PAYLOAD = (3,)\n"
+        "PINNED_SCHEMA_DATA = "
+        "((\"s.schema.json\", \"s.schema.json\"),)\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "PINNED_SCHEMA_DATA = 3\n",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-pintype-"
+    ) as parent:
+        old = globals()["WHEEL_CONTRACT"]
+        try:
+            for index, body in enumerate(bodies):
+                path = os.path.join(
+                    parent, "pins_%d.py" % index
+                )
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+                globals()["WHEEL_CONTRACT"] = path
+                try:
+                    _wheel_tree_paths()
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "non-string pins accepted: %r" % (body,)
+                    )
+        finally:
+            globals()["WHEEL_CONTRACT"] = old
+
+
+def test_wheel_pin_reader_unreadable_fails_closed():
+    # A missing contract or an unparsable one fails as
+    # AssertionError, never as a bare OSError/SyntaxError
+    # traceback.
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-unread-"
+    ) as parent:
+        missing = os.path.join(parent, "absent.py")
+        try:
+            _read_wheel_pins(missing)
+        except AssertionError as exc:
+            assert "absent.py" in str(exc), exc
+        else:
+            raise AssertionError("missing contract accepted")
+        broken = os.path.join(parent, "broken.py")
+        with open(broken, "w", encoding="utf-8") as handle:
+            handle.write("def broken(:\n")
+        try:
+            _read_wheel_pins(broken)
+        except AssertionError as exc:
+            assert "broken.py" in str(exc), exc
+        else:
+            raise AssertionError("unparsable contract accepted")
+
+
+def test_shipped_tracked_files_unreadable_manifest_fails_closed():
+    # A missing or corrupt sdist manifest fails as
+    # AssertionError, never as a bare OSError/ValueError
+    # traceback.
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-manifest-"
+    ) as parent:
+        old = globals()["SDIST_PIN"]
+        try:
+            globals()["SDIST_PIN"] = os.path.join(
+                parent, "absent.json"
+            )
+            try:
+                shipped_tracked_files()
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(
+                    "missing manifest accepted"
+                )
+            corrupt = os.path.join(parent, "corrupt.json")
+            with open(corrupt, "w", encoding="utf-8") as handle:
+                handle.write("{oops\n")
+            globals()["SDIST_PIN"] = corrupt
+            try:
+                shipped_tracked_files()
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(
+                    "corrupt manifest accepted"
+                )
+        finally:
+            globals()["SDIST_PIN"] = old
+
+
 def test_schema_source_validation_rejects_escapes():
     # Pinned schema sources must stay inside schemas/:
     # only ".." path segments escape, so only they (plus
-    # absolute/empty/non-string/non-json spellings) fail.
-    # Harmless doppelgangers ("..foo", ".") stay allowed.
+    # absolute/empty/NUL/non-string/non-json spellings)
+    # fail. Harmless doppelgangers ("..foo", ".") stay
+    # allowed.
     for good in (
         "a.schema.json",
         "sub/dir/b.schema.json",
@@ -533,6 +748,7 @@ def test_schema_source_validation_rejects_escapes():
         "/abs.json",
         "",
         "x.txt",
+        "a\x00.json",
         None,
         3,
     ):
@@ -544,6 +760,23 @@ def test_schema_source_validation_rejects_escapes():
             raise AssertionError(
                 "bad schema source accepted: %r" % (bad,)
             )
+
+
+def test_scan_shipped_nul_member_fails_closed():
+    # A NUL member path raises ValueError from open (not
+    # OSError): the scan must account it as FAIL, never as
+    # a traceback.
+    old = globals()["shipped_tracked_files"]
+    globals()["shipped_tracked_files"] = lambda: ["a\x00.json"]
+    try:
+        try:
+            scan_shipped()
+        except AssertionError as exc:
+            assert "a\x00.json" in str(exc), exc
+        else:
+            raise AssertionError("NUL member not failed closed")
+    finally:
+        globals()["shipped_tracked_files"] = old
 
 
 def test_tracked_sources_carry_spdx_headers():
@@ -573,6 +806,24 @@ def test_tracked_sources_carry_spdx_headers():
             misses.append(name)
     assert not misses, "missing SPDX header: %s" % ", ".join(misses)
     print("PASS SPDX headers in %d tracked sources" % len(names))
+
+
+def test_patterns_match_known_samples():
+    # Positive control: every pattern matches its sample
+    # form, so the clean-tree test cannot pass vacuously
+    # if a regex breaks. Samples live in this unshipped
+    # test file, never in the scanned set.
+    samples = {
+        "work-package ID": "see WP-1 for context",
+        "stage ID": "stage M-AB done",
+        "finding ID": "finding F-001 closed",
+        "private workspace path": "checked out under mojobpf-ws",
+    }
+    assert sorted(label for label, _ in PATTERNS) == sorted(
+        samples
+    )
+    for label, pattern in PATTERNS:
+        assert pattern.search(samples[label]), label
 
 
 def test_no_internal_ids_or_private_paths_in_shipped_files():

@@ -448,6 +448,22 @@ IMPORT_PROBES = (
         "unable to locate module",
     ),
     (
+        "compat_import_from_alias_evil",
+        "from mojobpf._impl import x as y\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
+    (
+        "compat_import_alias_evil",
+        "import mojobpf._impl as e\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
+    (
         "compat_import_semicolon_ok",
         "import mojobpf.packet; import mojobpf.core\n"
         "def entry() -> Int32:\n"
@@ -559,7 +575,7 @@ def test_additive_only_within_major():
 def test_import_probe_count_matches_unit_header():
     # tests/unit/test_sdk_surface.py documents this count in
     # the CHECKER_CASES header; update both together.
-    assert len(IMPORT_PROBES) == 21, len(IMPORT_PROBES)
+    assert len(IMPORT_PROBES) == 23, len(IMPORT_PROBES)
 
 
 def _checker_table():
@@ -597,7 +613,7 @@ def _probe_import_texts(probes):
     return texts
 
 
-# Frozen frontend-backed row identity: the exact 21
+# Frozen frontend-backed row identity: the exact 23
 # checker-row texts the probes cover. Swapping one
 # frontend row for another same-expectation row would keep
 # every count/subset assert green while the unit header
@@ -606,6 +622,7 @@ FROZEN_FRONTEND_TEXTS = (
     'def entry() -> Int32:\n    var x = "a\\\nfrom mojobpf import _impl\\\nb"\n    return Int32(0)\n',
     'from mojobpf . packet import XDP_PASS\n',
     'from mojobpf._impl import x\n',
+    'from mojobpf._impl import x as y\n',
     'from mojobpf.packet import (\n XDP_PASS,\n load_u8,\n)\n',
     'from mojobpf.packet import BPF_ANY\n',
     'from mojobpf.packet import XDP_PASS\n',
@@ -613,6 +630,7 @@ FROZEN_FRONTEND_TEXTS = (
     'from mojobpf.packet import _nope\n',
     'from mojobpf.packet import load_u8 as lu8\n',
     'from mojobpf.packet.sub import x\n',
+    'import mojobpf._impl as e\n',
     'import mojobpf._impl, mojobpf.packet\n',
     'import mojobpf.packet as pkt, mojobpf._impl as e\n',
     'import mojobpf.packet, mojobpf . _impl\n',
@@ -630,24 +648,29 @@ FROZEN_FRONTEND_TEXTS = (
 def test_frontend_probes_cover_checker_rows_exactly():
     # Every probe's import text must be a CHECKER_CASES row
     # with a consistent expectation, and no two probes may
-    # share a row: exactly the 21 probe-backed rows may claim
+    # share a row: exactly the 23 probe-backed rows may claim
     # frontend verification in the unit header, so the split
     # cannot rot again. The whole-source branch is pinned to
     # the string-hide probe alone, and no import text may
-    # embed the driver sentinel.
+    # embed the driver sentinel: every other probe carries
+    # it exactly once (a truncation-blind exclusion check
+    # would pass an evil source embedding it twice).
     rows = _checker_table()
     table = dict(rows)
-    assert len(table) == len(rows) == 56, len(rows)
+    assert len(table) == len(rows) == 58, len(rows)
     whole = [
         stem
         for stem, source, _, _ in IMPORT_PROBES
         if _ENTRY_SENTINEL not in source
     ]
     assert whole == ["compat_import_string_hide_ok"], whole
+    for stem, source, _, _ in IMPORT_PROBES:
+        if stem not in whole:
+            assert source.count(_ENTRY_SENTINEL) == 1, stem
     texts = _probe_import_texts(IMPORT_PROBES)
     for text in texts:
         assert _ENTRY_SENTINEL not in text, text
-    assert len(texts) == len(IMPORT_PROBES) == 21, len(texts)
+    assert len(texts) == len(IMPORT_PROBES) == 23, len(texts)
     assert len(set(texts)) == len(texts), texts
     assert sorted(texts) == sorted(FROZEN_FRONTEND_TEXTS)
     for (stem, _source, must_fail, _marker), text in zip(

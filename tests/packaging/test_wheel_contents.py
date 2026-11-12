@@ -214,9 +214,18 @@ def wheel_names():
 
 
 def wheel_bytes(name):
-    """Return the raw bytes of one wheel entry."""
+    """Return the raw bytes of one wheel entry.
+
+    A missing entry fails as AssertionError, never as a
+    KeyError traceback from the direct runner.
+    """
     with zipfile.ZipFile(wheel_path()) as archive:
-        return archive.read(name)
+        try:
+            return archive.read(name)
+        except KeyError:
+            raise AssertionError(
+                "wheel entry missing: %s" % name
+            )
 
 
 def tree_version():
@@ -373,8 +382,8 @@ def _validate_schema_pin(pairs):
     Duplicate sources or flattened names are refused (a
     silent zip clobber), and flattened names must stay
     flat: setuptools data-files install by basename, so a
-    ``/``, backslash, ``..``, or drive-letter wheel name
-    could never be produced honestly.
+    ``/``, backslash, NUL, ``..``, or drive-letter wheel
+    name could never be produced honestly.
     """
     try:
         entries = list(pairs)
@@ -403,6 +412,7 @@ def _validate_schema_pin(pairs):
             name
             and "/" not in name
             and "\\" not in name
+            and "\x00" not in name
             and name != "."
             and not name.startswith("..")
             and not (
@@ -427,6 +437,7 @@ def test_schema_pin_validation_rejects_bad_entries():
         (("a.schema.json", ""),),
         (("a.schema.json", "a\\..\\b.schema.json"),),
         (("a.schema.json", "C:x.schema.json"),),
+        (("a.schema.json", "a\x00b.schema.json"),),
         (
             ("a.schema.json", "dup.schema.json"),
             ("sub/b.schema.json", "dup.schema.json"),
@@ -498,6 +509,58 @@ def test_schemas_shipped_byte_identical():
             )
 
 
+def test_wheel_bytes_missing_entry_fails_closed():
+    # A missing wheel entry fails as AssertionError here,
+    # never as a KeyError traceback from the direct runner.
+    try:
+        wheel_bytes("mojobpf-0.0.0.dist-info/NOPE")
+    except AssertionError as exc:
+        assert "NOPE" in str(exc), exc
+    else:
+        raise AssertionError("missing wheel entry accepted")
+
+
+def test_direct_runner_accounts_errors_as_fail():
+    # The direct runner accounts assertion and
+    # infrastructure errors as FAIL, a toolchain gap as an
+    # environment refusal, and a clean run as a pass.
+    def boom_assert():
+        raise AssertionError("injected")
+
+    def boom_os():
+        raise OSError("injected tree-open failure")
+
+    def boom_env():
+        raise EnvironmentFailure("injected")
+
+    assert _run_single("probe_assert", boom_assert) == (
+        1, False,
+    )
+    assert _run_single("probe_os", boom_os) == (1, False)
+    assert _run_single("probe_env", boom_env) == (0, True)
+    assert _run_single("probe_ok", lambda: None) == (0, False)
+
+
+def _run_single(name, func):
+    """Run one direct-runner test; return (failures, environment).
+
+    Assertion and infrastructure errors (a missing wheel
+    entry, an unreadable tree file) account as FAIL, never
+    as a traceback; only a missing toolchain is an
+    environment refusal.
+    """
+    try:
+        func()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+        return 0, True
+    except (AssertionError, OSError) as exc:
+        print("FAIL %s: %s" % (name, exc))
+        return 1, False
+    print("PASS %s" % name)
+    return 0, False
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
@@ -506,16 +569,12 @@ def main():
     names = sorted(k for k in globals() if k.startswith("test_"))
     try:
         for name in names:
-            try:
-                globals()[name]()
-            except EnvironmentFailure as exc:
-                print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            failed, environment = _run_single(
+                name, globals()[name]
+            )
+            if environment:
                 return 2
-            except AssertionError as exc:
-                print("FAIL %s: %s" % (name, exc))
-                failures += 1
-            else:
-                print("PASS %s" % name)
+            failures += failed
     finally:
         parent = _WHEEL_CACHE.pop("dir", None)
         _WHEEL_CACHE.pop("path", None)

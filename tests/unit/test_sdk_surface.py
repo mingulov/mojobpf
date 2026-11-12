@@ -42,7 +42,7 @@ SDK_ROOT = os.path.join(
 SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 
 # Checker truth table: (source, expected violation count).
-# Twenty-one rows are re-verified against the genuine Mojo 1.1.0
+# Twenty-three rows are re-verified against the genuine Mojo 1.1.0
 # frontend on every run of the packaging compatibility suite
 # (``mojo build --emit llvm -I <sdk>``): the plain accept, the
 # parenthesized-list accept, the ``load_u8 as lu8`` alias
@@ -52,7 +52,8 @@ SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 # multi-module plain-import rows, the four multi-module
 # spaced-dots rows (one accept, three evil), the import-form
 # semicolon accept/evil pair, the backslash accept, the
-# from-form spaced-dots accept, and the string-hide accept
+# from-form spaced-dots accept, the two single alias evils
+# (from-form and import-form), and the string-hide accept
 # (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``;
 # membership pinned by
 # ``test_frontend_probes_cover_checker_rows_exactly``).
@@ -107,6 +108,8 @@ CHECKER_CASES = (
     ("import mojobpf.packet, mojobpf._impl\n", 1),
     ("import mojobpf._impl, mojobpf.packet\n", 1),
     ("import mojobpf.packet as pkt, mojobpf._impl as e\n", 1),
+    ("from mojobpf._impl import x as y\n", 1),
+    ("import mojobpf._impl as e\n", 1),
     ("import mojobpf.packet, std.random\n", 0),
     # Single-quote spans mask parens too, so a hostile line
     # cannot join away a forbidden import below it.
@@ -279,7 +282,7 @@ def test_no_underscore_names_exported():
 def test_checker_case_count_matches_header():
     # The header above documents the row budget by category;
     # update both together when adding rows.
-    assert len(CHECKER_CASES) == 56, len(CHECKER_CASES)
+    assert len(CHECKER_CASES) == 58, len(CHECKER_CASES)
 
 
 def test_import_checker_truth_table():
