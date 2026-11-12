@@ -78,33 +78,193 @@ _PIN_NAMES = ("PINNED_PAYLOAD", "PINNED_SCHEMA_DATA")
 def _read_wheel_pins(path):
     """Read the wheel contract pins from ``path``.
 
-    Module-level assignments only: a nested pin assignment
-    never overrides the real pin, and a duplicate
-    module-level assignment fails instead of silently
-    winning.
+    Exactly one plain module-level assignment per pin:
+    nested assignments never override it, duplicates fail
+    instead of silently winning, non-literal values fail
+    as AssertionError, and any other rebinding form
+    (annotated, augmented, def/class, import, loop/with/
+    except targets, walrus, match captures, ``del``)
+    anywhere outside nested local scopes fails loudly
+    instead of diverging from the runtime value. A
+    ``global`` pin declaration inside a nested scope
+    fails too.
     """
     with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read(), path)
+    pinset = set(_PIN_NAMES)
     pins = {}
+    accepted = set()
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
         for target in node.targets:
             if (
                 isinstance(target, ast.Name)
-                and target.id in _PIN_NAMES
+                and target.id in pinset
             ):
                 if target.id in pins:
                     raise AssertionError(
                         "duplicate wheel pin %r in %s"
                         % (target.id, path)
                     )
-                pins[target.id] = ast.literal_eval(node.value)
-    if set(pins) != set(_PIN_NAMES):
+                try:
+                    pins[target.id] = ast.literal_eval(
+                        node.value
+                    )
+                except (ValueError, TypeError, SyntaxError):
+                    raise AssertionError(
+                        "non-literal wheel pin %r in %s"
+                        % (target.id, path)
+                    )
+                accepted.add(id(target))
+    comp_targets = set()
+    for sub in ast.walk(tree):
+        if isinstance(sub, ast.comprehension):
+            for inner in ast.walk(sub.target):
+                comp_targets.add(id(inner))
+
+    def _refuse(what, name):
+        raise AssertionError(
+            "wheel pin %r %s in %s" % (name, what, path)
+        )
+
+    def _refuse_targets(targets):
+        for target in targets:
+            for found in ast.walk(target):
+                if (
+                    isinstance(found, ast.Name)
+                    and found.id in pinset
+                    and id(found) not in accepted
+                ):
+                    _refuse("reassigned", found.id)
+
+    def _scan(root):
+        stack = [root]
+        while stack:
+            sub = stack.pop()
+            if id(sub) in comp_targets:
+                continue
+            if isinstance(
+                sub,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                ),
+            ):
+                for inner in ast.walk(sub):
+                    if (
+                        isinstance(inner, ast.Global)
+                        and set(inner.names) & pinset
+                    ):
+                        _refuse(
+                            "rebound via global",
+                            sorted(
+                                set(inner.names) & pinset
+                            )[0],
+                        )
+                if isinstance(
+                    sub,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.ClassDef,
+                    ),
+                ):
+                    if sub.name in pinset:
+                        _refuse("redefined", sub.name)
+                    parts = list(sub.decorator_list)
+                    if not isinstance(sub, ast.ClassDef):
+                        parts.extend(sub.args.defaults)
+                        parts.extend(
+                            default
+                            for default in sub.args.kw_defaults
+                            if default is not None
+                        )
+                    else:
+                        parts.extend(sub.bases)
+                        parts.extend(
+                            keyword.value
+                            for keyword in sub.keywords
+                        )
+                else:
+                    parts = list(sub.args.defaults)
+                    parts.extend(
+                        default
+                        for default in sub.args.kw_defaults
+                        if default is not None
+                    )
+                stack.extend(parts)
+                continue
+            if isinstance(sub, ast.Assign):
+                _refuse_targets(sub.targets)
+            elif isinstance(sub, ast.AnnAssign):
+                if sub.value is not None:
+                    _refuse_targets([sub.target])
+            elif isinstance(sub, ast.AugAssign):
+                _refuse_targets([sub.target])
+            elif isinstance(sub, ast.NamedExpr):
+                _refuse_targets([sub.target])
+            elif isinstance(sub, (ast.For, ast.AsyncFor)):
+                _refuse_targets([sub.target])
+            elif isinstance(sub, ast.With):
+                _refuse_targets(
+                    [
+                        item.optional_vars
+                        for item in sub.items
+                        if item.optional_vars is not None
+                    ]
+                )
+            elif isinstance(sub, ast.ExceptHandler):
+                if sub.name in pinset:
+                    _refuse("rebound", sub.name)
+            elif isinstance(sub, ast.Delete):
+                _refuse_targets(sub.targets)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                for entry in sub.names:
+                    bound = entry.asname or entry.name.split(
+                        ".", 1
+                    )[0]
+                    if bound in pinset:
+                        _refuse("rebound", bound)
+            elif isinstance(
+                sub, (ast.MatchAs, ast.MatchStar)
+            ):
+                if sub.name in pinset:
+                    _refuse("rebound", sub.name)
+            elif isinstance(sub, ast.MatchMapping):
+                if sub.rest in pinset:
+                    _refuse("rebound", sub.rest)
+            stack.extend(ast.iter_child_nodes(sub))
+
+    for node in tree.body:
+        _scan(node)
+    if set(pins) != pinset:
         raise AssertionError(
             "wheel contract pins unreadable in %s" % path
         )
     return pins
+
+
+def _validate_schema_source(source):
+    """Validate a pinned schema source path.
+
+    The source joins under ``schemas/`` on this Linux
+    host, so only ``..`` segments (plus absolute, empty,
+    non-string, and non-json spellings) can escape; bare
+    ``..foo``/``.`` names are harmless and stay allowed.
+    """
+    if (
+        not isinstance(source, str)
+        or not source
+        or source.startswith("/")
+        or ".." in source.split("/")
+        or not source.endswith(".json")
+    ):
+        raise AssertionError(
+            "unexpected wheel schema source: %r" % (source,)
+        )
 
 
 def _wheel_tree_paths():
@@ -126,11 +286,9 @@ def _wheel_tree_paths():
                 "unexpected wheel schema entry: %r" % (entry,)
             )
         source, shipped = entry
+        _validate_schema_source(source)
         if (
-            source.startswith("/")
-            or source.startswith("..")
-            or not source.endswith(".json")
-            or "/" in shipped
+            "/" in shipped
             or not shipped.endswith(".json")
         ):
             raise AssertionError(
@@ -219,7 +377,11 @@ def test_unexpected_untracked_drop_fails_closed():
             try:
                 shipped_tracked_files()
             except AssertionError as exc:
+                # Both directions: the extra drop and a
+                # missing pinned drop are named, so an
+                # extra-only (missing-blind) check fails here.
                 assert "zz-unexpected-drop.txt" in str(exc), exc
+                assert "PKG-INFO" in str(exc), exc
             else:
                 raise AssertionError(
                     "unexpected drop went unscanned"
@@ -262,6 +424,126 @@ def test_wheel_pin_reader_ignores_nested_and_refuses_duplicates():
             pass
         else:
             raise AssertionError("duplicate pin accepted")
+
+
+def test_wheel_pin_reader_refuses_rebinding_forms():
+    # Only a single plain module-level assignment per pin
+    # is accepted: any other rebinding form (annotated,
+    # augmented, def/class, import, loop/with/except
+    # targets, walrus) fails loudly instead of silently
+    # diverging from the runtime value.
+    rebinding = (
+        "PINNED_PAYLOAD: tuple = (\"mojobpf/a.py\",)\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "PINNED_PAYLOAD += (\"mojobpf/b.py\",)\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "def PINNED_PAYLOAD():\n"
+        "    pass\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "class PINNED_PAYLOAD:\n"
+        "    pass\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "import os as PINNED_PAYLOAD\n",
+        "from os import path as PINNED_PAYLOAD\n"
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "for PINNED_PAYLOAD in []:\n"
+        "    pass\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "with open(\"x\") as PINNED_PAYLOAD:\n"
+        "    pass\n",
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "try:\n"
+        "    pass\n"
+        "except ValueError as PINNED_PAYLOAD:\n"
+        "    pass\n",
+        "y = (PINNED_PAYLOAD := (\"mojobpf/evil.py\",))\n"
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n",
+    )
+    schema = (
+        "PINNED_SCHEMA_DATA = "
+        "((\"s.schema.json\", \"s.schema.json\"),)\n"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-rebind-"
+    ) as parent:
+        for index, body in enumerate(rebinding):
+            path = os.path.join(
+                parent, "rebind_%d.py" % index
+            )
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body + schema)
+            try:
+                _read_wheel_pins(path)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(
+                    "rebinding form accepted: %r" % (body,)
+                )
+
+
+def test_wheel_pin_reader_multi_target_and_non_literal():
+    # A shared multi-target assignment binds every pin
+    # name; a non-literal value fails as AssertionError
+    # (never a bare literal_eval error).
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-pinform-"
+    ) as parent:
+        multi = os.path.join(parent, "multi_contract.py")
+        with open(multi, "w", encoding="utf-8") as handle:
+            handle.write(
+                "PINNED_PAYLOAD = PINNED_SCHEMA_DATA = "
+                "(\"shared\",)\n"
+            )
+        assert _read_wheel_pins(multi) == {
+            "PINNED_PAYLOAD": ("shared",),
+            "PINNED_SCHEMA_DATA": ("shared",),
+        }
+        dynamic = os.path.join(parent, "dyn_contract.py")
+        with open(dynamic, "w", encoding="utf-8") as handle:
+            handle.write(
+                "PINNED_PAYLOAD = list((\"mojobpf/a.py\",))\n"
+                "PINNED_SCHEMA_DATA = "
+                "((\"s.schema.json\", \"s.schema.json\"),)\n"
+            )
+        try:
+            _read_wheel_pins(dynamic)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("non-literal pin accepted")
+
+
+def test_schema_source_validation_rejects_escapes():
+    # Pinned schema sources must stay inside schemas/:
+    # only ".." path segments escape, so only they (plus
+    # absolute/empty/non-string/non-json spellings) fail.
+    # Harmless doppelgangers ("..foo", ".") stay allowed.
+    for good in (
+        "a.schema.json",
+        "sub/dir/b.schema.json",
+        "..foo.json",
+        "a/./b.schema.json",
+    ):
+        _validate_schema_source(good)
+    for bad in (
+        "../x.json",
+        "a/../../x.json",
+        "/abs.json",
+        "",
+        "x.txt",
+        None,
+        3,
+    ):
+        try:
+            _validate_schema_source(bad)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "bad schema source accepted: %r" % (bad,)
+            )
 
 
 def test_tracked_sources_carry_spdx_headers():

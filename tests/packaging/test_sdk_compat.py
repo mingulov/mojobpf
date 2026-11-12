@@ -580,6 +580,9 @@ def _checker_table():
     raise AssertionError("CHECKER_CASES not found in %s" % path)
 
 
+_ENTRY_SENTINEL = "\ndef entry() -> Int32:\n"
+
+
 def _probe_import_texts(probes):
     """Map each probe to its checker-row source text.
 
@@ -589,11 +592,39 @@ def _probe_import_texts(probes):
     """
     texts = []
     for _stem, source, _must_fail, _marker in probes:
-        head, sep, _rest = source.partition(
-            "\ndef entry() -> Int32:\n"
-        )
+        head, sep, _rest = source.partition(_ENTRY_SENTINEL)
         texts.append(head + "\n" if sep else source)
     return texts
+
+
+# Frozen frontend-backed row identity: the exact 21
+# checker-row texts the probes cover. Swapping one
+# frontend row for another same-expectation row would keep
+# every count/subset assert green while the unit header
+# went stale; this list fails such a swap for review.
+FROZEN_FRONTEND_TEXTS = (
+    'def entry() -> Int32:\n    var x = "a\\\nfrom mojobpf import _impl\\\nb"\n    return Int32(0)\n',
+    'from mojobpf . packet import XDP_PASS\n',
+    'from mojobpf._impl import x\n',
+    'from mojobpf.packet import (\n XDP_PASS,\n load_u8,\n)\n',
+    'from mojobpf.packet import BPF_ANY\n',
+    'from mojobpf.packet import XDP_PASS\n',
+    'from mojobpf.packet import \\\n XDP_PASS\n',
+    'from mojobpf.packet import _nope\n',
+    'from mojobpf.packet import load_u8 as lu8\n',
+    'from mojobpf.packet.sub import x\n',
+    'import mojobpf._impl, mojobpf.packet\n',
+    'import mojobpf.packet as pkt, mojobpf._impl as e\n',
+    'import mojobpf.packet, mojobpf . _impl\n',
+    'import mojobpf.packet, mojobpf . _impl as e\n',
+    'import mojobpf.packet, mojobpf . core\n',
+    'import mojobpf.packet, mojobpf . packet . sub\n',
+    'import mojobpf.packet, mojobpf._impl\n',
+    'import mojobpf.packet, mojobpf.core\n',
+    'import mojobpf.packet, std.random\n',
+    'import mojobpf.packet; from mojobpf._impl import x\n',
+    'import mojobpf.packet; import mojobpf.core\n',
+)
 
 
 def test_frontend_probes_cover_checker_rows_exactly():
@@ -601,13 +632,24 @@ def test_frontend_probes_cover_checker_rows_exactly():
     # with a consistent expectation, and no two probes may
     # share a row: exactly the 21 probe-backed rows may claim
     # frontend verification in the unit header, so the split
-    # cannot rot again.
+    # cannot rot again. The whole-source branch is pinned to
+    # the string-hide probe alone, and no import text may
+    # embed the driver sentinel.
     rows = _checker_table()
     table = dict(rows)
     assert len(table) == len(rows) == 56, len(rows)
+    whole = [
+        stem
+        for stem, source, _, _ in IMPORT_PROBES
+        if _ENTRY_SENTINEL not in source
+    ]
+    assert whole == ["compat_import_string_hide_ok"], whole
     texts = _probe_import_texts(IMPORT_PROBES)
+    for text in texts:
+        assert _ENTRY_SENTINEL not in text, text
     assert len(texts) == len(IMPORT_PROBES) == 21, len(texts)
     assert len(set(texts)) == len(texts), texts
+    assert sorted(texts) == sorted(FROZEN_FRONTEND_TEXTS)
     for (stem, _source, must_fail, _marker), text in zip(
         IMPORT_PROBES, texts
     ):

@@ -367,22 +367,50 @@ def test_validation_sources_sync():
 def _validate_schema_pin(pairs):
     """Split and validate the schema pin.
 
-    Returns (sources, flattened): duplicate sources or
-    flattened names are refused (a silent zip clobber), and
-    flattened names must stay flat (setuptools data-files
-    install by basename, so a ``/`` or ``..`` wheel name
-    could never be produced honestly).
+    Returns (sources, flattened). Malformed entries (not a
+    string pair) fail as AssertionError so the direct
+    runner accounts them as FAIL, never as a traceback.
+    Duplicate sources or flattened names are refused (a
+    silent zip clobber), and flattened names must stay
+    flat: setuptools data-files install by basename, so a
+    ``/``, backslash, ``..``, or drive-letter wheel name
+    could never be produced honestly.
     """
-    sources = [source for source, _ in pairs]
+    try:
+        entries = list(pairs)
+    except TypeError:
+        raise AssertionError(
+            "malformed schema pin: %r" % (pairs,)
+        )
+    sources = []
+    flattened = []
+    for entry in entries:
+        if (
+            not isinstance(entry, (tuple, list))
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not isinstance(entry[1], str)
+        ):
+            raise AssertionError(
+                "malformed schema pin entry: %r" % (entry,)
+            )
+        sources.append(entry[0])
+        flattened.append(entry[1])
     assert len(set(sources)) == len(sources), sources
-    flattened = [name for _, name in pairs]
     assert len(set(flattened)) == len(flattened), flattened
     for name in flattened:
         assert (
             name
             and "/" not in name
+            and "\\" not in name
             and name != "."
             and not name.startswith("..")
+            and not (
+                len(name) >= 2
+                and name[1] == ":"
+                and name[0].isalpha()
+                and name[0].isascii()
+            )
         ), name
     return sources, flattened
 
@@ -397,6 +425,8 @@ def test_schema_pin_validation_rejects_bad_entries():
         (("a.schema.json", ".."),),
         (("a.schema.json", "."),),
         (("a.schema.json", ""),),
+        (("a.schema.json", "a\\..\\b.schema.json"),),
+        (("a.schema.json", "C:x.schema.json"),),
         (
             ("a.schema.json", "dup.schema.json"),
             ("sub/b.schema.json", "dup.schema.json"),
@@ -412,6 +442,26 @@ def test_schema_pin_validation_rejects_bad_entries():
             pass
         else:
             raise AssertionError("bad pin accepted: %r" % (bad,))
+    for malformed in (
+        (("a.schema.json", "a.schema.json", "extra"),),
+        (("a.schema.json",),),
+        ("a.schema.json",),
+        ((None, "a.schema.json"),),
+        ((3, "a.schema.json"),),
+    ):
+        try:
+            _validate_schema_pin(malformed)
+        except AssertionError:
+            pass
+        except (ValueError, TypeError) as exc:
+            raise AssertionError(
+                "malformed pin escaped as %r: %r"
+                % (type(exc).__name__, malformed)
+            )
+        else:
+            raise AssertionError(
+                "malformed pin accepted: %r" % (malformed,)
+            )
 
 
 def test_schemas_shipped_byte_identical():

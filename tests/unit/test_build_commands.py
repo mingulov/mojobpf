@@ -7711,6 +7711,45 @@ def test_read_source_excerpt_read_and_close_failures_stay_best_effort():
         assert len(opened) == 4, opened
 
 
+def test_read_source_excerpt_open_failure_returns_none():
+    # The open-failure clause (nonexistent path, failing
+    # os.open) returns None; no descriptor exists yet, so
+    # there is nothing to leak or close. Also pins the
+    # lineno guard.
+    with tempfile.TemporaryDirectory(
+        prefix="build-excerpt-open-"
+    ) as parent:
+        missing = os.path.join(parent, "absent.mojo")
+        assert (
+            build_module._read_source_excerpt(missing, 1)
+            is None
+        )
+        target = os.path.join(parent, "source.mojo")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("one\n")
+        assert (
+            build_module._read_source_excerpt(target, 0)
+            is None
+        )
+        assert (
+            build_module._read_source_excerpt(target, -3)
+            is None
+        )
+        real_os_open = os.open
+
+        def failing_os_open(path, flags, *args, **kwargs):
+            raise OSError("injected open failure")
+
+        os.open = failing_os_open
+        try:
+            assert (
+                build_module._read_source_excerpt(target, 1)
+                is None
+            )
+        finally:
+            os.open = real_os_open
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
