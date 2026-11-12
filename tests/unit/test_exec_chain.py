@@ -13,6 +13,7 @@ repository root) or directly (``python3 tests/unit/test_exec_chain.py``).
 """
 
 from contextlib import contextmanager
+import dataclasses
 import os
 import shutil
 import sys
@@ -1042,6 +1043,43 @@ def test_hop_interpreter_swap_refuses_spawn():
         ), record
 
 
+def test_hop_interpreter_symlink_repoint_refuses_spawn():
+    # Same-realpath dedup must not drop a distinct interpreter
+    # path: a hop interpreter admitted through a symlink is
+    # watched by path, so repointing the link after admission
+    # refuses the spawn (round-5 MAJOR-1).
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hop-link-"
+    ) as parent:
+        link = os.path.join(parent, "linksh")
+        os.symlink("/bin/sh", link)
+        hop1 = os.path.join(parent, "hop1")
+        _write(hop1, "#!%s\nexec /bin/true\n" % link)
+        entry = os.path.join(parent, "entry")
+        _write(entry, "#!/bin/sh\nexec \"%s\" \"$@\"\n" % hop1)
+        request = execution_module.ExecutionRequest(
+            name="hop",
+            argv0=entry,
+            allow_path_lookup=False,
+            forms=(execution_module.FORM_EXEC_LAUNCHER,),
+        )
+        pins = execution_module.ExecutionPins(
+            exec_sha256=execution_module.sha256_file("/bin/true"),
+            exec_pin_present=True,
+        )
+        admitted = execution_module.admit_execution(request, pins)
+        marker = os.path.join(parent, "EVIL.marker")
+        evil = os.path.join(parent, "evil")
+        _write(evil, "#!/bin/sh\ntouch \"%s\"\n" % marker)
+        os.remove(link)
+        os.symlink(evil, link)
+        record = execution_module.run_admitted(admitted, ())
+        assert record.status == (
+            execution_module.STATUS_SPAWN_FAILED
+        ), record
+        assert not os.path.exists(marker), "repointed bytes executed"
+
+
 def test_hop_chain_without_swap_spawns_cleanly():
     # Control: the same two-hop chain spawns cleanly when
     # nothing drifts between admission and spawn.
@@ -1125,6 +1163,116 @@ def test_image_interpreter_swap_refuses_spawn():
         assert record.status == (
             execution_module.STATUS_SPAWN_FAILED
         ), record
+
+
+def test_identify_file_nul_byte_refuses_admission_error():
+    # An embedded NUL refuses as AdmissionError, not a raw
+    # ValueError from lstat: hostile bytes fail closed.
+    try:
+        execution_module.identify_file(
+            os.path.join("nope", "x\x00y")
+        )
+    except execution_module.AdmissionError as exc:
+        assert exc.reason in (
+            execution_module.REASON_NOT_FOUND,
+            execution_module.REASON_UNREADABLE,
+        ), exc
+    else:
+        raise AssertionError("NUL path identified")
+
+
+def _startup_console_admission_unpinned_modules(parent):
+    # Console admission with no pinned modules: python_path
+    # roots are still validated, never passed through blind.
+    request, pins = _startup_console_admission(parent, {})
+    return request, dataclasses.replace(pins, modules=())
+
+
+def test_admission_nul_root_refuses_admission_error():
+    # A root with an embedded NUL refuses, not ValueError.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-nul-root-"
+    ) as parent:
+        request, pins = _startup_console_admission_unpinned_modules(
+            parent
+        )
+        bad = dataclasses.replace(
+            pins,
+            python_path=(pins.python_path[0] + "\x00",),
+        )
+        try:
+            execution_module.admit_execution(request, bad)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_MODULE_NOT_FOUND
+            ), exc
+        else:
+            raise AssertionError("NUL root admitted")
+
+
+def test_admission_relative_root_refuses_admission_error():
+    # A relative root would resolve against the spawner's
+    # cwd: refused instead of passed to the spawn env.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-rel-root-"
+    ) as parent:
+        request, pins = _startup_console_admission_unpinned_modules(
+            parent
+        )
+        bad = dataclasses.replace(
+            pins,
+            python_path=("definitely/missing/relroot",),
+        )
+        try:
+            execution_module.admit_execution(request, bad)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_MODULE_NOT_FOUND
+            ), exc
+        else:
+            raise AssertionError("relative root admitted")
+
+
+def test_admission_missing_root_refuses_admission_error():
+    # A missing absolute root cannot be scanned or hashed:
+    # refused instead of passed to the spawn env.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-missing-root-"
+    ) as parent:
+        request, pins = _startup_console_admission_unpinned_modules(
+            parent
+        )
+        bad = dataclasses.replace(
+            pins,
+            python_path=(os.path.join(parent, "no-such-root"),),
+        )
+        try:
+            execution_module.admit_execution(request, bad)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_MODULE_NOT_FOUND
+            ), exc
+        else:
+            raise AssertionError("missing root admitted")
+
+
+def test_admission_nonstring_root_refuses_admission_error():
+    # A non-string root (hostile lock) refuses, not TypeError.
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-nonstr-root-"
+    ) as parent:
+        request, pins = _startup_console_admission_unpinned_modules(
+            parent
+        )
+        bad = dataclasses.replace(pins, python_path=(5,))
+        try:
+            execution_module.admit_execution(request, bad)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_MODULE_NOT_FOUND
+            ), exc
+        else:
+            raise AssertionError("non-string root admitted")
 
 
 def _direct_run():

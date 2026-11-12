@@ -26,7 +26,9 @@ tests/unit/test_matrix_runner.py``).
 import ast
 import importlib.util
 import json
+import importlib.machinery
 import os
+import py_compile
 import shutil
 import signal
 import subprocess
@@ -1333,11 +1335,667 @@ def test_parent_package_shadow_refused_without_marker():
         shutil.rmtree(tree["root"], ignore_errors=True)
 
 
+def _write_shadow_package_pyc(package_dir, marker):
+    """Stage a legacy-layout sourceless ``__init__.pyc`` shadow.
+
+    Compiles a marker-emitting module and places the bytecode as
+    ``package_dir/__init__.pyc`` (no source beside it), which the
+    import system loads via SourcelessFileLoader.
+    """
+    os.makedirs(package_dir, exist_ok=True)
+    target = os.path.join(package_dir, "__init__.pyc")
+    src = os.path.join(package_dir, "_stage_src.py")
+    _write_shadow_module(src, marker)
+    try:
+        py_compile.compile(src, cfile=target, doraise=True)
+    finally:
+        if os.path.exists(src):
+            os.unlink(src)
+    return target
+
+
+def _find_extension_donor():
+    """Return a loadable stdlib extension path, or None."""
+    for name in ("_datetime", "_socket", "math", "_struct"):
+        spec = importlib.util.find_spec(name)
+        if spec and spec.origin and spec.origin.endswith(".so"):
+            return spec.origin
+    return None
+
+
+def _write_shadow_package_ext_so(package_dir):
+    """Stage an ``__init__.<ext>.so`` shadow from a real extension.
+
+    Copies a loadable standard-library extension under the
+    platform's first extension suffix so the file finder selects
+    it. Skips when this host links extensions statically.
+    """
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    os.makedirs(package_dir, exist_ok=True)
+    target = os.path.join(package_dir, "__init__" + suffix)
+    donor = _find_extension_donor()
+    if donor is None:
+        import pytest
+
+        pytest.skip("no loadable stdlib extension on this host")
+    shutil.copyfile(donor, target)
+    return target
+
+
+def _write_shadow_module_ext_so(directory, stem):
+    """Stage a ``stem.<ext>.so`` shadow from a real extension.
+
+    Copies a loadable standard-library extension beside the
+    verified source so the file finder selects the extension.
+    Skips when this host links extensions statically.
+    """
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    os.makedirs(directory, exist_ok=True)
+    target = os.path.join(directory, stem + suffix)
+    donor = _find_extension_donor()
+    if donor is None:
+        import pytest
+
+        pytest.skip("no loadable stdlib extension on this host")
+    shutil.copyfile(donor, target)
+    return target
+
+
+def _find_spec_origin(dotted, roots):
+    """Resolve a module spec origin in a hermetic subprocess.
+
+    Reports what the import system would select for ``dotted``
+    under exactly ``roots`` (``-P`` keeps the current directory
+    out), without importing it.
+    """
+    lines = ["import sys", "import importlib.util"]
+    for root in reversed(roots):
+        lines.append("sys.path.insert(0, %r)" % (root,))
+    lines.append(
+        "print(importlib.util.find_spec(%r).origin)" % (dotted,)
+    )
+    proc = subprocess.run(
+        [sys.executable, "-P", "-c", "\n".join(lines)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+        env=dict(os.environ),
+    )
+    assert proc.returncode == 0, proc.stderr.decode()[-500:]
+    return proc.stdout.decode().strip()
+
+
+def _run_entry_with_path(entry, roots):
+    """Run a console entry with exactly the given PYTHONPATH."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(roots)
+    return subprocess.run(
+        [entry],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+        env=env,
+    )
+
+
+def test_stdlib_shadow_package_init_pyc_refused_without_marker():
+    """A json/__init__.pyc on a declared root shadows the stdlib
+    (sourceless bytecode imports as the package), so the root is
+    refused at static admission with module-mismatch and no
+    marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_JSON_PYC.marker")
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_package_pyc(os.path.join(evil, "json"), marker)
+    lock = _pinned_runner_lock(tree)
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    # Positive control: the sourceless package wins selection.
+    assert _import_with_path("import json", [evil]) == 0
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadows the admitted interpreter's" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_stdlib_shadow_package_init_ext_so_refused():
+    """A json/__init__.<ext>.so on a declared root diverts import
+    selection away from the verified stdlib, so the root is
+    refused at static admission with module-mismatch before any
+    probe executes."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_package_ext_so(os.path.join(evil, "json"))
+    lock = _pinned_runner_lock(tree)
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadows the admitted interpreter's" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_earlier_root_shadow_package_init_pyc_refused_without_marker():
+    """A parent package shadowed as __init__.pyc on an earlier
+    root hijacks the pinned submodule: the submodule's bytes
+    verify on the later root, but the interpreter would select
+    the sourceless parent (and fail the submodule beneath it)
+    from the earlier root. Refused with module-mismatch and no
+    marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_PARENT_PYC.marker")
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_package_pyc(
+        os.path.join(evil, "matrix_vng_pkg"), marker
+    )
+    lock = _pinned_runner_lock(tree)
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    # Pin only the submodule: its bytes verify on the later
+    # root while the shadowed parent escapes a leaf-only check.
+    modules = lock["runner"]["package"]["modules"]
+    del modules["matrix_vng_pkg"]
+    # Positive control: the earlier root wins the parent.
+    assert _import_with_path(
+        "import matrix_vng_pkg", [evil, tree["pkgdir"]]
+    ) == 0
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_same_root_extension_module_beats_verified_source_refused():
+    """A run.<ext>.so beside the verified run.py wins import
+    selection (extensions beat source), so the pinned module is
+    refused before any probe with module-mismatch."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    _write_shadow_module_ext_so(tree["package"], "run")
+    lock = _pinned_runner_lock(tree)
+    # Positive control: the file finder selects the extension.
+    origin = _find_spec_origin(
+        "matrix_vng_pkg.run", [tree["pkgdir"]]
+    )
+    assert origin.endswith(".so"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_same_root_extension_init_beats_verified_init_refused():
+    """An __init__.<ext>.so beside the verified __init__.py wins
+    import selection, so the pinned package is refused before
+    any probe with module-mismatch."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    _write_shadow_package_ext_so(tree["package"])
+    lock = _pinned_runner_lock(tree)
+    # Positive control: the file finder selects the extension.
+    origin = _find_spec_origin("matrix_vng_pkg", [tree["pkgdir"]])
+    assert origin.endswith(".so"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_same_root_package_beats_verified_module_refused_without_marker():
+    """A run/ package beside the verified run.py wins import
+    selection (packages beat modules), so the pinned module is
+    refused before any probe with module-mismatch and the
+    shadow main never executes."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_RUN_PKG.marker")
+    run_pkg = os.path.join(tree["package"], "run")
+    os.makedirs(run_pkg)
+    with open(os.path.join(run_pkg, "__init__.py"), "w") as handle:
+        handle.write(
+            "open(%r, 'w').write('shadow')\n"
+            "def main():\n"
+            "    print(%r)\n"
+            "    return 0\n" % (marker, _VNG_FIXTURE_VERSION)
+        )
+    lock = _pinned_runner_lock(tree)
+    # Positive control: a spawn executes the shadow package.
+    proc = _run_entry_with_path(tree["entry"], [tree["pkgdir"]])
+    assert proc.returncode == 0, proc.stderr.decode()[-500:]
+    assert _VNG_FIXTURE_VERSION in proc.stdout.decode()
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_same_root_sourceless_parent_shadow_refused_without_marker():
+    """A parent kept only as __init__.pyc executes unadmitted
+    bytecode on every import of the pinned submodule beneath
+    it, so admission is refused before any probe with
+    module-mismatch and no marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_SAME_PARENT.marker")
+    lock = _pinned_runner_lock(tree)
+    os.unlink(os.path.join(tree["package"], "__init__.py"))
+    _write_shadow_package_pyc(tree["package"], marker)
+    # Pin only the submodule: its bytes verify while the
+    # sourceless parent escapes a leaf-only check.
+    modules = lock["runner"]["package"]["modules"]
+    del modules["matrix_vng_pkg"]
+    # Positive control: a spawn executes the shadow parent,
+    # then the verified submodule beneath it.
+    proc = _run_entry_with_path(tree["entry"], [tree["pkgdir"]])
+    assert proc.returncode == 0, proc.stderr.decode()[-500:]
+    assert _VNG_FIXTURE_VERSION in proc.stdout.decode()
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_same_root_losing_siblings_still_admit():
+    """Siblings that lose import selection change nothing: legacy
+    bytecode beside verified source, and a module extension
+    beside a verified package, all lose, so admission still
+    succeeds."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    for stem in ("run", "__init__"):
+        src = os.path.join(tree["package"], "_benign_%s.py" % stem)
+        with open(src, "w") as handle:
+            handle.write("VALUE = 1\n")
+        try:
+            py_compile.compile(
+                src,
+                cfile=os.path.join(
+                    tree["package"], stem + ".pyc"
+                ),
+                doraise=True,
+            )
+        finally:
+            os.unlink(src)
+    # Positive control: source still wins over the bytecode.
+    origin = _find_spec_origin(
+        "matrix_vng_pkg.run", [tree["pkgdir"]]
+    )
+    assert origin.endswith("run.py"), origin
+    _write_shadow_module_ext_so(tree["pkgdir"], "matrix_vng_pkg")
+    # Positive control: the package still wins over the module
+    # extension.
+    origin = _find_spec_origin("matrix_vng_pkg", [tree["pkgdir"]])
+    assert origin.endswith("__init__.py"), origin
+    lock = _pinned_runner_lock(tree)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        record = runner.check_runner(
+            lock, farm_parent=tree["root"]
+        )
+        shutil.rmtree(record["farm"], ignore_errors=True)
+        assert record["version"] == _VNG_FIXTURE_VERSION, record
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_same_root_extension_init_refused():
+    """An __init__.<ext>.so beside the RECORD-verified
+    __init__.py wins import selection, so the distribution is
+    refused before any probe with module-mismatch."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    lock = _lock_with_distribution(tree, _fixture_distribution(tree))
+    _write_shadow_package_ext_so(
+        os.path.join(tree["pkgdir"], "matrix_dep")
+    )
+    # Positive control: the file finder selects the extension.
+    origin = _find_spec_origin("matrix_dep", [tree["pkgdir"]])
+    assert origin.endswith(".so"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_same_root_losing_siblings_still_admit():
+    """Siblings that lose import selection change nothing: a
+    module source, module bytecode and module extension beside
+    a RECORD-verified package all lose to the package, so
+    admission still succeeds."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    lock = _lock_with_distribution(tree, _fixture_distribution(tree))
+    with open(
+        os.path.join(tree["pkgdir"], "matrix_dep.py"), "w"
+    ) as handle:
+        handle.write("VALUE = 2\n")
+    src = os.path.join(tree["pkgdir"], "_benign_dep.py")
+    with open(src, "w") as handle:
+        handle.write("VALUE = 3\n")
+    try:
+        py_compile.compile(
+            src,
+            cfile=os.path.join(
+                tree["pkgdir"], "matrix_dep.pyc"
+            ),
+            doraise=True,
+        )
+    finally:
+        os.unlink(src)
+    _write_shadow_module_ext_so(tree["pkgdir"], "matrix_dep")
+    # Positive control: the verified package still wins.
+    origin = _find_spec_origin("matrix_dep", [tree["pkgdir"]])
+    assert origin.endswith("__init__.py"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        record = runner.check_runner(
+            lock, farm_parent=tree["root"]
+        )
+        shutil.rmtree(record["farm"], ignore_errors=True)
+        assert record["version"] == _VNG_FIXTURE_VERSION, record
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_sourceless_verified_beaten_by_source_refused():
+    """A RECORD-verified legacy .pyc loses import selection to a
+    same-stem .py source, so the distribution is refused before
+    any probe: the verified bytecode would never execute."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    stage_src = os.path.join(tree["root"], "_smod_stage.py")
+    with open(stage_src, "w") as handle:
+        handle.write("VALUE = 1\n")
+    stage_pyc = os.path.join(tree["root"], "_smod_stage.pyc")
+    py_compile.compile(stage_src, cfile=stage_pyc, doraise=True)
+    with open(stage_pyc, "rb") as handle:
+        pyc_bytes = handle.read()
+    os.unlink(stage_src)
+    os.unlink(stage_pyc)
+    metadata_digest, record_digest = _write_dep_dist(
+        tree["pkgdir"],
+        "matrix_smod",
+        "1.0",
+        {"matrix_smod.pyc": pyc_bytes},
+    )
+    lock = _pinned_runner_lock(tree)
+    lock["distribution"] = {
+        "runner": {
+            "dependencies": [
+                {
+                    "name": "matrix_smod",
+                    "version": "1.0",
+                    "metadata_sha256": metadata_digest,
+                    "record_sha256": record_digest,
+                },
+            ],
+        },
+        "emulator": {"qemu_version": _QEMU_FIXTURE_VERSION},
+    }
+    with open(
+        os.path.join(tree["pkgdir"], "matrix_smod.py"), "w"
+    ) as handle:
+        handle.write("VALUE = 2\n")
+    # Positive control: the source wins over the verified
+    # bytecode.
+    assert _import_with_path(
+        "import matrix_smod, sys; "
+        "sys.exit(0 if matrix_smod.VALUE == 2 else 1)",
+        [tree["pkgdir"]],
+    ) == 0
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_later_root_namespace_fallback_shadow_refused_without_marker():
+    """A bare parent on the verified root falls back to a later
+    root's regular package (regular beats namespace portions),
+    so the pinned submodule's verified bytes never execute: a
+    later root carrying the parent is refused with
+    module-mismatch and no marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_FALLBACK.marker")
+    lock = _pinned_runner_lock(tree)
+    # Bare the verified parent: no regular spelling remains.
+    os.unlink(os.path.join(tree["package"], "__init__.py"))
+    modules = lock["runner"]["package"]["modules"]
+    del modules["matrix_vng_pkg"]
+    later = os.path.join(tree["root"], "later")
+    later_pkg = os.path.join(later, "matrix_vng_pkg")
+    os.makedirs(later_pkg)
+    with open(os.path.join(later_pkg, "__init__.py"), "w") as handle:
+        handle.write("")
+    with open(os.path.join(later_pkg, "run.py"), "w") as handle:
+        handle.write(
+            "open(%r, 'w').write('shadow')\n"
+            "def main():\n"
+            "    print(%r)\n"
+            "    return 0\n" % (marker, _VNG_FIXTURE_VERSION)
+        )
+    lock["runner"]["python_path"] = [tree["pkgdir"], later]
+    # Positive control: the later root wins through fallback.
+    proc = _run_entry_with_path(
+        tree["entry"], [tree["pkgdir"], later]
+    )
+    assert proc.returncode == 0, proc.stderr.decode()[-500:]
+    assert _VNG_FIXTURE_VERSION in proc.stdout.decode()
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_later_root_namespace_fallback_refused():
+    """A RECORD-verified leaf under a bare parent falls back to
+    a later root's regular package, so the distribution is
+    refused before any probe with module-mismatch."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    metadata_digest, record_digest = _write_dep_dist(
+        tree["pkgdir"],
+        "matrix_dep",
+        "1.0",
+        {"matrix_dep/sub.py": "VALUE = 1\n"},
+    )
+    lock = _pinned_runner_lock(tree)
+    lock["distribution"] = {
+        "runner": {
+            "dependencies": [
+                {
+                    "name": "matrix_dep",
+                    "version": "1.0",
+                    "metadata_sha256": metadata_digest,
+                    "record_sha256": record_digest,
+                },
+            ],
+        },
+        "emulator": {"qemu_version": _QEMU_FIXTURE_VERSION},
+    }
+    later = os.path.join(tree["root"], "later")
+    later_pkg = os.path.join(later, "matrix_dep")
+    os.makedirs(later_pkg)
+    with open(os.path.join(later_pkg, "__init__.py"), "w") as handle:
+        handle.write("")
+    with open(os.path.join(later_pkg, "sub.py"), "w") as handle:
+        handle.write("VALUE = 2\n")
+    lock["runner"]["python_path"] = [tree["pkgdir"], later]
+    # Positive control: the later root wins through fallback.
+    assert _import_with_path(
+        "import matrix_dep.sub, sys; "
+        "sys.exit(0 if matrix_dep.sub.VALUE == 2 else 1)",
+        [tree["pkgdir"], later],
+    ) == 0
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_shadow_package_init_pyc_refused_without_marker():
+    """A matrix_dep/__init__.pyc on an earlier root is caught on
+    the distribution path: the record-derived stem carries the
+    __init__ leaf, so the legacy bytecode spelling refuses with
+    module-mismatch before any probe and no marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_DIST_PYC.marker")
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_package_pyc(
+        os.path.join(evil, "matrix_dep"), marker
+    )
+    lock = _lock_with_distribution(tree, _fixture_distribution(tree))
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    # Positive control: the earlier root wins import selection.
+    assert _import_with_path(
+        "import matrix_dep", [evil, tree["pkgdir"]]
+    ) == 0
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_shadow_package_init_ext_so_refused():
+    """A matrix_dep/__init__.<ext>.so on an earlier root is
+    caught on the distribution path: the record-derived stem
+    carries the __init__ leaf, so the extension spelling
+    refuses with module-mismatch before any probe."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_package_ext_so(os.path.join(evil, "matrix_dep"))
+    lock = _lock_with_distribution(tree, _fixture_distribution(tree))
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_earlier_root_shadow_package_init_ext_so_refused():
+    """A parent package shadowed as __init__.<ext>.so on an
+    earlier root diverts import selection away from the verified
+    submodule bytes, so admission is refused before any probe
+    with module-mismatch."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_package_ext_so(
+        os.path.join(evil, "matrix_vng_pkg")
+    )
+    lock = _pinned_runner_lock(tree)
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    # Pin only the submodule: its bytes verify on the later
+    # root while the shadowed parent escapes a leaf-only check.
+    modules = lock["runner"]["package"]["modules"]
+    del modules["matrix_vng_pkg"]
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
 def _write_dep_dist(pkgdir, name, version, files):
     """Stage a fixture distribution; return (metadata, record) digests.
 
     ``files`` maps root-relative paths (``pkg/__init__.py``) to
-    text content. Writes the package files, the ``.dist-info``
+    text content, or bytes for binary entries (``.pyc``,
+    ``.so``). Writes the package files, the ``.dist-info``
     with ``METADATA``, and a ``RECORD`` manifest with real
     per-file hashes plus its own empty-hash self entry.
     """
@@ -1350,8 +2008,12 @@ def _write_dep_dist(pkgdir, name, version, files):
     for rel, text in files.items():
         path = os.path.join(pkgdir, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        if isinstance(text, bytes):
+            with open(path, "wb") as handle:
+                handle.write(text)
+        else:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
         staged[rel] = path
     metadata_rel = "%s/METADATA" % dist_info
     metadata = os.path.join(pkgdir, metadata_rel)
@@ -3106,6 +3768,88 @@ def test_runner_docstring_discloses_pinned_exclusions():
     doc = runner.__doc__ or ""
     assert "LANE_SUITE_EXCLUSIONS" in doc, doc
     assert "Skips never occur" not in doc, doc
+
+
+def test_main_refuses_empty_board_when_all_cells_excluded():
+    # Every (lane, suite) cell pinned-excluded: main writes the
+    # empty board and refuses it (EXIT_SETUP), never a vacuous
+    # pass. Heavy setup (git/qemu/suites) is stubbed on the
+    # fresh module; the verdict branch is real.
+    import contextlib
+    import io
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-empty-board-")
+    try:
+        lock = _lock(
+            [
+                _lane(lane_id="solo-a", release="v9.1"),
+                _lane(lane_id="solo-b", release="v9.2"),
+            ]
+        )
+        lock_path = os.path.join(workdir, "lock.json")
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(lock, handle)
+        out_dir = os.path.join(workdir, "out")
+        all_suites = tuple(
+            suite_id for suite_id, _, _ in runner.SUITES
+        )
+        assert all_suites, "SUITES fixture empty"
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                "suite ran despite full exclusion"
+            )
+
+        runner.git_head = lambda: "abc123"
+        runner.git_clean = lambda: ""
+        runner.check_runner = lambda *a, **k: {
+            "farm": os.path.join(workdir, "farm"),
+            "version": "virtme-ng test",
+            "realpath": "/nonexistent/vng",
+            "digest": "d" * 64,
+            "qemu_binary": "qemu-test",
+            "qemu_path": "/nonexistent/qemu",
+            "qemu_version": "QEMU test",
+            "virtme_run_path": "/nonexistent/virtme-run",
+            "virtme_run_version": "virtme-run test",
+        }
+        runner.check_lane_cache = lambda lane: {}
+        runner.check_consumer_vng_shadow = lambda *a, **k: None
+        runner.check_consumer_qemu_shadow = lambda *a, **k: None
+        runner.check_consumer_virtme_run_shadow = (
+            lambda *a, **k: None
+        )
+        runner.run_suite = _boom
+        runner.runner_report = lambda value: {"stubbed": True}
+        runner.LANE_SUITE_EXCLUSIONS = {
+            "solo-a": all_suites,
+            "solo-b": all_suites,
+        }
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = runner.main(
+                ["--lock", lock_path, "--out-dir", out_dir]
+            )
+        text = stdout.getvalue()
+        assert code == runner.EXIT_SETUP, (code, text)
+        assert "refusing an empty board" in text, text
+        assert "(%d pinned-excluded cells)" % (
+            2 * len(all_suites)
+        ) in text, text
+        with open(
+            os.path.join(out_dir, "matrix-report.json"),
+            encoding="utf-8",
+        ) as handle:
+            report = json.load(handle)
+        assert report["results"] == [], report
+        assert [lane["id"] for lane in report["lanes"]] == [
+            "solo-a",
+            "solo-b",
+        ], report
+        print("PASS main refuses the empty board")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _direct_names():

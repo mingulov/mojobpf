@@ -19,6 +19,7 @@ tests/unit/test_inspect_btf.py``).
 import os
 import struct
 import sys
+import tempfile
 
 sys.path.insert(
     0,
@@ -515,6 +516,198 @@ def test_duplicate_member_refused():
         assert "duplicate" in exc.explanation, exc.explanation
     else:
         raise AssertionError("duplicate member parsed")
+
+
+PROFILE = "linux-bpfel-v3"
+
+
+def _trivial_blob():
+    """A parseable BTF blob carrying no types at all."""
+    header = struct.pack(
+        "<HBBIIIII", 0xEB9F, 1, 0, 24, 0, 0, 0, 1
+    )
+    return header + b"\x00"
+
+
+def _elf_image(named_contents):
+    """Build a minimal 64-bit little-endian relocatable object.
+
+    ``named_contents`` is a [(name, bytes)] list in section
+    order (duplicate names allowed); every section is
+    PROGBITS. Returns the image bytes.
+    """
+    contents = [
+        (name, bytes(content)) for name, content in named_contents
+    ]
+    strtab = b"\x00"
+    name_offs = []
+    for name, _content in contents:
+        name_offs.append(len(strtab))
+        strtab += name.encode("ascii") + b"\x00"
+    shstr_off = len(strtab)
+    strtab += b".shstrtab\x00"
+    offset = 64
+    rows = []
+    body = bytearray()
+    for (_name, content), name_off in zip(contents, name_offs):
+        rows.append((name_off, offset, len(content)))
+        body += content
+        offset += len(content)
+    str_off = offset
+    body += strtab
+    offset += len(strtab)
+    shoff = offset
+    table = bytearray(b"\x00" * 64)
+    for name_off, sec_off, size in rows:
+        table += struct.pack(
+            "<IIQQQQIIQQ", name_off, 1, 0, 0, sec_off, size,
+            0, 0, 1, 0,
+        )
+        offset += 64
+    header = bytearray(64)
+    header[0:4] = b"\x7fELF"
+    header[4] = 2
+    header[5] = 1
+    header[6] = 1
+    struct.pack_into("<HHI", header, 16, 1, 247, 1)
+    struct.pack_into("<Q", header, 40, shoff)
+    str_index = len(rows) + 1
+    table += struct.pack(
+        "<IIQQQQIIQQ", shstr_off, 3, 0, 0, str_off,
+        len(strtab), 0, 0, 1, 0,
+    )
+    struct.pack_into(
+        "<HHH", header, 58, 64, len(rows) + 2, str_index
+    )
+    return bytes(header) + bytes(body) + bytes(table)
+
+
+def _write_image(image):
+    fd, path = tempfile.mkstemp(suffix=".bpf.o")
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(image)
+    return path
+
+
+def test_duplicate_btf_sections_refused_by_inspection():
+    # Two .BTF sections would split first-vs-last readers, so
+    # inspection fails the object closed instead of picking one.
+    image = _elf_image([
+        (".BTF", _trivial_blob()),
+        (".BTF", _trivial_blob()),
+        (".maps", b"\x00" * 32),
+    ])
+    path = _write_image(image)
+    try:
+        report = inspect_module.inspect_object(path, PROFILE)
+    finally:
+        os.remove(path)
+    assert any(
+        "duplicate" in item.explanation
+        for item in report.structural
+    ), [item.code for item in report.structural]
+
+
+def test_duplicate_btf_sections_refused_by_map_specs():
+    image = _elf_image([
+        (".BTF", _trivial_blob()),
+        (".BTF", _trivial_blob()),
+    ])
+    path = _write_image(image)
+    try:
+        inspect_module.object_map_specs(path)
+    except inspect_module.InspectionError as exc:
+        assert exc.diagnostic.code == "MBPF402", exc.diagnostic
+        assert "duplicate" in exc.diagnostic.explanation, (
+            exc.diagnostic
+        )
+    else:
+        raise AssertionError("duplicate .BTF sections accepted")
+    finally:
+        os.remove(path)
+
+
+def test_duplicate_btf_sections_refused_by_value_sizes():
+    image = _elf_image([
+        (".BTF", _trivial_blob()),
+        (".BTF", _trivial_blob()),
+    ])
+    path = _write_image(image)
+    try:
+        inspect_module.object_map_value_sizes(path)
+    except inspect_module.InspectionError as exc:
+        assert exc.diagnostic.code == "MBPF402", exc.diagnostic
+        assert "duplicate" in exc.diagnostic.explanation, (
+            exc.diagnostic
+        )
+    else:
+        raise AssertionError("duplicate .BTF sections accepted")
+    finally:
+        os.remove(path)
+
+
+def test_map_key_sizes_resolve_declared_bounds():
+    image = _elf_image([(".BTF", _valid_blob())])
+    path = _write_image(image)
+    try:
+        sizes = inspect_module.object_map_key_sizes(path)
+    finally:
+        os.remove(path)
+    assert sizes == {"mojobpf_map0": 4}, sizes
+
+
+def test_duplicate_btf_sections_refused_by_key_sizes():
+    image = _elf_image([
+        (".BTF", _trivial_blob()),
+        (".BTF", _trivial_blob()),
+    ])
+    path = _write_image(image)
+    try:
+        inspect_module.object_map_key_sizes(path)
+    except inspect_module.InspectionError as exc:
+        assert exc.diagnostic.code == "MBPF402", exc.diagnostic
+        assert "duplicate" in exc.diagnostic.explanation, (
+            exc.diagnostic
+        )
+    else:
+        raise AssertionError("duplicate .BTF sections accepted")
+    finally:
+        os.remove(path)
+
+
+def _dup_var_blob():
+    """A maps blob whose DATASEC lists the same VAR twice."""
+    blob, offsets = _blob_and_offsets()
+    (type_len,) = struct.unpack_from("<I", blob, 16)
+    types_end = 24 + type_len
+    patched = (
+        blob[:types_end]
+        + struct.pack("<III", 11, 0, 32)
+        + blob[types_end:]
+    )
+    rec_info_at = 24 + offsets["datasec_entry"] - 12 + 4
+    patched = _patch(
+        patched, rec_info_at, struct.pack("<I", (15 << 24) | 2)
+    )
+    patched = _patch(
+        patched, 12, struct.pack("<I", type_len + 12)
+    )
+    return _patch(
+        patched, 16, struct.pack("<I", type_len + 12)
+    )
+
+
+def test_duplicate_var_refused():
+    # A repeated VAR name overwrites silently in a dict, so the
+    # parser refuses: the winning attribute set would otherwise
+    # depend on entry order.
+    try:
+        inspect_module._parse_btf_map_attrs(_dup_var_blob(), PATH)
+    except inspect_module._ElfError as exc:
+        assert exc.code == "MBPF402", exc.code
+        assert "duplicate" in exc.explanation, exc.explanation
+    else:
+        raise AssertionError("duplicate VAR parsed")
 
 
 def _direct_names():

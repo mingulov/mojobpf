@@ -534,6 +534,34 @@ def test_size_budget_conforms():
     _assert_union_covered(schema, [accepted], "size-budget")
 
 
+def test_every_schema_file_has_conformance_coverage():
+    # Closed sweep: every schemas/*.schema.json must be loaded
+    # by a conformance test above (via _load_schema), so a new
+    # schema file without a test fails here, never silently.
+    import ast
+
+    with open(__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    covered = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_load_schema"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            covered.add(node.args[0].value)
+    on_disk = sorted(
+        entry[: -len(".schema.json")]
+        for entry in os.listdir(SCHEMAS)
+        if entry.endswith(".schema.json")
+    )
+    assert on_disk, "no schemas found"
+    missing = [name for name in on_disk if name not in covered]
+    assert not missing, missing
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

@@ -208,9 +208,9 @@ does not parse under 1.0.0: it uses the 1.1
 decorator-argument spelling `@inline(.always)` in every
 module, which the older parser rejects, so every
 SDK-importing external source fails at the frontend
-(95 files: 80 tests + 15 examples; 96 counting the
+(151 files: 127 tests + 24 examples; 152 counting the
 SDK's own self-import). That count is a source
-inventory, not 95 individually observed
+inventory, not 151 individually observed
 compilations: every SDK module uses the spelling,
 so any SDK import transitively fails at parse.
 Build-driver paths additionally refuse the unpinned compiler

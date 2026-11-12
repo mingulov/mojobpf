@@ -7,13 +7,19 @@ no host load, run, or attach commands)::
     mojobpf build --manifest mojobpf.toml --out-dir build \\
         [--adapter adapter_service.py] [--lockfile lock.json]
         [--save-temps]
-    mojobpf check --manifest mojobpf.toml [--lockfile lock.json] [--json]
+    mojobpf check --manifest mojobpf.toml [--adapter adapter_service.py]
+        [--lockfile lock.json] [--json]
     mojobpf doctor [--lockfile lock.json] [--json]
-    mojobpf inspect --object prog.bpf.o [--profile linux-bpfel-v3]
-        [--source-license S --kernel-license K] [--json]
-    mojobpf verify --kernel --object prog.bpf.o [--release v6.12]
-        [--prog-type xdp] [--timeout SECS] [--kernels-lock lock.json]
-        [--keep-evidence] [--json]
+    mojobpf inspect [--object prog.bpf.o | prog.bpf.o]
+        [--profile linux-bpfel-v3] [--source-license S --kernel-license K]
+        [--json] [--report-only]
+    mojobpf verify --kernel [--object prog.bpf.o | prog.bpf.o]
+        [--release RELEASE] [--accelerator tcg|kvm] [--vng PATH]
+        [--kernels-lock lock.json] [--keep-evidence]
+        [--pin-path PATH] [--prog-type xdp] [--map-type TYPE]...
+        [--trace-event CAT:NAME] [--require-btf auto|yes|no]
+        [--kernel-btf PATH] [--as-user USER] [--timeout SECS]
+        [--output PATH] [--json]
     mojobpf test --suite SUITE [--suite-path DIR] [--require-kernel]
 
 ``build`` compiles every program in the manifest through the reusable
@@ -708,11 +714,11 @@ def _command_test(args) -> int:
                 "guest runner on PATH (--require-kernel)\n"
             )
             return EXIT_ENVIRONMENT
-        sys.stdout.write(
+        sys.stderr.write(
             "mojobpf test: suite 'kernel' skipped: vng guest "
             "runner not on PATH\n"
         )
-        return EXIT_OK
+        return EXIT_ENVIRONMENT
     try:
         import pytest  # noqa: F401
     except ImportError:

@@ -2843,6 +2843,30 @@ def _adapter_ran_local(result):
     )
 
 
+def test_unreadable_lockfile_refuses_adapter():
+    # An explicit lockfile that cannot be parsed refuses the
+    # adapter outright (MBPF104): admission never proceeds
+    # unpinned when pinning was requested.
+    parent = tempfile.mkdtemp(prefix="unreadable-lock-")
+    try:
+        lock = os.path.join(parent, "toolchains.lock.json")
+        with open(lock, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        diagnostics = []
+        execution, trust = build_module.admit_adapter(
+            build_module.default_adapter_path(), lock, diagnostics
+        )
+        assert execution is None, trust
+        assert [item.code for item in diagnostics] == ["MBPF104"], (
+            diagnostics
+        )
+        assert "lockfile" in diagnostics[0].explanation, (
+            diagnostics[0]
+        )
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def test_lockfile_without_adapter_pins_refuses_default():
     # A supplied lockfile without adapter pins refuses the default
     # adapter outright (MBPF104): warnings never substitute for
@@ -6736,6 +6760,20 @@ def test_test_missing_suite_is_usage_error():
     assert code == cli_module.EXIT_USAGE
 
 
+def test_test_kernel_skip_without_capability_is_environment_error():
+    parent = tempfile.mkdtemp(prefix="cli-test-kernelskip-")
+    root = os.path.join(parent, "tests")
+    _write_fixture_suite(root, "kernel")
+    empty = tempfile.mkdtemp(prefix="empty-path-", dir=parent)
+    code, _, err = run_cli(
+        ["test", "--suite", "kernel", "--suite-path", root],
+        path=empty,
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT, err
+    assert "skipped" in err
+    assert "vng" in err
+
+
 def test_test_kernel_require_without_capability_is_environment_error():
     parent = tempfile.mkdtemp(prefix="cli-test-kernel-")
     root = os.path.join(parent, "tests")
@@ -7135,6 +7173,235 @@ def test_check_routes_environment_failure_to_environment():
         cli_module.build_project = real
     assert code == cli_module.EXIT_ENVIRONMENT
     assert "MBPF102" in err
+
+
+_MAP_BTF_STRINGS = (
+    b"\x00.maps\x00mojobpf_map0\x00type\x00key_size\x00"
+    b"value_size\x00max_entries\x00"
+)
+_MAP_BTF_OFF = {
+    "maps": 1,
+    "var": 7,
+    "type": 20,
+    "key_size": 25,
+    "value_size": 34,
+    "max_entries": 45,
+}
+
+
+def _maps_btf_blob(key_size, value_size=8, entries=1,
+                   map_type=2):
+    """Build a legacy-spelling map-attribute BTF blob."""
+    types = bytearray()
+    types += struct.pack("<III", 0, (1 << 24) | 0, 4)
+    types += struct.pack("<I", 0x01000020)
+    ptr_ids = []
+    next_id = 2
+    for bound in (map_type, key_size, value_size, entries):
+        types += struct.pack("<III", 0, (3 << 24) | 0, 0)
+        types += struct.pack("<III", 1, 1, bound)
+        array_id = next_id
+        next_id += 1
+        types += struct.pack("<III", 0, (2 << 24) | 0, array_id)
+        ptr_ids.append(next_id)
+        next_id += 1
+    types += struct.pack("<III", 0, (4 << 24) | 4, 0)
+    for (name, bit_off), type_id in zip(
+        (
+            ("type", 0),
+            ("key_size", 32),
+            ("value_size", 64),
+            ("max_entries", 96),
+        ),
+        ptr_ids,
+    ):
+        types += struct.pack(
+            "<III", _MAP_BTF_OFF[name], type_id, bit_off
+        )
+    types += struct.pack(
+        "<III", _MAP_BTF_OFF["var"], (14 << 24) | 0, 10
+    )
+    types += struct.pack("<I", 0)
+    types += struct.pack(
+        "<III", _MAP_BTF_OFF["maps"], (15 << 24) | 1, 32
+    )
+    types += struct.pack("<III", 11, 0, 32)
+    header = struct.pack(
+        "<HBBIIIII", 0xEB9F, 1, 0, 24, 0, len(types),
+        len(types), len(_MAP_BTF_STRINGS),
+    )
+    return bytes(header) + bytes(types) + _MAP_BTF_STRINGS
+
+
+def _gate_elf_image(named_contents):
+    """Build a minimal 64-bit little-endian relocatable object."""
+    contents = [
+        (name, bytes(content)) for name, content in named_contents
+    ]
+    strtab = b"\x00"
+    name_offs = []
+    for name, _content in contents:
+        name_offs.append(len(strtab))
+        strtab += name.encode("ascii") + b"\x00"
+    shstr_off = len(strtab)
+    strtab += b".shstrtab\x00"
+    offset = 64
+    rows = []
+    body = bytearray()
+    for (_name, content), name_off in zip(contents, name_offs):
+        rows.append((name_off, offset, len(content)))
+        body += content
+        offset += len(content)
+    str_off = offset
+    body += strtab
+    shoff = offset + len(strtab)
+    table = bytearray(b"\x00" * 64)
+    for name_off, sec_off, size in rows:
+        table += struct.pack(
+            "<IIQQQQIIQQ", name_off, 1, 0, 0, sec_off, size,
+            0, 0, 1, 0,
+        )
+    str_index = len(rows) + 1
+    table += struct.pack(
+        "<IIQQQQIIQQ", shstr_off, 3, 0, 0, str_off,
+        len(strtab), 0, 0, 1, 0,
+    )
+    header = bytearray(64)
+    header[0:4] = b"\x7fELF"
+    header[4] = 2
+    header[5] = 1
+    header[6] = 1
+    struct.pack_into("<HHI", header, 16, 1, 247, 1)
+    struct.pack_into("<Q", header, 40, shoff)
+    struct.pack_into(
+        "<HHH", header, 58, 64, len(rows) + 2, str_index
+    )
+    return bytes(header) + bytes(body) + bytes(table)
+
+
+_MAP_ADAPTED_TEXT = (
+    "inttoptr (i64 1 to ptr)\ninttoptr (i64 2 to ptr)\n"
+)
+
+
+def _gate_synthetic_manifest(parent, key_type="u32"):
+    """Stage a one-map manifest; return its parsed form."""
+    from mojobpf.manifest import parse_manifest
+
+    manifest_path, _out = write_project(
+        parent, dirname="keygate", with_maps=True
+    )
+    if key_type != "u32":
+        with open(manifest_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace('key_type = "u32"', 'key_type = "%s"'
+                            % key_type)
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    return parse_manifest(manifest_path)
+
+
+def _gate_outcome(parent, manifest, key_size):
+    """Run the map gate over a synthetic object; return diagnostics."""
+    staged = os.path.join(parent, "staged.bpf.o")
+    with open(staged, "wb") as handle:
+        handle.write(
+            _gate_elf_image([
+                (".BTF", _maps_btf_blob(key_size)),
+                (".maps", b"\x00" * 32),
+            ])
+        )
+    adapted = os.path.join(parent, "adapted.ll")
+    with open(adapted, "w", encoding="utf-8") as handle:
+        handle.write(_MAP_ADAPTED_TEXT)
+    return build_module._map_entries_outcome(
+        manifest, staged, adapted, "lane-a"
+    )
+
+
+def test_map_gate_accepts_matching_key_size():
+    parent = tempfile.mkdtemp(prefix="mojobpf-keygate-")
+    try:
+        manifest = _gate_synthetic_manifest(parent)
+        outcome = _gate_outcome(parent, manifest, 4)
+        assert outcome == [], outcome
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_map_gate_refuses_mismatched_key_size():
+    # The manifest declares u32 keys but the object emits
+    # 8-byte keys: MBPF216, like every other map-attribute
+    # disagreement.
+    parent = tempfile.mkdtemp(prefix="mojobpf-keygate-")
+    try:
+        manifest = _gate_synthetic_manifest(parent)
+        outcome = _gate_outcome(parent, manifest, 8)
+        assert [item.code for item in outcome] == ["MBPF216"], (
+            outcome
+        )
+        assert "map key" in outcome[0].explanation, outcome[0]
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_map_gate_refuses_unreconciled_key_type():
+    # A key type with no reconciled BTF size fails closed at
+    # the gate itself, like an unknown value type (the
+    # manifest is mutated past the parser to reach the gate's
+    # own vocabulary check).
+    import dataclasses
+
+    parent = tempfile.mkdtemp(prefix="mojobpf-keygate-")
+    try:
+        manifest = _gate_synthetic_manifest(parent)
+        entry = manifest.maps[0]
+        manifest = dataclasses.replace(
+            manifest,
+            maps=(
+                dataclasses.replace(entry, key_type="u16"),
+            ),
+        )
+        outcome = _gate_outcome(parent, manifest, 4)
+        assert [item.code for item in outcome] == ["MBPF216"], (
+            outcome
+        )
+        assert "key" in outcome[0].explanation, outcome[0]
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_read_source_excerpt_fifo_returns_none_without_blocking():
+    # A FIFO planted where a source excerpt is expected must
+    # not hang the build: excerpts are best-effort (None).
+    # Regular files (and symlinks to them) still excerpt.
+    import threading
+
+    with tempfile.TemporaryDirectory(
+        prefix="build-excerpt-fifo-"
+    ) as parent:
+        src = os.path.join(parent, "real.mojo")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write("one\ntwo\n")
+        assert build_module._read_source_excerpt(src, 2) == "two"
+        link = os.path.join(parent, "link.mojo")
+        os.symlink(src, link)
+        assert build_module._read_source_excerpt(link, 1) == "one"
+        fifo = os.path.join(parent, "source.mojo")
+        os.mkfifo(fifo)
+        outcome = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(
+                build_module._read_source_excerpt(fifo, 1)
+            ),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(5.0)
+        assert not worker.is_alive(), (
+            "excerpt read blocked on a FIFO"
+        )
+        assert outcome == [None], outcome
 
 
 def _direct_run():

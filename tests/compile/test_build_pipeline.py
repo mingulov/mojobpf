@@ -78,6 +78,7 @@ from mojobpf.evidence import (  # noqa: E402
     cache_key,
 )
 from mojobpf.inspect import (  # noqa: E402
+    object_map_key_sizes,
     object_map_specs,
     object_map_value_sizes,
 )
@@ -918,14 +919,14 @@ def _section_file_range(data, want):
     raise AssertionError("object has no %s section" % want)
 
 
-def _value_size_bound_offset(data):
-    """Return the file offset of the value size with its old value.
+def _member_bound_offset(data, var_name, legacy_name, modern_name):
+    """Return the file offset of a map member bound with its old value.
 
-    Walks DATASEC ``.maps`` -> VAR -> STRUCT member
-    ``value_size`` -> pointer target ARRAY (legacy spelling) or
-    member ``value`` -> pointer target INT size (modern typed
-    spelling), asserting every hop, so BTF drift fails loudly
-    instead of patching dead bytes.
+    Walks DATASEC ``.maps`` -> the named VAR -> STRUCT member
+    ``legacy_name`` -> pointer target ARRAY (legacy spelling) or
+    member ``modern_name`` -> pointer target INT size (modern
+    typed spelling), asserting every hop, so BTF drift fails
+    loudly instead of patching dead bytes.
     """
     boff, blen = _section_file_range(data, ".BTF")
     blob = data[boff : boff + blen]
@@ -999,38 +1000,61 @@ def _value_size_bound_offset(data):
     for name, kind, payload, _ in records:
         if kind != 15 or name != ".maps":
             continue
-        (var_id, _off, _size) = payload[0]
-        (_vname, vkind, target, _voff) = _record(var_id)
-        assert vkind == 14, vkind
-        (_sname, skind, members, _soff) = _record(target)
-        assert skind == 4, skind
-        for m_name, m_type, _ in members:
-            if m_name == "value_size":
-                (_pname, pkind, ptarget, _poff) = _record(m_type)
-                assert pkind == 2, pkind
-                (_aname, akind, nelems, aoff) = _record(ptarget)
-                assert akind == 3, akind
-                return aoff + 12 + 8, nelems
-            if m_name == "value":
-                (_pname, pkind, ptarget, _poff) = _record(m_type)
-                assert pkind == 2, pkind
-                (_iname, ikind, isize, ioff) = _record(ptarget)
-                assert ikind == 1, ikind
-                return ioff + 8, isize
-    raise AssertionError("value_size bound not found")
+        for (var_id, _off, _size) in payload:
+            (_vname, vkind, target, _voff) = _record(var_id)
+            assert vkind == 14, vkind
+            if _vname != var_name:
+                continue
+            (_sname, skind, members, _soff) = _record(target)
+            assert skind == 4, skind
+            for m_name, m_type, _ in members:
+                if m_name == legacy_name:
+                    (_pname, pkind, ptarget, _poff) = _record(m_type)
+                    assert pkind == 2, pkind
+                    (_aname, akind, nelems, aoff) = _record(ptarget)
+                    assert akind == 3, akind
+                    return aoff + 12 + 8, nelems
+                if m_name == modern_name:
+                    (_pname, pkind, ptarget, _poff) = _record(m_type)
+                    assert pkind == 2, pkind
+                    (_iname, ikind, isize, ioff) = _record(ptarget)
+                    assert ikind == 1, ikind
+                    return ioff + 8, isize
+    raise AssertionError(
+        "%s bound not found for %s" % (legacy_name, var_name)
+    )
 
 
 def _mutate_value_size(staged_obj, workdir, tag, new_size):
     """Copy a built object with a patched BTF value size."""
     with open(staged_obj, "rb") as handle:
         image = bytearray(handle.read())
-    at, old = _value_size_bound_offset(bytes(image))
+    at, old = _member_bound_offset(
+        bytes(image), "mojobpf_map0", "value_size", "value"
+    )
     assert old != new_size, (old, new_size)
     struct.pack_into("<I", image, at, new_size)
     mutated = os.path.join(workdir, "%s.bpf.o" % tag)
     with open(mutated, "wb") as handle:
         handle.write(bytes(image))
     sizes = object_map_value_sizes(mutated)
+    assert sizes.get("mojobpf_map0") == new_size, sizes
+    return mutated
+
+
+def _mutate_key_size(staged_obj, workdir, tag, new_size):
+    """Copy a built object with a patched BTF key size."""
+    with open(staged_obj, "rb") as handle:
+        image = bytearray(handle.read())
+    at, old = _member_bound_offset(
+        bytes(image), "mojobpf_map0", "key_size", "key"
+    )
+    assert old != new_size, (old, new_size)
+    struct.pack_into("<I", image, at, new_size)
+    mutated = os.path.join(workdir, "%s.bpf.o" % tag)
+    with open(mutated, "wb") as handle:
+        handle.write(bytes(image))
+    sizes = object_map_key_sizes(mutated)
     assert sizes.get("mojobpf_map0") == new_size, sizes
     return mutated
 
@@ -2066,6 +2090,104 @@ def test_noncore_value_size_keeps_base_behavior():
     finally:
         if core_result.work_dir is not None:
             shutil.rmtree(core_result.work_dir, ignore_errors=True)
+
+
+def test_key_size_mismatch_refused():
+    # Key-size reconciliation covers every family: a non-core,
+    # core, or event object whose BTF key size disagrees with
+    # the manifest refuses with MBPF216. The gate runs directly
+    # because the mutation applies post-build.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        MAP_SOURCE, "xdp_entry", "noncore_key_obj", True,
+        max_entries=1,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert result.work_dir is not None
+        staged = os.path.join(result.work_dir, "xdp_entry.bpf.o")
+        adapted = os.path.join(
+            result.work_dir, "xdp_entry.adapter", "adapted.ll"
+        )
+        manifest = parse_manifest(manifest_path)
+        assert not manifest.target.core
+        program = manifest.programs[0]
+        assert _verify_gate_outcome(
+            manifest, program, staged, adapted, "parsed"
+        ) == []
+        mutated = _mutate_key_size(
+            staged, result.work_dir, "noncore_key8", 8
+        )
+        outcome = _verify_gate_outcome(
+            manifest, manifest.programs[0], mutated, adapted,
+            "parsed",
+        )
+        assert [item.code for item in outcome] == ["MBPF216"], outcome
+        assert "map key" in outcome[0].explanation, outcome[0]
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+    core_manifest_path, core_out = write_core_project("core_key_obj")
+    core_result = build(core_manifest_path, core_out, save_temps=True)
+    try:
+        assert core_result.success is True, core_result.diagnostics
+        assert core_result.work_dir is not None
+        staged = os.path.join(core_result.work_dir, "xdp_entry.bpf.o")
+        adapted = os.path.join(
+            core_result.work_dir, "xdp_entry.adapter", "adapted.ll"
+        )
+        manifest = parse_manifest(core_manifest_path)
+        assert manifest.target.core
+        program = manifest.programs[0]
+        assert _verify_gate_outcome(
+            manifest, program, staged, adapted, "lane-a"
+        ) == []
+        mutated = _mutate_key_size(
+            staged, core_result.work_dir, "core_key8", 8
+        )
+        outcome = _verify_gate_outcome(
+            manifest, manifest.programs[0], mutated, adapted,
+            "lane-a",
+        )
+        assert [item.code for item in outcome] == ["MBPF216"], outcome
+        assert "map key" in outcome[0].explanation, outcome[0]
+    finally:
+        if core_result.work_dir is not None:
+            shutil.rmtree(core_result.work_dir, ignore_errors=True)
+    event_manifest_path, event_out = write_event_project(
+        EVENT_SOURCE, "event_key_obj"
+    )
+    event_result = build(
+        event_manifest_path, event_out, save_temps=True
+    )
+    try:
+        assert event_result.success is True, event_result.diagnostics
+        assert event_result.work_dir is not None
+        staged = os.path.join(
+            event_result.work_dir, "trace_entry.bpf.o"
+        )
+        adapted = os.path.join(
+            event_result.work_dir, "trace_entry.adapter",
+            "adapted.ll",
+        )
+        manifest = parse_manifest(event_manifest_path)
+        program = manifest.programs[0]
+        assert _verify_gate_outcome(
+            manifest, program, staged, adapted, "parsed"
+        ) == []
+        mutated = _mutate_key_size(
+            staged, event_result.work_dir, "event_key8", 8
+        )
+        outcome = _verify_gate_outcome(
+            manifest, manifest.programs[0], mutated, adapted,
+            "parsed",
+        )
+        assert [item.code for item in outcome] == ["MBPF216"], outcome
+        assert "map key" in outcome[0].explanation, outcome[0]
+    finally:
+        if event_result.work_dir is not None:
+            shutil.rmtree(event_result.work_dir, ignore_errors=True)
 
 
 def test_mismatched_entry_section_refused_through_driver():

@@ -228,6 +228,7 @@ from .inspect import (
     InspectionError,
     assert_no_link_step,
     object_has_btf_ext,
+    object_map_key_sizes,
     object_map_names,
     object_map_specs,
     object_map_value_sizes,
@@ -557,6 +558,11 @@ PARSED_MAP_TYPE_KINDS = {
 # profile-admitted keyed-map value type has an entry here; a
 # vocabulary addition without one fails closed at reconciliation.
 VALUE_TYPE_SIZES = {"u64": 8, "bytes4096": 4096}
+# Declared key-type vocabulary to BTF key sizes in bytes. Every
+# profile-admitted key type has an entry here (ring-buffer maps
+# resolve to zero, matching their contract); a vocabulary
+# addition without one fails closed at reconciliation.
+KEY_TYPE_SIZES = {"u32": 4, "none": 0}
 
 # Proven 64-bit add-immediate multiset of the qualified map object,
 # in sorted order: the two audited stack-slot offsets (key -4 twice,
@@ -1442,6 +1448,24 @@ def admit_adapter(
         default_adapter_path()
     )
     document = load_toolchain_document(lockfile_path) if lockfile_path is not None else None
+    if lockfile_path is not None and document is None:
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF104",
+                stage=STAGE_BUILD_SETUP,
+                severity=SEVERITY_ERROR,
+                explanation="adapter %r cannot run: lockfile %r "
+                "is unreadable" % (adapter_path, lockfile_path),
+                location=lockfile_path,
+                remedy="point --lockfile at a readable pinned "
+                "lockfile",
+            )
+        )
+        return None, (
+            ADAPTER_TRUST_DEFAULT
+            if is_default
+            else ADAPTER_TRUST_EXTENSION
+        )
     if document is not None and document.get("schema_version") == 2:
         try:
             bundle = native_bundle or native_module.admit_native_bundle(document["native_adapter"], adapter_path)
@@ -2217,8 +2241,15 @@ def _debug_aligns(
 
 
 def _read_source_excerpt(path: str, lineno: int) -> str | None:
-    """Return source line ``lineno`` of ``path``, if readable."""
+    """Return source line ``lineno`` of ``path``, if readable.
+
+    Best-effort: anything unreadable -- including a FIFO or
+    other non-regular file swapped in for the source -- yields
+    ``None`` instead of hanging the build on a blocking open.
+    """
     if lineno < 1:
+        return None
+    if not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -3469,13 +3500,14 @@ def _event_map_outcome(manifest, staged_obj: str,
                        adapted_text: str,
                        family: str,
                        adapter_route: str) -> list[Diagnostic]:
-    """Reject an event-pair object whose pair, kinds, or sizes disagree.
+    """Reject an event-pair object whose pair, kinds, keys, or sizes disagree.
 
     The event and reservation shapes emit the array state map
-    ``mojobpf_map0`` (four entries) plus the ring-buffer companion
-    ``mojobpf_map1`` sized by the audited size tag; the manifest
-    must declare that pair (in either order) with those kinds and
-    sizes, and the object's BTF map attributes must agree. Any
+    ``mojobpf_map0`` (four entries, u32 keys) plus the
+    ring-buffer companion ``mojobpf_map1`` sized by the audited
+    size tag; the manifest must declare that pair (in either
+    order) with those kinds, key types, and sizes, and the
+    object's BTF map attributes must agree. Any
     other declaration or emission fails closed here (``MBPF216``).
     On the parsed route the lowering resolves the size tag's
     map operand to the emitted companion (so the adapted-text
@@ -3602,6 +3634,48 @@ def _event_map_outcome(manifest, staged_obj: str,
                 "need a reviewed route" % (want_size,),
             )
         ]
+    for member, want_key in ((state, 4), (ring, 0)):
+        declared_key = KEY_TYPE_SIZES.get(member.key_type)
+        if declared_key is None:
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "manifest.maps declares key_type = %r "
+                        "for %r, which has no reconciled BTF "
+                        "key size"
+                        % (member.key_type, member.name)
+                    ),
+                    location=staged_obj,
+                    remedy="declare the reviewed key type for "
+                    "this program shape (u32 for the state map, "
+                    "none for the ring-buffer companion); wider "
+                    "shapes need a reviewed route",
+                )
+            ]
+        if declared_key != want_key:
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "built %s object %r emits a %d-byte map "
+                        "key for %r but manifest.maps declares "
+                        "key_type = %r (%d bytes)"
+                        % (family, staged_obj, want_key,
+                           member.name, member.key_type,
+                           declared_key)
+                    ),
+                    location=staged_obj,
+                    remedy="declare the reviewed key type for "
+                    "this program shape (u32 for the state map, "
+                    "none for the ring-buffer companion); wider "
+                    "shapes need a reviewed route",
+                )
+            ]
     try:
         specs = dict(
             (name, (map_type, entries))
@@ -3629,6 +3703,28 @@ def _event_map_outcome(manifest, staged_obj: str,
                         MAP_TYPE_IDS["ringbuf"],
                         want_size,
                     )
+                ),
+                location=staged_obj,
+                remedy="rebuild the object with the pinned toolchain",
+            )
+        ]
+    try:
+        keys = object_map_key_sizes(staged_obj)
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    observed_keys = (
+        keys.get("mojobpf_map0"), keys.get("mojobpf_map1"),
+    )
+    if observed_keys != (4, 0):
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r carries map keys %s but "
+                    "the %s program shape emits ((4, 0))"
+                    % (staged_obj, observed_keys, family)
                 ),
                 location=staged_obj,
                 remedy="rebuild the object with the pinned toolchain",
@@ -3689,7 +3785,7 @@ def _parsed_object_kind(staged_obj: str,
 def _map_entries_outcome(manifest, staged_obj: str,
                          adapted_path: str,
                          adapter_route: str) -> list[Diagnostic]:
-    """Reject a map object whose kind, count, or value size disagrees.
+    """Reject a map object whose kind, count, key, or value size disagrees.
 
     The adapter emits the map kind and entry count the audited
     program shape requires (the kind tag selects array, per-CPU
@@ -3705,9 +3801,12 @@ def _map_entries_outcome(manifest, staged_obj: str,
     publishing an artifact that disagrees with its manifest. The
     core family additionally reconciles the emitted 4096-byte map
     value against the manifest's declared value type and the
-    object's BTF value size; every other family keeps kind and
-    entry count only, and refuses a 4096-byte value declaration
-    outright (only the core shape emits one). On the parsed
+    object's BTF value size; every other family keeps kind,
+    entry count, and key size, and refuses a 4096-byte value
+    declaration outright (only the core shape emits one). Every
+    family reconciles the emitted u32 map key against the
+    manifest's declared key type and the object's BTF key size.
+    On the parsed
     route the lowering consumes kind tags into helper-call
     operands, so the staged object's BTF attributes (not the
     adapted text) are the built kind evidence.
@@ -4017,6 +4116,74 @@ def _map_entries_outcome(manifest, staged_obj: str,
                     "toolchain",
                 )
             ]
+    # Key-size reconciliation covers every family (unlike values):
+    # all reviewed keyed shapes emit u32 keys, so a declared or
+    # emitted disagreement fails closed here.
+    want_key = 4
+    declared_key = KEY_TYPE_SIZES.get(declared.key_type)
+    if declared_key is None:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "manifest.maps declares key_type = %r, "
+                    "which has no reconciled BTF key size"
+                    % (declared.key_type,)
+                ),
+                location=staged_obj,
+                remedy="declare a reviewed key type for this "
+                "program shape; wider shapes need a reviewed "
+                "route",
+            )
+        ]
+    if declared_key != want_key:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built %s object %r emits a %d-byte map "
+                    "key but manifest.maps declares "
+                    "key_type = %r (%d bytes)"
+                    % (family, staged_obj, want_key,
+                       declared.key_type, declared_key)
+                ),
+                location=staged_obj,
+                remedy="declare key_type = 'u32' for this "
+                "program shape; wider shapes need a reviewed "
+                "route",
+            )
+        ]
+    try:
+        keys = object_map_key_sizes(staged_obj)
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    if keys.get(declared.name) != want_key:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r carries a %r-byte map "
+                    "key for %r but the %s program shape "
+                    "emits %d bytes"
+                    % (
+                        staged_obj,
+                        keys.get(declared.name),
+                        declared.name,
+                        family,
+                        want_key,
+                    )
+                ),
+                location=staged_obj,
+                remedy="rebuild the object with the pinned "
+                "toolchain",
+            )
+        ]
     return []
 
 
@@ -4031,9 +4198,10 @@ def _verify_gate_outcome(manifest, program, staged_obj: str,
     unsupported, license) when the object fails, the manifest
     disagreement (``MBPF216``) when the emitted program section
     is not the manifest program's declared section, when the
-    emitted maps, their kinds, or their entry counts differ from
-    ``manifest.maps`` (the core family additionally reconciles
-    the emitted map value size), or when the emitted CO-RE
+    emitted maps, their kinds, their key sizes, or their entry
+    counts differ from ``manifest.maps`` (the core family
+    additionally reconciles the emitted map value size), or
+    when the emitted CO-RE
     relocation records disagree with the manifest's CO-RE flag,
     or an empty list when the object passes. An unreadable
     object fails with its own diagnostic.

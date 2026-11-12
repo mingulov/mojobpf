@@ -198,15 +198,6 @@ _SAFE_TOKEN = re.compile(r"^/?[A-Za-z0-9_][A-Za-z0-9_.,:/=@-]*\Z")
 _NAME_TOKEN = re.compile(r"[A-Za-z0-9_]+")
 
 
-def sha256_file(path: str) -> str:
-    """Return the hex SHA-256 of a file."""
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def classify_load_output(stdout: str, stderr: str, timed_out: bool) -> str:
     """Classify a failed ``bpftool prog load`` as verifier/environment/loader."""
     if timed_out:
@@ -707,9 +698,11 @@ def resolve_lane(
     """Resolve the effective release/accelerator to a locked lane.
 
     Validates the effective release token after environment/default
-    selection and requires the pair to match a lane in the kernels
-    lock, so a stale or ambient release can never silently prove
-    the wrong kernel. Returns the lane mapping. Raises
+    selection and requires the pair to match exactly one lane in
+    the kernels lock, so a stale or ambient release can never
+    silently prove the wrong kernel, and duplicate selection
+    keys refuse as ambiguous instead of running the first
+    lane's kernel. Returns the lane mapping. Raises
     :class:`VerifyError` before any process starts.
     """
     _require_safe_token("release", release)
@@ -717,12 +710,29 @@ def resolve_lane(
         raise VerifyError("accelerator must be 'tcg' or 'kvm'")
     lock_path = _require_lock_path(kernels_lock)
     lanes = _load_lanes(lock_path)
-    for lane in lanes:
+    matches = [
+        lane
+        for lane in lanes
         if (
             lane["release"] == release
             and lane["accelerator"] == accelerator
-        ):
-            return dict(lane)
+        )
+    ]
+    if len(matches) > 1:
+        raise VerifyError(
+            "release %r with accelerator %r is ambiguous in %s "
+            "(matches lanes %s)"
+            % (
+                release,
+                accelerator,
+                lock_path,
+                ", ".join(
+                    str(lane.get("id", "?")) for lane in matches
+                ),
+            )
+        )
+    if matches:
+        return dict(matches[0])
     available = ", ".join(
         "%s/%s" % (lane["release"], lane["accelerator"])
         for lane in lanes

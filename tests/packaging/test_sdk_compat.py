@@ -446,6 +446,38 @@ IMPORT_PROBES = (
         True,
         "unable to locate module",
     ),
+    (
+        "compat_import_semicolon_ok",
+        "import mojobpf.packet; import mojobpf.core\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
+    (
+        "compat_import_semicolon_evil",
+        "import mojobpf.packet; from mojobpf._impl import x\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "unable to locate module",
+    ),
+    (
+        "compat_import_backslash_ok",
+        "from mojobpf.packet import \\\n XDP_PASS\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
+    (
+        "compat_import_spaced_dots_ok",
+        "from mojobpf . packet import XDP_PASS\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
 )
 
 

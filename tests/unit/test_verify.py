@@ -3288,6 +3288,58 @@ def test_resolve_lane_rejects_laneless_and_malformed_locks():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_resolve_lane_refuses_duplicate_release_accelerator():
+    # Two lanes sharing the (release, accelerator) selection
+    # key: the choice is ambiguous, so resolution refuses
+    # instead of silently running the first lane's kernel.
+    root = tempfile.mkdtemp(prefix="verify-dup-release-")
+    try:
+        lock_path = os.path.join(root, "kernels.lock.json")
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "lanes": [
+                        {
+                            "id": "dup-a",
+                            "release": "v9.99",
+                            "accelerator": "tcg",
+                            "kernel_release": "9.99.0-a",
+                            "kernel_debs": [],
+                            "vng_argv_prefix": ["vng"],
+                        },
+                        {
+                            "id": "dup-b",
+                            "release": "v9.99",
+                            "accelerator": "tcg",
+                            "kernel_release": "9.99.0-b",
+                            "kernel_debs": [],
+                            "vng_argv_prefix": ["vng"],
+                        },
+                    ],
+                },
+                handle,
+            )
+        try:
+            resolve_lane("v9.99", "tcg", lock_path)
+        except VerifyError as exc:
+            assert "ambiguous" in str(exc), exc
+            assert "dup-a" in str(exc), exc
+            assert "dup-b" in str(exc), exc
+        else:
+            raise AssertionError(
+                "duplicate release/accelerator resolved"
+            )
+        try:
+            resolve_lane("v9.99", "kvm", lock_path)
+        except VerifyError as exc:
+            assert "matches no lane" in str(exc), exc
+        else:
+            raise AssertionError("unlisted accelerator resolved")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_run_verification_rejects_unlisted_release_before_spawn():
     """An unlisted release fails lane resolution before any spawn."""
     holding = tempfile.mkdtemp(prefix="verify-nolane-")

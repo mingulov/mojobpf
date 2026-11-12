@@ -577,9 +577,12 @@ SDK_SIGNATURES = {
 _NAME_RE = re.compile(r"^(?:def|struct)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _COMPTIME_RE = re.compile(r"^comptime\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
 _WS_RE = re.compile(r"\s+")
+_DOTTED_RE = (
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)*"
+    r"[A-Za-z_][A-Za-z0-9_.]*"
+)
 _IMPORT_RE = re.compile(
-    r"^(?:from\s+([A-Za-z_][A-Za-z0-9_.]*)|import\s+([A-Za-z_]"
-    r"[A-Za-z0-9_.]*))"
+    r"^(?:from\s+(%s)|import\s+(%s))" % (_DOTTED_RE, _DOTTED_RE)
 )
 
 
@@ -736,8 +739,9 @@ def _split_import_names(body: str) -> list[str]:
     return found
 
 
-def _lex_line(line: str, in_triple: bool) -> tuple[str, int, bool]:
-    """Lex one line to (code text, paren delta, in-triple flag).
+def _lex_segments(line: str, in_triple: bool
+                ) -> tuple[list[tuple[str, int]], bool, bool]:
+    """Lex one line to ([(code, delta)], in-triple, continues).
 
     Code text keeps every non-comment character (string
     contents included); only the paren delta masks string
@@ -746,8 +750,14 @@ def _lex_line(line: str, in_triple: bool) -> tuple[str, int, bool]:
     starts a string inside a comment. Single-quote spans mask
     too: Mojo has no single-quote strings, so the spelling is
     invalid input, but masking it keeps a hostile line from
-    joining away the statement below.
+    joining away the statement below. A ``;`` in code state
+    ends a segment (Mojo accepts it as a statement separator);
+    a ``;`` inside any string span or comment is content, never
+    a split. ``continues`` reports a code-state trailing
+    backslash run of odd length: the line joins the next one,
+    exactly as the compiler joins it.
     """
+    segments: list[tuple[str, int]] = []
     out: list[str] = []
     delta = 0
     state = "tstring" if in_triple else "code"
@@ -805,13 +815,26 @@ def _lex_line(line: str, in_triple: bool) -> tuple[str, int, bool]:
             out.append(char)
             index += 1
             continue
+        if char == ";":
+            segments.append(("".join(out), delta))
+            out = []
+            delta = 0
+            index += 1
+            continue
         if char == "(":
             delta += 1
         elif char == ")":
             delta -= 1
         out.append(char)
         index += 1
-    return "".join(out), delta, state == "tstring"
+    segments.append(("".join(out), delta))
+    run = 0
+    for char in reversed(out):
+        if char != "\\":
+            break
+        run += 1
+    continues = state == "code" and run % 2 == 1
+    return segments, state == "tstring", continues
 
 
 def _join_logical_lines(text: str) -> list[tuple[int, str]]:
@@ -823,7 +846,12 @@ def _join_logical_lines(text: str) -> list[tuple[int, str]]:
     can neither hide behind a string paren nor be conjured
     from inside one. Only the count is masked; the buffered
     statement text is unchanged apart from string-aware
-    comment stripping.
+    comment stripping. Each ``;``-separated segment judges on
+    its own once its parens balance, so a forbidden import
+    after a semicolon is still reported. A code-state trailing
+    backslash joins the next line into the current segment
+    (the backslash itself is dropped), so a continued import
+    judges as one statement.
     """
     logical: list[tuple[int, str]] = []
     buffer = ""
@@ -831,16 +859,22 @@ def _join_logical_lines(text: str) -> list[tuple[int, str]]:
     depth = 0
     in_triple = False
     for lineno, raw in enumerate(text.splitlines(), start=1):
-        code, delta, in_triple = _lex_line(raw, in_triple)
-        if not buffer:
-            start = lineno
-        buffer += " " + code.strip()
-        depth += delta
-        if not in_triple and depth <= 0:
-            depth = 0
-            if buffer.strip():
-                logical.append((start, _normalize(buffer)))
-            buffer = ""
+        segments, in_triple, continues = _lex_segments(
+            raw, in_triple
+        )
+        for position, (code, delta) in enumerate(segments):
+            hold = continues and position == len(segments) - 1
+            if hold:
+                code = code[:-1]
+            if not buffer:
+                start = lineno
+            buffer += " " + code.strip()
+            depth += delta
+            if not hold and not in_triple and depth <= 0:
+                depth = 0
+                if buffer.strip():
+                    logical.append((start, _normalize(buffer)))
+                buffer = ""
     if buffer.strip():
         logical.append((start, _normalize(buffer)))
     return logical
@@ -864,6 +898,7 @@ def check_mojo_imports(text: str) -> tuple[ImportViolation, ...]:
         if match is None:
             continue
         dotted = match.group(1) or match.group(2)
+        dotted = "".join(dotted.split())
         if dotted != "mojobpf" and not dotted.startswith("mojobpf."):
             continue
         rest = statement[match.end():].strip()

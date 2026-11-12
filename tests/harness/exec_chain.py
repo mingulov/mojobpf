@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Shared launcher ``exec``-chain resolution for the consumer suites.
+"""Independent launcher ``exec``-chain resolution for the parity locks.
 
-Every consumer suite probes its PATH-resolved toolchain and records
-each entry's hash. When an entry is a launcher script (as the
-independent consumer toolchain's ``mojo`` is), the entry hash alone
-identifies the launcher, not the compiler that actually runs. This
-module resolves the chain statically: :func:`follow_exec_target`
-returns the realpath of the image a launcher hands off to, or None
-when the entry is itself the executed image or the chain does not
-resolve. Suites record both hashes and cross-check the executed
-image against the installed tool's own report.
+When a toolchain entry is a launcher script, the entry hash
+alone identifies the launcher, not the compiler that actually
+runs. This module resolves the chain statically and
+independently of the product: :func:`follow_exec_target`
+returns the realpath of the image a launcher hands off to, or
+None when the entry is itself the executed image or the chain
+does not resolve. The exec-chain parity battery
+(``tests/unit/test_exec_chain.py``) pins this independent
+resolution against the product follower so the duplicates
+cannot drift apart, and the portability locks
+(``tests/unit/test_portability_locks.py``) pin it against the
+staged guest copy in ``tests/harness/bpf_test_run.py``.
 
 Standard library only.
 """

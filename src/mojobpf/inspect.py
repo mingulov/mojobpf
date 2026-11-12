@@ -1545,15 +1545,24 @@ def _inspect_parsed(path: str, elf: Elf,
         )
     )
     ext_section = None
-    btf_section = None
     for section in elf.sections:
         if section.name == ".BTF.ext":
             ext_section = section
-        elif section.name == ".BTF":
-            btf_section = section
+    try:
+        btf_section = _sole_btf_section(elf, path)
+    except ElfError as exc:
+        structural.append(
+            _object_finding(
+                exc.code,
+                exc.explanation,
+                "section:.BTF",
+                "rebuild the object with the pinned backend",
+            )
+        )
+        btf_section = None
     if ext_section is not None:
         if profile.core_supported:
-            if btf_section is None:
+            if btf_section is None and not btf_present:
                 structural.append(
                     _object_finding(
                         "MBPF402",
@@ -1563,7 +1572,7 @@ def _inspect_parsed(path: str, elf: Elf,
                         "rebuild the object with the pinned backend",
                     )
                 )
-            else:
+            elif btf_section is not None:
                 try:
                     shapes = _core_relo_shapes(
                         section_bytes(elf, btf_section),
@@ -1757,6 +1766,29 @@ def _btf_string(strings: bytes, off: int, path: str) -> str:
         return strings[off:end].decode("ascii")
     except UnicodeDecodeError:
         raise ElfError("MBPF402", "non-ASCII BTF string", path) from None
+
+
+def _sole_btf_section(elf: Elf, path: str):
+    """Return the single ``.BTF`` section, or None when absent.
+
+    Every consumer must read the same types, so an object
+    carrying more than one ``.BTF`` section fails closed
+    (:class:`ElfError` ``MBPF402``) instead of splitting
+    first-vs-last readers.
+    """
+    found = None
+    for section in elf.sections:
+        if section.name != ".BTF":
+            continue
+        if found is not None:
+            raise ElfError(
+                "MBPF402",
+                "duplicate .BTF sections; every consumer must "
+                "read the same types",
+                path,
+            )
+        found = section
+    return found
 
 
 def _parse_btf_types(blob: bytes, path: str
@@ -2003,6 +2035,12 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                         "members %s" % (var_name, extra),
                         path,
                     )
+            if var_name in found:
+                raise ElfError(
+                    "MBPF402",
+                    "BTF map VAR %r is duplicated" % var_name,
+                    path,
+                )
             found[var_name] = attrs
     return found
 
@@ -2209,15 +2247,13 @@ def object_map_specs(path: str) -> tuple[tuple[str, int, int], ...]:
             where,
             "rebuild the object with the pinned toolchain",
         ) from None
-    blob = None
-    for section in elf.sections:
-        if section.name == ".BTF":
-            blob = section_bytes(elf, section)
-            break
-    if blob is None:
-        return ()
     try:
-        attrs = _parse_btf_map_attrs(blob, where)
+        btf_section = _sole_btf_section(elf, where)
+        if btf_section is None:
+            return ()
+        attrs = _parse_btf_map_attrs(
+            section_bytes(elf, btf_section), where
+        )
     except ElfError as exc:
         raise _fail(
             exc.code,
@@ -2262,15 +2298,13 @@ def object_map_value_sizes(path: str) -> dict[str, int]:
             where,
             "rebuild the object with the pinned toolchain",
         ) from None
-    blob = None
-    for section in elf.sections:
-        if section.name == ".BTF":
-            blob = section_bytes(elf, section)
-            break
-    if blob is None:
-        return {}
     try:
-        attrs = _parse_btf_map_attrs(blob, where)
+        btf_section = _sole_btf_section(elf, where)
+        if btf_section is None:
+            return {}
+        attrs = _parse_btf_map_attrs(
+            section_bytes(elf, btf_section), where
+        )
     except ElfError as exc:
         raise _fail(
             exc.code,
@@ -2282,6 +2316,54 @@ def object_map_value_sizes(path: str) -> dict[str, int]:
         ) from None
     return {
         name: spec["value_size"] for name, spec in attrs.items()
+    }
+
+
+def object_map_key_sizes(path: str) -> dict[str, int]:
+    """Return the BTF-declared key size per emitted map.
+
+    Resolves each ``.maps`` VAR's ``key_size`` ARRAY bound
+    through the same attribute chain as :func:`object_map_specs`
+    (ring-buffer maps resolve to zero, matching their contract).
+    An object without map BTF yields an empty dict. Errors match
+    :func:`object_map_specs`. Builds compare the emitted sizes
+    against the manifest's declared key types before
+    publication.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
+    except ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot list the map symbols of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    try:
+        btf_section = _sole_btf_section(elf, where)
+        if btf_section is None:
+            return {}
+        attrs = _parse_btf_map_attrs(
+            section_bytes(elf, btf_section), where
+        )
+    except ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot read the map attributes of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    return {
+        name: spec["key_size"] for name, spec in attrs.items()
     }
 
 

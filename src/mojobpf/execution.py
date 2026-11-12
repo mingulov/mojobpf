@@ -1809,11 +1809,12 @@ def identify_file(path: str) -> FileIdentity:
     Follows symlinks for the bytes and stat identity, and records
     the link's own ``(st_dev, st_ino)`` when ``path`` itself is a
     symlink. Raises :class:`AdmissionError` (``not-found`` /
-    ``unreadable``) instead of ``OSError``.
+    ``unreadable``) instead of ``OSError`` (or ``ValueError``
+    for an embedded NUL byte).
     """
     try:
         link_stat = os.lstat(path)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise AdmissionError(
             REASON_NOT_FOUND, "cannot stat %r: %s" % (path, exc)
         )
@@ -1823,7 +1824,7 @@ def identify_file(path: str) -> FileIdentity:
     try:
         realpath = os.path.realpath(path)
         file_stat = os.stat(path)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise AdmissionError(
             REASON_UNREADABLE, "cannot stat %r: %s" % (path, exc)
         )
@@ -1833,7 +1834,7 @@ def identify_file(path: str) -> FileIdentity:
         )
     try:
         digest = sha256_file(realpath)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise AdmissionError(
             REASON_UNREADABLE, "cannot hash %r: %s" % (path, exc)
         )
@@ -2693,28 +2694,35 @@ def _module_prefix_paths(parts: list[str]) -> list[str]:
     ]
 
 
-def _earlier_root_shadow(
-    prefix_rel: str, earlier_roots: list[str]
+def _first_shadow_root(
+    prefix_rel: str, roots: list[str]
 ) -> str | None:
-    """Return the first earlier root shadowing a module path.
+    """Return the first root shadowing a module path.
 
     Any winning sibling spelling shadows: ``stem.py``,
-    ``stem/__init__.py``, sourceless ``stem.pyc`` or a
-    platform-tagged ``stem.*.so``/``stem.pyd`` (the first
+    ``stem.pyc``, ``stem/__init__.py``,
+    ``stem/__init__.pyc``, a platform-tagged
+    ``stem.*.so``/``stem.pyd`` or a platform-tagged
+    ``stem/__init__.*.so``/``stem/__init__.pyd`` (the first
     path entry carrying any match wins import selection, so a
     same-name module beats a package and an extension beats
-    source across roots). A bare directory without
-    ``__init__.py`` is only a namespace portion and does not
-    shadow a verified regular module or package, so only
-    files count. Returns the shadowing root, or None.
+    source across roots). A bare directory without an
+    ``__init__`` spelling is only a namespace portion and
+    does not shadow a verified regular module or package, so
+    only files count. Direction-free: callers pass earlier
+    roots, later roots, or a single root to probe. Returns
+    the shadowing root, or None.
     """
-    for root in earlier_roots:
+    for root in roots:
         base = os.path.join(root, prefix_rel)
         if (
             os.path.isfile(base + ".py")
             or os.path.isfile(base + ".pyc")
             or os.path.isfile(
                 os.path.join(base, "__init__.py")
+            )
+            or os.path.isfile(
+                os.path.join(base, "__init__.pyc")
             )
         ):
             return root
@@ -2731,24 +2739,82 @@ def _earlier_root_shadow(
                 and os.path.isfile(os.path.join(parent, entry))
             ):
                 return root
+        try:
+            inits = os.listdir(base)
+        except OSError:
+            continue
+        for entry in inits:
+            if not entry.startswith("__init__."):
+                continue
+            if entry.lower().endswith(
+                (".so", ".pyd")
+            ) and os.path.isfile(os.path.join(base, entry)):
+                return root
     return None
 
 
-def _reject_earlier_module_shadow(
+def _extension_entry(directory: str, stem: str) -> str | None:
+    """Return a same-stem extension file in a directory, if any.
+
+    ``stem.<tag>.so``/``stem.pyd`` beats ``stem.py``/``stem.pyc``
+    within its level (extensions beat source and bytecode), so
+    beside a verified source or bytecode file it wins import
+    selection. Returns the entry name, or None.
+    """
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    for entry in entries:
+        if (
+            entry.startswith(stem + ".")
+            and entry.lower().endswith((".so", ".pyd"))
+            and os.path.isfile(os.path.join(directory, entry))
+        ):
+            return entry
+    return None
+
+
+def _package_init_extension(package_dir: str) -> str | None:
+    """Return a package extension init in a directory, if any.
+
+    ``__init__.<tag>.so``/``__init__.pyd`` beats every other
+    ``__init__`` spelling, so beside a verified ``__init__.py``
+    or ``__init__.pyc`` it wins import selection. Returns the
+    entry name, or None.
+    """
+    try:
+        entries = os.listdir(package_dir)
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.startswith("__init__."):
+            continue
+        if entry.lower().endswith((".so", ".pyd")) and os.path.isfile(
+            os.path.join(package_dir, entry)
+        ):
+            return entry
+    return None
+
+
+def _reject_cross_root_shadow(
     entry_path: str,
     dotted: str,
     found: str,
     roots: list[str],
 ) -> None:
-    """Reject when an earlier root shadows a verified module.
+    """Reject when another root shadows a verified module.
 
     ``found`` is the first-hit file whose bytes were verified;
-    import selection still escapes the pin when an earlier root
-    in resolution order carries the module path itself (both
-    spellings) or any ancestor package in either spelling,
-    because the interpreter resolves each level's first hit.
-    Raises :class:`AdmissionError` (``module-mismatch``) naming
-    the shadow, before any probe executes.
+    import selection still escapes the pin from either
+    direction: an earlier root in resolution order carrying
+    the module path or any ancestor package in any winning
+    spelling wins outright, and a later root carrying an
+    ancestor wins by namespace fallback when the verified
+    root's own level is a namespace portion (regular beats
+    namespace portions at every level). Raises
+    :class:`AdmissionError` (``module-mismatch``) naming the
+    shadow, before any probe executes.
     """
     parts = dotted.split(".")
     index = None
@@ -2781,7 +2847,7 @@ def _reject_earlier_module_shadow(
         if current != verified_root:
             earlier.append(root)
     for prefix_rel in _module_prefix_paths(parts):
-        shadow = _earlier_root_shadow(prefix_rel, earlier)
+        shadow = _first_shadow_root(prefix_rel, earlier)
         if shadow is not None:
             raise AdmissionError(
                 REASON_MODULE_MISMATCH,
@@ -2790,6 +2856,137 @@ def _reject_earlier_module_shadow(
                 "be the imported bytes"
                 % (entry_path, dotted, prefix_rel, shadow),
             )
+    later: list[str] = []
+    for root in roots[index + 1:]:
+        try:
+            current = os.path.realpath(root)
+        except OSError:
+            current = root
+        if current != verified_root:
+            later.append(root)
+    for depth in range(1, len(parts)):
+        level_rel = os.path.join(*parts[:depth])
+        if _first_shadow_root(level_rel, [roots[index]]) is not None:
+            # A first-hit regular spelling on the verified root
+            # beats every later root; a same-root sibling that
+            # beats the verified file instead is the same-root
+            # check's domain.
+            continue
+        shadow = _first_shadow_root(level_rel, later)
+        if shadow is not None:
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "%r module %r is shadowed by %r on later "
+                "admitted root %r: parent %r is a namespace "
+                "portion on the verified root, so the later "
+                "root's regular spelling wins import "
+                "selection; the verified bytes would not be "
+                "the imported bytes"
+                % (
+                    entry_path,
+                    dotted,
+                    level_rel,
+                    shadow,
+                    level_rel,
+                ),
+            )
+
+
+def _reject_same_root_module_shadow(
+    entry_path: str, dotted: str, found: str
+) -> None:
+    """Reject when a same-root sibling beats the verified file.
+
+    The locator binds ``.py``/``__init__.py`` bytes, but import
+    selection prefers packages over modules structurally and,
+    within a level, extensions over source over bytecode: a
+    ``stem.*.so``, a ``stem/`` package in any ``__init__``
+    spelling, or a parent level resolving to anything but the
+    regular package (or a namespace) means the verified bytes
+    never execute. Losing siblings (bytecode beside verified
+    source, a module beside a verified package) change nothing
+    and still admit. Raises :class:`AdmissionError`
+    (``module-mismatch``) naming the shadow, before any probe
+    executes.
+    """
+    parts = dotted.split(".")
+    verified_root = os.path.dirname(found)
+    strip = (
+        len(parts)
+        if os.path.basename(found) == "__init__.py"
+        else len(parts) - 1
+    )
+    for _ in range(strip):
+        verified_root = os.path.dirname(verified_root)
+    leaf_rel = os.path.join(*parts)
+    if found != os.path.join(
+        verified_root, leaf_rel
+    ) + ".py" and found != os.path.join(
+        verified_root, leaf_rel, "__init__.py"
+    ):
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "%r module %r resolved outside the admitted "
+            "interpreter path" % (entry_path, dotted),
+        )
+
+    def _refuse(beater_rel: str) -> None:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "%r module %r is shadowed by same-root %r on its "
+            "verified root %r; the verified bytes would not "
+            "be the imported bytes"
+            % (entry_path, dotted, beater_rel, verified_root),
+        )
+
+    leaf_dir = os.path.dirname(found)
+    if os.path.basename(found) == "__init__.py":
+        beater = _package_init_extension(leaf_dir)
+        if beater is not None:
+            _refuse(
+                os.path.join(
+                    leaf_rel, beater,
+                )
+            )
+    else:
+        stem = os.path.basename(found)[:-3]
+        sibling = _extension_entry(leaf_dir, stem)
+        if sibling is not None:
+            _refuse(os.path.join(os.path.dirname(leaf_rel), sibling))
+        package = os.path.join(leaf_dir, stem)
+        package_rel = os.path.join(
+            os.path.dirname(leaf_rel), stem,
+        )
+        if os.path.isfile(os.path.join(package, "__init__.py")):
+            _refuse(os.path.join(package_rel, "__init__.py"))
+        if os.path.isfile(os.path.join(package, "__init__.pyc")):
+            _refuse(os.path.join(package_rel, "__init__.pyc"))
+        sibling = _package_init_extension(package)
+        if sibling is not None:
+            _refuse(os.path.join(package_rel, sibling))
+    for depth in range(1, len(parts)):
+        level = os.path.join(verified_root, *parts[:depth])
+        level_rel = os.path.join(*parts[:depth])
+        sibling = _package_init_extension(level)
+        if sibling is not None:
+            _refuse(os.path.join(level_rel, sibling))
+        if os.path.isfile(os.path.join(level, "__init__.py")):
+            continue
+        if os.path.isfile(os.path.join(level, "__init__.pyc")):
+            _refuse(os.path.join(level_rel, "__init__.pyc"))
+        level_dir = os.path.dirname(level)
+        level_stem = os.path.basename(level)
+        sibling = _extension_entry(level_dir, level_stem)
+        if sibling is not None:
+            _refuse(
+                os.path.join(
+                    os.path.dirname(level_rel), sibling,
+                )
+            )
+        if os.path.isfile(level + ".py"):
+            _refuse(level_rel + ".py")
+        if os.path.isfile(level + ".pyc"):
+            _refuse(level_rel + ".pyc")
 
 
 def _reject_stdlib_shadow(
@@ -2800,8 +2997,10 @@ def _reject_stdlib_shadow(
     """Reject declared roots shadowing the admitted stdlib.
 
     Declared ``PYTHONPATH`` roots precede the standard library
-    in resolution order, so a top-level ``X.py`` or
-    ``X/__init__.py`` there wins every ``import X`` -- including
+    in resolution order, so a top-level ``X`` there in any
+    importable spelling (``X.py``, ``X.pyc``, ``X.*.so``,
+    ``X/__init__.py``, ``X/__init__.pyc``,
+    ``X/__init__.*.so``) wins every ``import X`` -- including
     inside the version probe -- over verified bytes. Raises
     :class:`AdmissionError` (``module-mismatch``) when any
     declared root carries a top-level module colliding with the
@@ -2846,7 +3045,24 @@ def _reject_stdlib_shadow(
                 top = name
                 hit = os.path.isfile(
                     os.path.join(full, "__init__.py")
+                ) or os.path.isfile(
+                    os.path.join(full, "__init__.pyc")
                 )
+                if not hit:
+                    try:
+                        inits = os.listdir(full)
+                    except OSError:
+                        inits = ()
+                    for entry in inits:
+                        if not entry.startswith("__init__."):
+                            continue
+                        if entry.lower().endswith(
+                            (".so", ".pyd")
+                        ) and os.path.isfile(
+                            os.path.join(full, entry)
+                        ):
+                            hit = True
+                            break
             if top not in wanted or not hit:
                 continue
             raise AdmissionError(
@@ -2941,6 +3157,31 @@ def admit_execution(
     if not request.forms:
         raise ValueError("admit_execution requires at least one form")
     entry_path = resolve_entry(request)
+    for root in pins.python_path:
+        if not isinstance(root, str):
+            raise AdmissionError(
+                REASON_MODULE_NOT_FOUND,
+                "%r: admitted module root %r is not a string"
+                % (entry_path, root),
+            )
+        if "\x00" in root:
+            raise AdmissionError(
+                REASON_MODULE_NOT_FOUND,
+                "%r: admitted module root %r embeds NUL"
+                % (entry_path, root),
+            )
+        if not os.path.isabs(root):
+            raise AdmissionError(
+                REASON_MODULE_NOT_FOUND,
+                "%r: admitted module root %r is not absolute"
+                % (entry_path, root),
+            )
+        if not os.path.isdir(root):
+            raise AdmissionError(
+                REASON_MODULE_NOT_FOUND,
+                "%r: admitted module root %r is not a directory"
+                % (entry_path, root),
+            )
     captured = capture_chain(entry_path)
     if captured.form == FORM_UNKNOWN:
         raise AdmissionError(
@@ -3082,8 +3323,11 @@ def admit_execution(
                     "%r module %r hash %s does not match the pin"
                     % (entry_path, dotted, observed),
                 )
-            _reject_earlier_module_shadow(
+            _reject_cross_root_shadow(
                 entry_path, dotted, found, roots
+            )
+            _reject_same_root_module_shadow(
+                entry_path, dotted, found
             )
             modules.append(
                 ModuleIdentity(
@@ -3377,21 +3621,36 @@ def verify_spawn(execution: AdmittedExecution) -> None:
     watched: list[tuple[str, FileIdentity]] = [
         ("entry", execution.entry),
     ]
+    # Dedup by (path, realpath): the drift check re-stats the
+    # admitted PATH (link identity included), so two watches
+    # sharing a realpath through different links are distinct
+    # watches — dropping either lets a repointed link execute
+    # unadmitted bytes.
+    seen_paths = {(execution.entry.path, execution.entry.realpath)}
     for index, hop in enumerate(execution.hops):
-        if hop.realpath != execution.entry.realpath:
+        key = (hop.path, hop.realpath)
+        if key not in seen_paths:
+            seen_paths.add(key)
             watched.append(("hop-%d" % index, hop))
-    if execution.image.realpath != execution.entry.realpath and all(
-        hop.realpath != execution.image.realpath
-        for hop in execution.hops
-    ):
+    image_key = (execution.image.path, execution.image.realpath)
+    if image_key not in seen_paths:
+        seen_paths.add(image_key)
         watched.append(("image", execution.image))
     if execution.interpreter is not None:
         watched.append(("interpreter", execution.interpreter))
-    seen_realpaths = {identity.realpath for _, identity in watched}
+        seen_paths.add(
+            (
+                execution.interpreter.path,
+                execution.interpreter.realpath,
+            )
+        )
     for index, identity in enumerate(execution.hop_interpreters):
-        if identity is None or identity.realpath in seen_realpaths:
+        if identity is None:
             continue
-        seen_realpaths.add(identity.realpath)
+        key = (identity.path, identity.realpath)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
         watched.append(
             ("hop-%d-interpreter" % index, identity)
         )
@@ -4538,6 +4797,46 @@ def _earlier_declared_roots(
     return earlier
 
 
+def _later_roots(roots: list[str], dist_root: str) -> list[str]:
+    """Resolution-order roots behind a verified distribution.
+
+    Only roots behind the verified ``.dist-info`` in
+    resolution order can win by namespace fallback over its
+    files. Compared by realpath, so symlinked aliases of the
+    verified root itself are skipped instead of
+    self-shadowing it. When the verified position is somehow
+    absent, every non-alias root counts as later (fail
+    closed: an unknown position binds nothing).
+    """
+    try:
+        verified = os.path.realpath(dist_root)
+    except OSError:
+        verified = dist_root
+    later: list[str] = []
+    passed = False
+    for entry in roots:
+        try:
+            current = os.path.realpath(entry)
+        except OSError:
+            current = entry
+        if current == verified:
+            passed = True
+            continue
+        if passed:
+            later.append(entry)
+    if not passed:
+        fell_back: list[str] = []
+        for entry in roots:
+            try:
+                current = os.path.realpath(entry)
+            except OSError:
+                current = entry
+            if current != verified:
+                fell_back.append(entry)
+        return fell_back
+    return later
+
+
 def _verify_one_dependency(
     name: str, version: str, digest: str, record_digest: str,
     roots: list[str], declared: list[str],
@@ -4604,6 +4903,10 @@ def _verify_one_dependency(
     _reject_dependency_shadow(
         name, record_text, dist_root,
         _earlier_declared_roots(declared, dist_root),
+    )
+    _reject_dependency_local_shadow(
+        name, record_text, dist_root,
+        _later_roots(roots, dist_root),
     )
 
 
@@ -4777,8 +5080,8 @@ def _reject_dependency_shadow(
     selection over the verified distribution root. Every
     ``RECORD``-listed import path -- including each ancestor
     package, whose shadow hijacks the whole subtree -- must
-    have no ``.py``/``__init__.py`` sibling on any earlier
-    declared root. A top-level stem colliding with the
+    have no winning sibling spelling on any earlier declared
+    root. A top-level stem colliding with the
     standard library is likewise rejected: on a declared root
     it would shadow the real library, and on a later site root
     the real library shadows the verified file instead, so in
@@ -4807,7 +5110,7 @@ def _reject_dependency_shadow(
         else:
             prefixes = _module_prefix_paths(stem.split("/"))
         winners = [
-            (prefix, _earlier_root_shadow(prefix, earlier_roots))
+            (prefix, _first_shadow_root(prefix, earlier_roots))
             for prefix in prefixes
         ]
         if stem.lower().endswith((".so", ".pyd")):
@@ -4837,6 +5140,226 @@ def _reject_dependency_shadow(
                     "imported bytes"
                     % (name, stem, prefix_rel, shadow),
                 )
+
+
+def _reject_dependency_local_shadow(
+    name: str,
+    record_text: str,
+    dist_root: str,
+    later_roots: list[str],
+) -> None:
+    """Bind a verified dependency's same-root and fallback selection.
+
+    Every ``RECORD``-verified importable file -- source,
+    sourceless bytecode, or extension module -- must be what
+    the interpreter actually selects: a winning sibling on the
+    distribution root itself (extensions beat source and
+    bytecode within a level, packages beat modules
+    structurally) means the verified bytes never execute, and
+    a namespace-only parent level falls back to any regular
+    spelling on a later root. A verified file beaten even by
+    another verified file fails closed (a ``RECORD`` listing
+    both ``stem.py`` and legacy ``stem.pyc`` binds nothing
+    for the loser). Raises :class:`AdmissionError`
+    (``module-mismatch``) naming the shadow, before any probe
+    executes.
+    """
+
+    def _refuse(rel: str, beater: str, detail: str) -> None:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r file %r is shadowed "
+            "by %r%s; the verified bytes would not be the "
+            "imported bytes" % (name, rel, beater, detail),
+        )
+
+    def _refuse_same_root(rel: str, beater_rel: str) -> None:
+        _refuse(
+            rel, "same-root %s" % beater_rel,
+            " on its verified root %r" % (dist_root,),
+        )
+
+    def _package_beater(package_dir: str) -> str | None:
+        if os.path.isfile(os.path.join(package_dir, "__init__.py")):
+            return "__init__.py"
+        if os.path.isfile(
+            os.path.join(package_dir, "__init__.pyc")
+        ):
+            return "__init__.pyc"
+        return _package_init_extension(package_dir)
+
+    def _leaf_beaters(
+        rel: str, kind: str, leaf_dir: str, base: str,
+    ) -> None:
+        first = base.split(".", 1)[0]
+        if kind == "extension" and first == "__init__":
+            # A verified package extension init sits atop import
+            # precedence; nothing beats it.
+            return
+        if kind == "source" and base == "__init__.py":
+            sibling = _package_init_extension(leaf_dir)
+            if sibling is not None:
+                _refuse_same_root(
+                    rel,
+                    os.path.join(
+                        os.path.dirname(rel), sibling,
+                    ),
+                )
+            return
+        if kind == "bytecode" and base == "__init__.pyc":
+            if os.path.isfile(
+                os.path.join(leaf_dir, "__init__.py")
+            ):
+                _refuse_same_root(
+                    rel,
+                    os.path.join(
+                        os.path.dirname(rel), "__init__.py",
+                    ),
+                )
+            sibling = _package_init_extension(leaf_dir)
+            if sibling is not None:
+                _refuse_same_root(
+                    rel,
+                    os.path.join(
+                        os.path.dirname(rel), sibling,
+                    ),
+                )
+            return
+        if kind == "bytecode":
+            # Sourceless bytecode loses to source as well.
+            if os.path.isfile(
+                os.path.join(leaf_dir, first + ".py")
+            ):
+                _refuse_same_root(
+                    rel,
+                    os.path.join(
+                        os.path.dirname(rel), first + ".py",
+                    ),
+                )
+        if kind in ("source", "bytecode"):
+            sibling = _extension_entry(leaf_dir, first)
+            if sibling is not None:
+                _refuse_same_root(
+                    rel,
+                    os.path.join(os.path.dirname(rel), sibling),
+                )
+        else:
+            # A second same-stem extension leaves selection to
+            # directory order, binding nothing.
+            try:
+                entries = os.listdir(leaf_dir)
+            except OSError:
+                entries = []
+            for entry in entries:
+                if (
+                    entry != base
+                    and entry.startswith(first + ".")
+                    and entry.lower().endswith((".so", ".pyd"))
+                    and os.path.isfile(
+                        os.path.join(leaf_dir, entry)
+                    )
+                ):
+                    _refuse_same_root(
+                        rel,
+                        os.path.join(os.path.dirname(rel), entry),
+                    )
+        package = os.path.join(leaf_dir, first)
+        beater = _package_beater(package)
+        if beater is not None:
+            _refuse_same_root(
+                rel,
+                os.path.join(
+                    os.path.dirname(rel), first, beater,
+                ),
+            )
+
+    def _ancestor_beaters(rel: str, parts: list[str]) -> None:
+        for depth in range(1, len(parts)):
+            level_rel = os.path.join(*parts[:depth])
+            level = os.path.join(dist_root, level_rel)
+            sibling = _package_init_extension(level)
+            if sibling is not None:
+                _refuse_same_root(
+                    rel, os.path.join(level_rel, sibling),
+                )
+            if os.path.isfile(os.path.join(level, "__init__.py")):
+                continue
+            if os.path.isfile(
+                os.path.join(level, "__init__.pyc")
+            ):
+                _refuse_same_root(
+                    rel, os.path.join(level_rel, "__init__.pyc"),
+                )
+            level_dir = os.path.dirname(level)
+            level_stem = os.path.basename(level)
+            sibling = _extension_entry(level_dir, level_stem)
+            if sibling is not None:
+                _refuse_same_root(
+                    rel,
+                    os.path.join(
+                        os.path.dirname(level_rel), sibling,
+                    ),
+                )
+            if os.path.isfile(level + ".py"):
+                _refuse_same_root(rel, level_rel + ".py")
+            if os.path.isfile(level + ".pyc"):
+                _refuse_same_root(rel, level_rel + ".pyc")
+
+    def _fallback_beaters(rel: str, parts: list[str]) -> None:
+        for depth in range(1, len(parts)):
+            level_rel = os.path.join(*parts[:depth])
+            if (
+                _first_shadow_root(level_rel, [dist_root])
+                is not None
+            ):
+                # A first-hit regular spelling on the
+                # distribution root beats every later root.
+                continue
+            shadow = _first_shadow_root(level_rel, later_roots)
+            if shadow is not None:
+                _refuse(
+                    rel, level_rel,
+                    " on later admitted root %r: parent %r is "
+                    "a namespace portion on the verified root, "
+                    "so the later root's regular spelling wins "
+                    "import selection"
+                    % (shadow, level_rel),
+                )
+
+    for row in csv.reader(record_text.splitlines()):
+        if not row or not row[0]:
+            continue
+        rel = row[0]
+        if rel.startswith("/") or rel.startswith(".."):
+            continue
+        segments = rel.split("/")
+        if not segments or segments[0].endswith(".dist-info"):
+            continue
+        if "__pycache__" in segments:
+            continue
+        lowered = rel.lower()
+        if lowered.endswith(".py"):
+            kind = "source"
+            stem = rel[:-3]
+        elif lowered.endswith(".pyc"):
+            kind = "bytecode"
+            stem = rel[:-4]
+        elif lowered.endswith((".so", ".pyd")):
+            kind = "extension"
+            stem = "/".join(
+                segments[:-1] + [segments[-1].split(".", 1)[0]]
+            )
+        else:
+            continue
+        parts = stem.split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+            if not parts:
+                continue
+        leaf_dir = os.path.dirname(os.path.join(dist_root, rel))
+        _leaf_beaters(rel, kind, leaf_dir, segments[-1])
+        _ancestor_beaters(rel, parts)
+        _fallback_beaters(rel, parts)
 
 
 def _extension_prefix_paths(stem: str) -> list[str]:
