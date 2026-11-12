@@ -45,22 +45,31 @@ SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 # Twenty-one rows are re-verified against the genuine Mojo 1.1.0
 # frontend on every run of the packaging compatibility suite
 # (``mojo build --emit llvm -I <sdk>``): the plain accept, the
-# parenthesized-list accept, the ``as``-alias accept, the
-# unknown name, the unknown module, the wrong-module name, the
-# deeper path, the five multi-module plain-import rows, the
-# four multi-module spaced-dots rows (one accept, three evil),
-# the semicolon accept/evil pair, and the backslash, spaced-dots
-# and string-hide accepts
-# (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``).
-# The twenty-eight static rows (module-only imports, ``std.*``
-# ignores, the empty import, the alternate unknown-module
-# spellings, the core-module accept/reject rows, the
-# string-paren line-join rows, the non-joining invalid-word
-# rows, the comment backslash row, and the quote/comment masking
-# rows) rest on one-time manual observation against the same
-# frontend, except the seven masking rows: those pin static
-# masking behavior only (no compiler on the audit host), and
-# the single-quote rows use invalid-Mojo spellings (Mojo has
+# parenthesized-list accept, the ``load_u8 as lu8`` alias
+# accept, the ``packet/_nope`` unknown name, the
+# ``mojobpf._impl`` unknown module, the ``packet/BPF_ANY``
+# wrong-module name, the ``packet.sub`` deeper path, the five
+# multi-module plain-import rows, the four multi-module
+# spaced-dots rows (one accept, three evil), the import-form
+# semicolon accept/evil pair, the backslash accept, the
+# from-form spaced-dots accept, and the string-hide accept
+# (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``;
+# membership pinned by
+# ``test_frontend_probes_cover_checker_rows_exactly``).
+# The other thirty-five rows rest on one-time manual
+# observation against the same frontend: the core accept,
+# the core alias accept, the top-level ``_impl`` reject, the
+# alternate unknown-module spellings (``core/_nope``,
+# ``core/BPF_ANY``, import-form ``_impl`` and deeper path),
+# module-only imports, ``std.*`` ignores, the empty import,
+# the string-paren line-join rows, the static semicolon rows
+# (from-form accept, string/triple-quote/paren cases), the
+# static spaced-dots rows (import-form accept, evil), the
+# semicolon+backslash row, the comment backslash row, and
+# the non-joining invalid-word rows -- except the seven
+# quote/comment masking rows, which pin static masking
+# behavior only (no compiler on the audit host), where the
+# single-quote rows use invalid-Mojo spellings (Mojo has
 # no single-quote strings) that hostile input could carry.
 # Accept rows exit 0; reject rows exit 1 with a source-layer
 # diagnostic. Row counts are pinned by

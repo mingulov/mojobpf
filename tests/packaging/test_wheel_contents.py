@@ -364,16 +364,63 @@ def test_validation_sources_sync():
             assert wheel_bytes(name) == handle.read(), name
 
 
+def _validate_schema_pin(pairs):
+    """Split and validate the schema pin.
+
+    Returns (sources, flattened): duplicate sources or
+    flattened names are refused (a silent zip clobber), and
+    flattened names must stay flat (setuptools data-files
+    install by basename, so a ``/`` or ``..`` wheel name
+    could never be produced honestly).
+    """
+    sources = [source for source, _ in pairs]
+    assert len(set(sources)) == len(sources), sources
+    flattened = [name for _, name in pairs]
+    assert len(set(flattened)) == len(flattened), flattened
+    for name in flattened:
+        assert (
+            name
+            and "/" not in name
+            and name != "."
+            and not name.startswith("..")
+        ), name
+    return sources, flattened
+
+
+def test_schema_pin_validation_rejects_bad_entries():
+    good = (("a.schema.json", "a.schema.json"),)
+    assert _validate_schema_pin(good) == (
+        ["a.schema.json"], ["a.schema.json"],
+    )
+    for bad in (
+        (("a.schema.json", "sub/a.schema.json"),),
+        (("a.schema.json", ".."),),
+        (("a.schema.json", "."),),
+        (("a.schema.json", ""),),
+        (
+            ("a.schema.json", "dup.schema.json"),
+            ("sub/b.schema.json", "dup.schema.json"),
+        ),
+        (
+            ("a.schema.json", "a.schema.json"),
+            ("a.schema.json", "other.schema.json"),
+        ),
+    ):
+        try:
+            _validate_schema_pin(bad)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("bad pin accepted: %r" % (bad,))
+
+
 def test_schemas_shipped_byte_identical():
     # The wheel ships every tree schema: a contract schema added
     # to schemas/ without a packaging pin fails here, never
     # silently absent from installed environments. The walk is
     # recursive so a schema in a subdirectory cannot evade the
     # pin either.
-    sources = [source for source, _ in PINNED_SCHEMA_DATA]
-    assert len(set(sources)) == len(sources), sources
-    flattened = [name for _, name in PINNED_SCHEMA_DATA]
-    assert len(set(flattened)) == len(flattened), flattened
+    sources, flattened = _validate_schema_pin(PINNED_SCHEMA_DATA)
     schemas_dir = os.path.join(REPO_ROOT, "schemas")
     tree_schemas = sorted(
         os.path.relpath(os.path.join(found, entry), schemas_dir)

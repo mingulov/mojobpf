@@ -34,6 +34,7 @@ tests/packaging/test_sdk_compat.py``) or under any ``test_``-style
 runner. Standard library only.
 """
 
+import ast
 import hashlib
 import json
 import os
@@ -559,6 +560,59 @@ def test_import_probe_count_matches_unit_header():
     # tests/unit/test_sdk_surface.py documents this count in
     # the CHECKER_CASES header; update both together.
     assert len(IMPORT_PROBES) == 21, len(IMPORT_PROBES)
+
+
+def _checker_table():
+    """Load CHECKER_CASES rows from the unit truth table (AST)."""
+    path = os.path.join(
+        REPO_ROOT, "tests", "unit", "test_sdk_surface.py"
+    )
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "CHECKER_CASES"
+        ):
+            return list(ast.literal_eval(node.value))
+    raise AssertionError("CHECKER_CASES not found in %s" % path)
+
+
+def _probe_import_texts(probes):
+    """Map each probe to its checker-row source text.
+
+    Every probe is its import text plus the ``def entry``
+    driver, except the string-hide probe, whose whole source
+    is the row (the import hides inside a string).
+    """
+    texts = []
+    for _stem, source, _must_fail, _marker in probes:
+        head, sep, _rest = source.partition(
+            "\ndef entry() -> Int32:\n"
+        )
+        texts.append(head + "\n" if sep else source)
+    return texts
+
+
+def test_frontend_probes_cover_checker_rows_exactly():
+    # Every probe's import text must be a CHECKER_CASES row
+    # with a consistent expectation, and no two probes may
+    # share a row: exactly the 21 probe-backed rows may claim
+    # frontend verification in the unit header, so the split
+    # cannot rot again.
+    rows = _checker_table()
+    table = dict(rows)
+    assert len(table) == len(rows) == 56, len(rows)
+    texts = _probe_import_texts(IMPORT_PROBES)
+    assert len(texts) == len(IMPORT_PROBES) == 21, len(texts)
+    assert len(set(texts)) == len(texts), texts
+    for (stem, _source, must_fail, _marker), text in zip(
+        IMPORT_PROBES, texts
+    ):
+        assert text in table, stem
+        assert table[text] == (1 if must_fail else 0), stem
 
 
 def test_frontend_import_negatives():

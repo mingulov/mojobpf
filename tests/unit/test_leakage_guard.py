@@ -5,7 +5,9 @@ The shipped set is derived, never guessed: the union of the sdist
 member pin (``tests/packaging/sdist-members.json``) and the wheel
 payload pin (``PINNED_PAYLOAD``/``PINNED_SCHEMA_DATA`` in
 ``tests/packaging/test_wheel_contents.py``, mapped back to tree
-paths), intersected with ``git ls-files`` tracked files. Every
+paths), intersected with ``git ls-files`` tracked files.
+Untracked pinned drops are allowlisted by
+``PINNED_GENERATED_DROPPED``; anything else fails. Every
 text-decodable member is grepped for internal work-package IDs
 (``WP-*``), stage IDs (``M-*``), finding IDs (``F-*``), and private
 workspace paths. A hit fails with a ``file:line`` listing; scrub the
@@ -21,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +47,20 @@ PATTERNS = (
     ),
 )
 
+# Pinned build-generated sdist members that are untracked by
+# design: anything else dropping out of the shipped set fails
+# for review instead of going silently unscanned.
+PINNED_GENERATED_DROPPED = (
+    "PKG-INFO",
+    "setup.cfg",
+    "src/mojobpf.egg-info/PKG-INFO",
+    "src/mojobpf.egg-info/SOURCES.txt",
+    "src/mojobpf.egg-info/dependency_links.txt",
+    "src/mojobpf.egg-info/entry_points.txt",
+    "src/mojobpf.egg-info/top_level.txt",
+)
+
+
 # Files the guard must cover for the verdict to mean anything: if a
 # manifest stops listing one of these, the guard fails closed instead
 # of silently narrowing.
@@ -55,24 +72,44 @@ REQUIRED_SHIPPED = (
 )
 
 
-def _wheel_tree_paths():
-    """Map the wheel payload pin back to tree-relative paths."""
-    with open(WHEEL_CONTRACT, encoding="utf-8") as handle:
-        tree = ast.parse(handle.read(), WHEEL_CONTRACT)
+_PIN_NAMES = ("PINNED_PAYLOAD", "PINNED_SCHEMA_DATA")
+
+
+def _read_wheel_pins(path):
+    """Read the wheel contract pins from ``path``.
+
+    Module-level assignments only: a nested pin assignment
+    never overrides the real pin, and a duplicate
+    module-level assignment fails instead of silently
+    winning.
+    """
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), path)
     pins = {}
-    for node in ast.walk(tree):
+    for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
         for target in node.targets:
             if (
                 isinstance(target, ast.Name)
-                and target.id in ("PINNED_PAYLOAD", "PINNED_SCHEMA_DATA")
+                and target.id in _PIN_NAMES
             ):
+                if target.id in pins:
+                    raise AssertionError(
+                        "duplicate wheel pin %r in %s"
+                        % (target.id, path)
+                    )
                 pins[target.id] = ast.literal_eval(node.value)
-    if set(pins) != {"PINNED_PAYLOAD", "PINNED_SCHEMA_DATA"}:
+    if set(pins) != set(_PIN_NAMES):
         raise AssertionError(
-            "wheel contract pins unreadable in %s" % WHEEL_CONTRACT
+            "wheel contract pins unreadable in %s" % path
         )
+    return pins
+
+
+def _wheel_tree_paths():
+    """Map the wheel payload pin back to tree-relative paths."""
+    pins = _read_wheel_pins(WHEEL_CONTRACT)
     paths = set()
     for name in pins["PINNED_PAYLOAD"]:
         if not name.startswith("mojobpf/"):
@@ -118,7 +155,14 @@ def shipped_tracked_files():
             "cannot derive tracked files (git ls-files failed): %s" % exc
         )
     tracked = set(raw.decode("utf-8").split())
-    shipped = (set(members) | _wheel_tree_paths()) & tracked
+    pinned = set(members) | _wheel_tree_paths()
+    dropped = pinned - tracked
+    if dropped != set(PINNED_GENERATED_DROPPED):
+        raise AssertionError(
+            "unpinned shipped-set drop: %s"
+            % sorted(dropped ^ set(PINNED_GENERATED_DROPPED))
+        )
+    shipped = pinned & tracked
     if not shipped:
         raise AssertionError("shipped tracked set is empty")
     return sorted(shipped)
@@ -155,6 +199,69 @@ def test_shipped_set_covers_scrubbed_files():
     missing = [name for name in REQUIRED_SHIPPED if name not in shipped]
     assert not missing, "guard lost coverage of: %s" % (", ".join(missing),)
     print("PASS shipped set covers %d files" % len(shipped))
+
+
+def test_unexpected_untracked_drop_fails_closed():
+    # A pinned file that is not git-tracked must be a pinned
+    # build-generated drop; anything else fails here instead
+    # of going silently unscanned.
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-drop-"
+    ) as parent:
+        members_path = os.path.join(parent, "sdist-members.json")
+        with open(members_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                ["setup.cfg", "zz-unexpected-drop.txt"], handle
+            )
+        old = globals()["SDIST_PIN"]
+        globals()["SDIST_PIN"] = members_path
+        try:
+            try:
+                shipped_tracked_files()
+            except AssertionError as exc:
+                assert "zz-unexpected-drop.txt" in str(exc), exc
+            else:
+                raise AssertionError(
+                    "unexpected drop went unscanned"
+                )
+        finally:
+            globals()["SDIST_PIN"] = old
+
+
+def test_wheel_pin_reader_ignores_nested_and_refuses_duplicates():
+    # A nested pin assignment must not override the
+    # module-level pin, and a duplicate module-level
+    # assignment must fail instead of silently winning.
+    probe = (
+        "PINNED_PAYLOAD = (\"mojobpf/a.py\",)\n"
+        "PINNED_SCHEMA_DATA = "
+        "((\"s.schema.json\", \"s.schema.json\"),)\n"
+        "def factory():\n"
+        "    PINNED_PAYLOAD = (\"evil\",)\n"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-pin-"
+    ) as parent:
+        path = os.path.join(parent, "probe_contract.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(probe)
+        assert _read_wheel_pins(path) == {
+            "PINNED_PAYLOAD": ("mojobpf/a.py",),
+            "PINNED_SCHEMA_DATA": (
+                ("s.schema.json", "s.schema.json"),
+            ),
+        }
+        dup_path = os.path.join(parent, "dup_contract.py")
+        with open(dup_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                probe + "PINNED_PAYLOAD = (\"mojobpf/b.py\",)\n"
+            )
+        try:
+            _read_wheel_pins(dup_path)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("duplicate pin accepted")
 
 
 def test_tracked_sources_carry_spdx_headers():

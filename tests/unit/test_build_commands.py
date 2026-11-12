@@ -6761,6 +6761,24 @@ def test_test_require_kernel_help_matches_behavior():
     assert "ignored for other suites" in text, text
 
 
+def test_test_require_kernel_ignored_for_non_kernel_suite():
+    # Behavioral pin for the help's "ignored for other
+    # suites": a non-kernel suite with --require-kernel and
+    # no vng runner still runs normally (exit 0), since the
+    # flag only gates the kernel suite.
+    parent = tempfile.mkdtemp(prefix="cli-test-nonrequire-")
+    root = os.path.join(parent, "tests")
+    _write_fixture_suite(root, "unit")
+    empty = tempfile.mkdtemp(prefix="empty-path-", dir=parent)
+    code, out, _ = run_cli(
+        ["test", "--suite", "unit", "--require-kernel",
+         "--suite-path", root],
+        path=empty,
+    )
+    assert code == 0, out
+    assert "1 passed" in out, out
+
+
 def test_test_kernel_all_skipped_without_require_passes():
     parent = tempfile.mkdtemp(prefix="cli-test-skippass-")
     root = os.path.join(parent, "tests")
@@ -7492,9 +7510,10 @@ def test_read_source_excerpt_swap_inside_open_never_blocks():
 
 
 def test_read_source_excerpt_setup_failure_returns_none_without_leak():
-    # Fault injection: os.set_blocking / os.fdopen raising must
-    # keep the best-effort contract (None, never raise) and must
-    # not leak the opened descriptor.
+    # Fault injection: os.set_blocking / os.fdopen raising
+    # (OSError or ValueError) must keep the best-effort
+    # contract (None, never raise) and must not leak the
+    # opened descriptor.
     with tempfile.TemporaryDirectory(
         prefix="build-excerpt-setup-"
     ) as parent:
@@ -7512,11 +7531,17 @@ def test_read_source_excerpt_setup_failure_returns_none_without_leak():
                 opened.append(fd)
             return fd
 
-        def failing_set_blocking(fd, flag):
+        def failing_set_blocking_oserror(fd, flag):
             raise OSError("injected set_blocking failure")
 
-        def failing_fdopen(fd, *args, **kwargs):
+        def failing_set_blocking_value(fd, flag):
+            raise ValueError("injected set_blocking failure")
+
+        def failing_fdopen_oserror(fd, *args, **kwargs):
             raise OSError("injected fdopen failure")
+
+        def failing_fdopen_value(fd, *args, **kwargs):
+            raise ValueError("injected fdopen failure")
 
         def _closed(fd):
             try:
@@ -7525,17 +7550,123 @@ def test_read_source_excerpt_setup_failure_returns_none_without_leak():
                 return True
             return False
 
-        os.open = tracking_os_open
-        try:
-            os.set_blocking = failing_set_blocking
+        def _calls_return_none(seam, name, failing, restore):
+            setattr(os, name, failing)
             try:
                 assert (
                     build_module._read_source_excerpt(target, 1)
                     is None
-                )
+                ), seam
             finally:
-                os.set_blocking = real_set_blocking
-            os.fdopen = failing_fdopen
+                setattr(os, name, restore)
+
+        os.open = tracking_os_open
+        try:
+            _calls_return_none(
+                "set_blocking/OSError", "set_blocking",
+                failing_set_blocking_oserror, real_set_blocking,
+            )
+            _calls_return_none(
+                "set_blocking/ValueError", "set_blocking",
+                failing_set_blocking_value, real_set_blocking,
+            )
+            _calls_return_none(
+                "fdopen/OSError", "fdopen",
+                failing_fdopen_oserror, real_fdopen,
+            )
+            _calls_return_none(
+                "fdopen/ValueError", "fdopen",
+                failing_fdopen_value, real_fdopen,
+            )
+        finally:
+            os.open = real_os_open
+        assert len(opened) == 4, opened
+        assert all(_closed(fd) for fd in opened), opened
+
+
+def test_read_source_excerpt_read_and_close_failures_stay_best_effort():
+    # Fault injection round two: read-time ValueError, a
+    # failing handle close, a failing os.close, and fstat
+    # ValueError must all keep the best-effort contract
+    # (None, never raise); closable descriptors still close.
+    with tempfile.TemporaryDirectory(
+        prefix="build-excerpt-readclose-"
+    ) as parent:
+        target = os.path.join(parent, "source.mojo")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("one\ntwo\n")
+        fifo = os.path.join(parent, "pipe.mojo")
+        os.mkfifo(fifo)
+        real_os_open = os.open
+        real_os_close = os.close
+        real_fstat = os.fstat
+        real_fdopen = os.fdopen
+        opened = []
+        closed = []
+
+        def tracking_os_open(path, flags, *args, **kwargs):
+            fd = real_os_open(path, flags, *args, **kwargs)
+            if path in (target, fifo):
+                opened.append(fd)
+            return fd
+
+        class _FailingIter:
+            def __init__(self):
+                self.closed_flag = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise ValueError("injected read failure")
+
+            def close(self):
+                self.closed_flag = True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.close()
+                return False
+
+        class _FailingClose:
+            def __init__(self, lines):
+                self._lines = lines
+
+            def __iter__(self):
+                return iter(self._lines)
+
+            def close(self):
+                closed.append("handle")
+                raise OSError("injected handle-close failure")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.close()
+                return False
+
+        def failing_fstat(fd):
+            raise ValueError("injected fstat failure")
+
+        def failing_close(fd):
+            raise OSError("injected close failure")
+
+        iters = []
+
+        def fake_fdopen_iter(fd, *args, **kwargs):
+            it = _FailingIter()
+            iters.append(it)
+            return it
+
+        def fake_fdopen_close(fd, *args, **kwargs):
+            return _FailingClose(["one\n", "two\n"])
+
+        os.open = tracking_os_open
+        try:
+            os.fdopen = fake_fdopen_iter
             try:
                 assert (
                     build_module._read_source_excerpt(target, 1)
@@ -7543,10 +7674,41 @@ def test_read_source_excerpt_setup_failure_returns_none_without_leak():
                 )
             finally:
                 os.fdopen = real_fdopen
+            assert iters and all(
+                it.closed_flag for it in iters
+            ), iters
+            os.fdopen = fake_fdopen_close
+            try:
+                assert build_module._read_source_excerpt(
+                    target, 2
+                ) == "two"
+            finally:
+                os.fdopen = real_fdopen
+            assert closed == ["handle"], closed
+            os.close = failing_close
+            try:
+                assert (
+                    build_module._read_source_excerpt(fifo, 1)
+                    is None
+                )
+            finally:
+                os.close = real_os_close
+            os.fstat = failing_fstat
+            try:
+                assert (
+                    build_module._read_source_excerpt(target, 1)
+                    is None
+                )
+            finally:
+                os.fstat = real_fstat
         finally:
             os.open = real_os_open
-        assert len(opened) == 2, opened
-        assert all(_closed(fd) for fd in opened), opened
+        for fd in opened:
+            try:
+                real_os_close(fd)
+            except OSError:
+                pass
+        assert len(opened) == 4, opened
 
 
 def _direct_run():

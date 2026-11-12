@@ -2241,6 +2241,14 @@ def _debug_aligns(
     return True
 
 
+def _close_quietly(fd: int) -> None:
+    """Close ``fd``, swallowing close failures (best-effort)."""
+    try:
+        os.close(fd)
+    except (OSError, ValueError):
+        pass
+
+
 def _read_source_excerpt(path: str, lineno: int) -> str | None:
     """Return source line ``lineno`` of ``path``, if readable.
 
@@ -2250,9 +2258,10 @@ def _read_source_excerpt(path: str, lineno: int) -> str | None:
     of hanging the build. The open is non-blocking and the
     regularity check binds the open file descriptor (not the
     path), mirroring :func:`mojobpf.execution._open_bound`,
-    so no swap timing can wedge it. Setup failures (the
-    blocking-mode reset, the stream wrap) likewise yield
-    None without leaking the descriptor.
+    so no swap timing can wedge it. Setup, read, and close
+    failures likewise yield None (a read line survives a
+    failing handle close): every error path returns None or a
+    line, never raises.
     """
     if lineno < 1:
         return None
@@ -2264,25 +2273,29 @@ def _read_source_excerpt(path: str, lineno: int) -> str | None:
         return None
     try:
         is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
-    except OSError:
-        os.close(fd)
+    except (OSError, ValueError):
+        _close_quietly(fd)
         return None
     if not is_regular:
-        os.close(fd)
+        _close_quietly(fd)
         return None
     try:
         os.set_blocking(fd, True)
         handle = os.fdopen(fd, "r", encoding="utf-8", errors="replace")
     except (OSError, ValueError):
-        os.close(fd)
+        _close_quietly(fd)
         return None
-    with handle:
+    try:
+        for number, text in enumerate(handle, 1):
+            if number == lineno:
+                return text.rstrip("\r\n")
+    except (OSError, ValueError):
+        return None
+    finally:
         try:
-            for number, text in enumerate(handle, 1):
-                if number == lineno:
-                    return text.rstrip("\r\n")
-        except OSError:
-            return None
+            handle.close()
+        except (OSError, ValueError):
+            pass
     return None
 
 

@@ -536,14 +536,68 @@ def test_size_budget_conforms():
     _assert_union_covered(schema, [accepted], "size-budget")
 
 
+_SWEEP_NESTED_SCOPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+)
+
+_SWEEP_TERMINATORS = (
+    ast.Return,
+    ast.Raise,
+    ast.Break,
+    ast.Continue,
+)
+
+_SWEEP_ASSERTS = (
+    "_assert_conforms",
+    "_assert_union_covered",
+)
+
+
+def _sweep_load_literal(node):
+    """Schema literal of a ``_load_schema`` call, else None."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_load_schema"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ):
+        return None
+    return node.args[0].value
+
+
+def _sweep_assert_names(node, into):
+    """Collect names flowing into an assert-helper call."""
+    stack = list(node.args)
+    stack.extend(
+        keyword.value
+        for keyword in node.keywords
+        if keyword.value is not None
+    )
+    while stack:
+        child = stack.pop()
+        if isinstance(child, _SWEEP_NESTED_SCOPES):
+            continue
+        if isinstance(child, ast.Name):
+            into.add(child.id)
+        stack.extend(ast.iter_child_nodes(child))
+
+
 def _sweep_covered_names(path):
     """Schema names the closed sweep credits in ``path``.
 
     Only module-level ``test_*`` bodies count (pytest parity:
-    nested ``test_*`` defs never run), and nested scopes
-    (``def``/``lambda``) inside them are not descended into:
-    a load or assertion that may never execute credits no
-    coverage.
+    nested ``test_*`` defs never run). Inside them, only
+    structurally live code counts: nested scopes
+    (``def``/``lambda``) are not descended into, statements
+    after a terminator (``return``/``raise``/``break``/
+    ``continue``) in the same block are skipped, and constant
+    ``if``/``while False`` branches are pruned. A load
+    credits coverage only when its bound name flows into an
+    assert-helper call (last binding wins). Dynamically
+    conditional code stays conservatively visited.
     """
     with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
@@ -554,35 +608,80 @@ def _sweep_covered_names(path):
             and node.name.startswith("test_")
         ):
             continue
-        loads = set()
-        asserted = False
-        stack = list(node.body)
-        while stack:
-            child = stack.pop()
-            if isinstance(
-                child,
-                (
-                    ast.FunctionDef,
-                    ast.AsyncFunctionDef,
-                    ast.Lambda,
-                ),
+        bound = {}
+        asserted_names = set()
+
+        def _collect(child):
+            if (
+                isinstance(child, ast.Assign)
+                and len(child.targets) == 1
+                and isinstance(child.targets[0], ast.Name)
             ):
-                continue
-            if isinstance(child, ast.Call) and isinstance(
-                child.func, ast.Name
+                literal = _sweep_load_literal(child.value)
+                if literal is not None:
+                    bound[child.targets[0].id] = literal
+            elif (
+                isinstance(child, ast.AnnAssign)
+                and isinstance(child.target, ast.Name)
+                and child.value is not None
             ):
-                if child.func.id == "_load_schema" and child.args:
-                    arg = child.args[0]
-                    if isinstance(arg, ast.Constant):
-                        loads.add(arg.value)
-                elif child.func.id in (
-                    "_assert_conforms",
-                    "_assert_union_covered",
+                literal = _sweep_load_literal(child.value)
+                if literal is not None:
+                    bound[child.target.id] = literal
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id in _SWEEP_ASSERTS
+            ):
+                _sweep_assert_names(child, asserted_names)
+
+        def _walk_block(statements):
+            for stmt in statements:
+                if isinstance(stmt, _SWEEP_TERMINATORS):
+                    for _field, entry in ast.iter_fields(stmt):
+                        if isinstance(entry, ast.AST):
+                            _walk_node(entry)
+                    return
+                _walk_node(stmt)
+
+        def _walk_node(child):
+            if isinstance(child, _SWEEP_NESTED_SCOPES):
+                return
+            if isinstance(child, ast.If) and isinstance(
+                child.test, ast.Constant
+            ):
+                _walk_node(child.test)
+                if child.test.value:
+                    _walk_block(child.body)
+                else:
+                    _walk_block(child.orelse)
+                return
+            if (
+                isinstance(child, ast.While)
+                and isinstance(child.test, ast.Constant)
+                and not child.test.value
+            ):
+                _walk_node(child.test)
+                _walk_block(child.orelse)
+                return
+            _collect(child)
+            for field, entry in ast.iter_fields(child):
+                if (
+                    field in ("body", "orelse", "finalbody")
+                    and isinstance(entry, list)
                 ):
-                    asserted = True
-            stack.extend(ast.iter_child_nodes(child))
-        if asserted:
-            covered |= loads
+                    _walk_block(entry)
+                elif isinstance(entry, list):
+                    for item in entry:
+                        if isinstance(item, ast.AST):
+                            _walk_node(item)
+                elif isinstance(entry, ast.AST):
+                    _walk_node(entry)
+
+        _walk_block(node.body)
+        for name in asserted_names:
+            if name in bound:
+                covered.add(bound[name])
     return covered
 
 
@@ -591,7 +690,10 @@ def test_sweep_credits_only_executed_module_level_loads():
     # scopes (a helper def, a lambda) or inside a nested
     # test_* def never execute under pytest, so the closed
     # sweep must not credit them; only module-level test_
-    # bodies count.
+    # bodies count. Likewise structurally dead loads (after
+    # a return, under ``if False``/``while False``) and loads
+    # whose result never flows into an assert helper credit
+    # nothing.
     probe = (
         "def test_outer():\n"
         "    schema = _load_schema(\"outer\")\n"
@@ -610,6 +712,28 @@ def test_sweep_credits_only_executed_module_level_loads():
         "    _assert_conforms(schema, {}, \"lam\")\n"
         "    _assert_union_covered(schema, [{}], \"lam\")\n"
         "    thunk = lambda: _load_schema(\"laminner\")\n"
+        "def test_dead():\n"
+        "    schema = _load_schema(\"live\")\n"
+        "    _assert_union_covered(schema, [{}], \"live\")\n"
+        "    return _assert_conforms(schema, {}, \"live\")\n"
+        "    schema = _load_schema(\"afterreturn\")\n"
+        "def test_constif():\n"
+        "    schema = _load_schema(\"live2\")\n"
+        "    if False:\n"
+        "        schema = _load_schema(\"iffalse\")\n"
+        "    _assert_conforms(schema, {}, \"live2\")\n"
+        "    _assert_union_covered(schema, [{}], \"live2\")\n"
+        "def test_whilefalse():\n"
+        "    schema = _load_schema(\"live3\")\n"
+        "    while False:\n"
+        "        schema = _load_schema(\"whilefalse\")\n"
+        "    _assert_conforms(schema, {}, \"live3\")\n"
+        "    _assert_union_covered(schema, [{}], \"live3\")\n"
+        "def test_mismatch():\n"
+        "    schema_a = _load_schema(\"unasserted\")\n"
+        "    schema_b = _load_schema(\"asserted\")\n"
+        "    _assert_conforms(schema_b, {}, \"asserted\")\n"
+        "    _assert_union_covered(schema_b, [{}], \"asserted\")\n"
     )
     with tempfile.TemporaryDirectory(
         prefix="schema-sweep-probe-"
@@ -617,14 +741,17 @@ def test_sweep_credits_only_executed_module_level_loads():
         path = os.path.join(parent, "probe_conform.py")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(probe)
-        assert _sweep_covered_names(path) == {"outer", "lam"}
+        assert _sweep_covered_names(path) == {
+            "outer", "lam", "live", "live2", "live3", "asserted",
+        }
 
 
 def test_every_schema_file_has_conformance_coverage():
     # Closed sweep: every schemas/*.schema.json at any depth
     # must be asserted by a conformance test above (a literal
-    # _load_schema load in a module-level test_* body that
-    # also calls an assert helper outside any nested scope),
+    # _load_schema load bound to a name in a module-level
+    # test_* body, whose value flows into an assert helper;
+    # nested scopes and structurally dead code are pruned),
     # so a new schema file without a test fails here, never
     # silently. A bare load with no assertions does not
     # count. No src loader globs schemas/ (all use exact
