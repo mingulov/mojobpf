@@ -962,6 +962,8 @@ def _load_shard_report(path):
             or not item.get("lane")
             or not isinstance(item.get("suite"), str)
             or not item.get("suite")
+            or not isinstance(item.get("outcome"), str)
+            or not item.get("outcome")
         ):
             raise SetupFailure(
                 "shard report %s carries malformed results; "
@@ -1047,7 +1049,7 @@ def merge_reports(paths, out_dir, expect_lanes=None):
             lane_id = lane.get("id", "?")
             if lane_id in seen_lanes:
                 raise SetupFailure(
-                    "lane %r is covered by more than one shard "
+                    "lane %r is covered more than once "
                     "(%s repeats it)" % (lane_id, path)
                 )
             seen_lanes.add(lane_id)
@@ -1095,8 +1097,8 @@ def merge_reports(paths, out_dir, expect_lanes=None):
                 )
             if case in seen_cases:
                 raise SetupFailure(
-                    "lane-suite %s/%s is covered by more than one "
-                    "shard (%s repeats it)"
+                    "lane-suite %s/%s is covered more than once "
+                    "(%s repeats it)"
                     % (case[0], case[1], path)
                 )
             seen_cases.add(case)
@@ -1156,7 +1158,12 @@ def merge_reports(paths, out_dir, expect_lanes=None):
             "merged elapsed_secs overflowed; refusing to emit "
             "a board the loader itself would refuse"
         )
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        raise SetupFailure(
+            "cannot create out dir %s: %s" % (out_dir, exc)
+        )
     merged = {
         "tool": "run_vm_tests",
         "commit": first["commit"],
@@ -2810,8 +2817,10 @@ def main(argv=None):
             )
             return EXIT_SETUP
         out_dir = args.out_dir
+        created_default = False
         if not out_dir:
             out_dir = tempfile.mkdtemp(prefix="mojobpf-matrix-merged-")
+            created_default = True
         expect = None
         if args.expect_lanes:
             expect = [
@@ -2822,6 +2831,8 @@ def main(argv=None):
         try:
             return merge_reports(args.merge, out_dir, expect)
         except SetupFailure as exc:
+            if created_default:
+                shutil.rmtree(out_dir, ignore_errors=True)
             sys.stderr.write("run_vm_tests: %s\n" % exc)
             return EXIT_SETUP
     if args.expect_lanes:

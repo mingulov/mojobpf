@@ -4015,9 +4015,11 @@ def test_merge_refuses_commit_mismatch():
             workdir, "b.json", _shard_report("lane-b", commit="bbb")
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
+        )
+        assert "disagrees on 'commit'" in message, message
         print("PASS merge refuses commit mismatch")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4034,9 +4036,11 @@ def test_merge_refuses_lane_overlap():
             workdir, "b.json", _shard_report("lane-a")
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
+        )
+        assert "covered more than once" in message, message
         print("PASS merge refuses lane overlap")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4267,12 +4271,15 @@ def test_merge_refuses_malformed_lane_without_traceback():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _merge_rejection_text(runner, args, out_dir):
+def _merge_rejection_text(runner, args, out_dir, must_not_exist=True):
     """Run a merge expecting refusal; return its stderr text.
 
     Pins the refusal contract: exit 2, a single stderr line
-    (no traceback), and no emitted board directory (refused
-    merges leave no trace).
+    (no traceback) carrying the tool prefix, and no emitted
+    board directory (refused merges leave no trace). Pass
+    must_not_exist=False when the out path pre-exists (e.g.
+    out_dir-is-a-file): the refusal shape is still pinned,
+    but there is nothing to not-emit.
     """
     import io
     from contextlib import redirect_stderr
@@ -4282,8 +4289,10 @@ def _merge_rejection_text(runner, args, out_dir):
         code = runner.main(args)
     assert code == 2, code
     message = buffer.getvalue()
+    assert message.startswith("run_vm_tests:"), message
     assert message.strip().count("\n") == 0, message
-    assert not os.path.exists(out_dir), out_dir
+    if must_not_exist:
+        assert not os.path.exists(out_dir), out_dir
     return message
 
 
@@ -4478,6 +4487,189 @@ def test_merge_refuses_elapsed_sum_overflow():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_merge_default_out_dir_refusal_cleans_up():
+    # A refused merge without --out-dir leaves no trace: the
+    # default mkdtemp dir is removed on the refusal path.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    created = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _captive_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, dir=workdir, **kwargs)
+        created.append(path)
+        return path
+
+    tempfile.mkdtemp = _captive_mkdtemp
+    try:
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a", commit="aaa")
+        )
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b", commit="bbb")
+        )
+        import io
+        from contextlib import redirect_stderr
+
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            code = runner.main(["--merge", first, second])
+        assert code == 2, code
+        message = buffer.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.strip().count("\n") == 0, message
+        assert "disagrees on 'commit'" in message, message
+        assert len(created) == 1, created
+        assert not os.path.exists(created[0]), created
+        print("PASS merge default out-dir refusal cleans up")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_default_out_dir_success_keeps_board():
+    # The success path keeps the default board: cleanup runs
+    # on refusal only, never on a merged board.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    created = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _captive_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, dir=workdir, **kwargs)
+        created.append(path)
+        return path
+
+    tempfile.mkdtemp = _captive_mkdtemp
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            ),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        assert runner.main(["--merge", first, second]) == 0
+        assert len(created) == 1, created
+        assert os.path.isfile(
+            os.path.join(created[0], "matrix-report.json")
+        ), created
+        print("PASS merge default out-dir success keeps board")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_out_dir_is_a_file():
+    # An out path that exists as a file refuses (exit 2,
+    # single line) instead of an uncaught traceback; the
+    # file itself is untouched.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            ),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write("not a dir\n")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out, must_not_exist=False,
+        )
+        assert "cannot create out dir" in message, message
+        assert os.path.isfile(out), out
+        print("PASS merge refuses out-dir-is-a-file")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_result_missing_outcome():
+    # A result without an outcome is malformed input, not a
+    # test failure: it refuses (exit 2) instead of falling
+    # through to the exit-1 failure path.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        report = _shard_report("lane-a")
+        del report["results"][0]["outcome"]
+        first = _write_report(workdir, "a.json", report)
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
+        )
+        assert "malformed results" in message, message
+        print("PASS merge refuses result missing outcome")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_intra_shard_duplicate_lane():
+    # A shard listing one lane twice refuses with an
+    # accurate message: the lane is covered more than
+    # once, not "by more than one shard".
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        report = _shard_report("lane-a")
+        report["lanes"].append(dict(report["lanes"][0]))
+        first = _write_report(workdir, "a.json", report)
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
+        )
+        assert "covered more than once" in message, message
+        assert "more than one shard" not in message, message
+        print("PASS merge refuses intra-shard duplicate lane")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_duplicate_lane_suite_cell():
+    # Two results for one lane-suite cell refuse, even
+    # within a single shard.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        report = _shard_report("lane-a")
+        report["results"].append(dict(report["results"][0]))
+        first = _write_report(workdir, "a.json", report)
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
+        )
+        assert "covered more than once" in message, message
+        print("PASS merge refuses duplicate lane-suite cell")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_merge_refuses_vacuous_shard():
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
@@ -4488,9 +4680,11 @@ def test_merge_refuses_vacuous_shard():
             workdir, "b.json", _shard_report("lane-b")
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
+        )
+        assert "vacuous shard never merges" in message, message
         print("PASS merge refuses vacuous shard")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4504,10 +4698,13 @@ def test_merge_refuses_missing_expected_lane():
             workdir, "a.json", _shard_report("lane-a")
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, "--out-dir", out,
-             "--expect-lanes", "lane-a,lane-b"]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, "--out-dir", out,
+                     "--expect-lanes", "lane-a,lane-b"],
+            out,
+        )
+        assert "do not cover the expected set" in message, message
+        assert "missing" in message, message
         print("PASS merge refuses missing expected lane")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4551,10 +4748,12 @@ def test_merge_refuses_partial_suite_coverage():
             _shard_report("lane-b", outcomes=(("s1", "pass"),)),
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out,
-             "--expect-lanes", "lane-a,lane-b"]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out,
+                     "--expect-lanes", "lane-a,lane-b"],
+            out,
+        )
+        assert "only pinned exclusions excuse" in message, message
         print("PASS merge refuses partial suite coverage")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4612,10 +4811,12 @@ def test_merge_refuses_beyond_pinned_exclusions():
             ),
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, "--out-dir", out,
-             "--expect-lanes", "v6.12-kvm"]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, "--out-dir", out,
+                     "--expect-lanes", "v6.12-kvm"],
+            out,
+        )
+        assert "only pinned exclusions excuse" in message, message
         print("PASS merge refuses beyond pinned exclusions")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4632,10 +4833,306 @@ def test_merge_refuses_malformed_report():
             workdir, "good.json", _shard_report("lane-a")
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", bad, good, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", bad, good, "--out-dir", out],
+            out,
+        )
+        assert "lacks 'commit'" in message, message
         print("PASS merge refuses malformed report")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_shard_identity_mismatch():
+    # Beyond the commit, the interpreter and consumer path
+    # are shard identity too: each mismatch refuses.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        variants = {
+            "python": {
+                "executable": "/other/python3",
+                "version": "3.14.8",
+            },
+            "consumer_path": ["/other/consumer"],
+        }
+        for key, other in variants.items():
+            first = _write_report(
+                workdir, "a-%s.json" % key,
+                _shard_report("lane-a"),
+            )
+            altered = _shard_report("lane-b")
+            altered[key] = other
+            second = _write_report(
+                workdir, "b-%s.json" % key, altered
+            )
+            out = os.path.join(workdir, "merged-%s" % key)
+            message = _merge_rejection_text(
+                runner,
+                ["--merge", first, second, "--out-dir", out],
+                out,
+            )
+            assert "disagrees on %r" % key in message, (
+                key, message,
+            )
+        print("PASS merge refuses shard identity mismatch")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_extra_expected_lane():
+    # Expected lanes must match exactly: an extra merged
+    # lane refuses, not just a missing one.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a")
+        )
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out,
+                     "--expect-lanes", "lane-a"],
+            out,
+        )
+        assert "do not cover the expected set" in message, message
+        assert "extra" in message, message
+        print("PASS merge refuses extra expected lane")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_unknown_suite_exclusion():
+    # The exclusion map must name real suites only: an
+    # unknown suite refuses instead of excusing anything.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        runner.LANE_SUITE_EXCLUSIONS = dict(
+            runner.LANE_SUITE_EXCLUSIONS,
+            **{"lane-a": ("bogus-suite",)},
+        )
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a")
+        )
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
+        )
+        assert "unknown suite" in message, message
+        print("PASS merge refuses unknown suite exclusion")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_unloadable_shard():
+    # A shard path that cannot load refuses (exit 2,
+    # single line), never a traceback.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        missing = os.path.join(workdir, "no-such.json")
+        good = _write_report(
+            workdir, "good.json", _shard_report("lane-a")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", missing, good, "--out-dir", out],
+            out,
+        )
+        assert "cannot load shard report" in message, message
+        print("PASS merge refuses unloadable shard")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_non_board_shard():
+    # Valid JSON that is not a run_vm_tests board refuses.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        foreign = os.path.join(workdir, "foreign.json")
+        with open(foreign, "w", encoding="utf-8") as handle:
+            handle.write('{"tool": "other-tool"}\n')
+        good = _write_report(
+            workdir, "good.json", _shard_report("lane-a")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", foreign, good, "--out-dir", out],
+            out,
+        )
+        assert "not a run_vm_tests board" in message, message
+        print("PASS merge refuses non-board shard")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_non_list_lanes():
+    # A shard whose lanes block is not a list refuses as
+    # malformed lanes.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        report = _shard_report("lane-a")
+        report["lanes"] = {"id": "lane-a"}
+        bad = _write_report(workdir, "bad.json", report)
+        good = _write_report(
+            workdir, "good.json", _shard_report("lane-b")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", bad, good, "--out-dir", out],
+            out,
+        )
+        assert "malformed lanes" in message, message
+        print("PASS merge refuses non-list lanes")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_non_list_results():
+    # A shard whose results block is not a list refuses as
+    # malformed results.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        report = _shard_report("lane-a")
+        report["results"] = {"lane-a": "pass"}
+        bad = _write_report(workdir, "bad.json", report)
+        good = _write_report(
+            workdir, "good.json", _shard_report("lane-b")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", bad, good, "--out-dir", out],
+            out,
+        )
+        assert "malformed results" in message, message
+        print("PASS merge refuses non-list results")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_reports_refuses_empty_shard_list():
+    # merge_reports([]) refuses directly: the CLI cannot
+    # express it (nargs=+), so only a direct call pins it.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        out = os.path.join(workdir, "merged")
+        try:
+            runner.merge_reports([], out)
+        except runner.SetupFailure as exc:
+            assert "at least one shard" in str(exc), exc
+        else:
+            raise AssertionError("empty shard list merged")
+        assert not os.path.exists(out), out
+        print("PASS merge reports refuses empty shard list")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_merge_with_run_flags():
+    # --merge takes no --lane/--suite/--timeout: each
+    # combination refuses (exit 2, single prefixed line)
+    # before any directory is created.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a")
+        )
+        for extra in (
+            ["--lane", "lane-a"],
+            ["--suite", "s1"],
+            ["--timeout", "5"],
+        ):
+            out = os.path.join(
+                workdir, "merged-%s" % extra[0].lstrip("-")
+            )
+            message = _merge_rejection_text(
+                runner,
+                ["--merge", first, "--out-dir", out] + extra,
+                out,
+            )
+            assert "--merge takes no" in message, (
+                extra, message,
+            )
+        print("PASS main refuses merge with run flags")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_expect_lanes_without_merge():
+    # --expect-lanes without --merge refuses (exit 2,
+    # single prefixed line) with no side effects.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--expect-lanes", "lane-a", "--out-dir", out],
+            out,
+        )
+        assert "--expect-lanes needs --merge" in message, message
+        print("PASS main refuses expect-lanes without merge")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_expect_lanes_parsing_edges():
+    # --expect-lanes parsing edges: whitespace-only refuses
+    # (nothing expected, lanes extra), while empty and
+    # duplicated spellings behave as absent and exact.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            ),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        blank = os.path.join(workdir, "merged-blank")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second,
+                     "--out-dir", blank,
+                     "--expect-lanes", "  "],
+            blank,
+        )
+        assert "extra" in message, message
+        empty = os.path.join(workdir, "merged-empty")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", empty,
+             "--expect-lanes", ""]
+        ) == 0
+        assert os.path.isfile(
+            os.path.join(empty, "matrix-report.json")
+        )
+        dupes = os.path.join(workdir, "merged-dupes")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", dupes,
+             "--expect-lanes", "lane-a,lane-b,lane-a"]
+        ) == 0
+        assert os.path.isfile(
+            os.path.join(dupes, "matrix-report.json")
+        )
+        print("PASS merge expect-lanes parsing edges")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
