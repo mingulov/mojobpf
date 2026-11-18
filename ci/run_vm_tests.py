@@ -897,6 +897,22 @@ class SetupFailure(Exception):
     """The matrix cannot run honestly (exit 2)."""
 
 
+def _runner_merge_identity(runner):
+    """Runner identity shared across merge shards (no spawn).
+
+    The farm scratch directory is per-run ephemeral state, not
+    runner identity: every lane run mints its own, so shards
+    from separate runs always differ there. Everything else in
+    the block (paths, hashes, versions, admissions) must match
+    exactly.
+    """
+    if not isinstance(runner, dict):
+        return runner
+    return {
+        key: value for key, value in runner.items() if key != "farm"
+    }
+
+
 def _load_shard_report(path):
     """Load one per-shard board, or refuse it as malformed."""
     try:
@@ -948,13 +964,21 @@ def merge_reports(paths, out_dir, expect_lanes=None):
     shards = [_load_shard_report(path) for path in paths]
     first = shards[0]
     for path, shard in zip(paths[1:], shards[1:]):
-        for key in ("commit", "python", "consumer_path", "runner"):
+        for key in ("commit", "python", "consumer_path"):
             if shard[key] != first[key]:
                 raise SetupFailure(
                     "shard %s disagrees on %r; shards must share "
                     "their commit, runner, interpreter and "
                     "consumer path" % (path, key)
                 )
+        if _runner_merge_identity(
+            shard["runner"]
+        ) != _runner_merge_identity(first["runner"]):
+            raise SetupFailure(
+                "shard %s disagrees on 'runner'; shards must "
+                "share their commit, runner, interpreter and "
+                "consumer path" % (path,)
+            )
     seen_lanes = set()
     lanes = []
     for path, shard in zip(paths, shards):

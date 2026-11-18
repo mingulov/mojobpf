@@ -3798,6 +3798,29 @@ def test_merge_refuses_runner_mismatch():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_merge_accepts_distinct_farm_paths():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        first_report["runner"]["farm"] = "/tmp/mojobpf-farm-aaaa"
+        second_report = _shard_report(
+            "lane-b", outcomes=_full_outcomes(runner)
+        )
+        second_report["runner"]["farm"] = "/tmp/mojobpf-farm-bbbb"
+        first = _write_report(workdir, "a.json", first_report)
+        second = _write_report(workdir, "b.json", second_report)
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out]
+        ) == 0
+        print("PASS merge accepts distinct farm paths")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_merge_refuses_vacuous_shard():
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
