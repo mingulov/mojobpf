@@ -4004,6 +4004,58 @@ def test_merge_shard_failure_fails_merged():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_merge_records_non_pass_outcome_vocabulary():
+    # The producer vocabulary beyond pass/fail merges:
+    # timeout and envfail outcomes (and any other
+    # non-empty outcome string) fail the merge (exit 1)
+    # and are recorded verbatim, never refused and never
+    # a pass.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        suite_ids = [suite_id for suite_id, _, _ in runner.SUITES]
+        assert len(suite_ids) >= 3, suite_ids
+        outcomes = tuple(
+            (suite_id, outcome)
+            for suite_id, outcome in zip(
+                suite_ids,
+                ["timeout", "envfail", "bogus"] + ["pass"] * len(
+                    suite_ids
+                ),
+            )
+        )
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report("lane-a", outcomes=outcomes),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out]
+        ) == 1
+        with open(
+            os.path.join(out, "matrix-report.json"),
+            encoding="utf-8",
+        ) as handle:
+            merged = json.load(handle)
+        seen = {
+            (item["suite"], item["outcome"])
+            for item in merged["results"]
+            if item["lane"] == "lane-a"
+        }
+        assert (suite_ids[0], "timeout") in seen, seen
+        assert (suite_ids[1], "envfail") in seen, seen
+        assert (suite_ids[2], "bogus") in seen, seen
+        print("PASS merge records non-pass outcome vocabulary")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_merge_refuses_commit_mismatch():
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
@@ -4630,6 +4682,7 @@ def test_merge_refuses_unwritable_report():
         assert not os.path.isfile(
             os.path.join(out, "matrix-report.json")
         ), out
+        assert os.path.isdir(out), out
         print("PASS merge refuses unwritable report")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4721,6 +4774,90 @@ def test_merge_default_out_dir_failure_keeps_board():
         print("PASS merge default out-dir failure keeps board")
     finally:
         tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_default_dir_creation_failure():
+    # A default out dir that cannot be created refuses
+    # (exit 2, single line) instead of an uncaught
+    # traceback.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _boom(*args, **kwargs):
+        raise NotADirectoryError("mkdtemp probe")
+
+    tempfile.mkdtemp = _boom
+    try:
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a")
+        )
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b")
+        )
+        import io
+        from contextlib import redirect_stderr
+
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            code = runner.main(["--merge", first, second])
+        assert code == 2, code
+        message = buffer.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.strip().count("\n") == 0, message
+        assert "cannot create default out dir" in message, message
+        print("PASS merge refuses default-dir creation failure")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refusal_survives_cleanup_failure():
+    # Cleanup is best-effort: a failing rmtree still
+    # refuses (exit 2, single line); the leftover dir is
+    # the documented trace of a failed cleanup, not a
+    # crash.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    created = []
+    real_mkdtemp = tempfile.mkdtemp
+    real_rmtree = runner.shutil.rmtree
+
+    def _captive_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, dir=workdir, **kwargs)
+        created.append(path)
+        return path
+
+    def _boom(*args, **kwargs):
+        raise OSError("rmtree probe")
+
+    tempfile.mkdtemp = _captive_mkdtemp
+    runner.shutil.rmtree = _boom
+    try:
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a", commit="aaa")
+        )
+        second = _write_report(
+            workdir, "b.json", _shard_report("lane-b", commit="bbb")
+        )
+        import io
+        from contextlib import redirect_stderr
+
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            code = runner.main(["--merge", first, second])
+        assert code == 2, code
+        message = buffer.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.strip().count("\n") == 0, message
+        assert "disagrees on 'commit'" in message, message
+        assert len(created) == 1, created
+        assert os.path.isdir(created[0]), created
+        print("PASS merge refusal survives cleanup failure")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
+        runner.shutil.rmtree = real_rmtree
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -4836,6 +4973,114 @@ def test_main_refuses_unwritable_report():
         ), out
         print("PASS main refuses unwritable report")
     finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_default_dir_creation_failure():
+    # A direct-run default out dir that cannot be created
+    # refuses (exit 2, single line) instead of an uncaught
+    # traceback.
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _boom(*args, **kwargs):
+        raise NotADirectoryError("mkdtemp probe")
+
+    tempfile.mkdtemp = _boom
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with redirect_stderr(stderr):
+                code = runner.main(["--lock", lock_path])
+        assert code == 2, (code, stdout.getvalue())
+        message = stderr.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.strip().count("\n") == 0, message
+        assert "cannot create default out dir" in message, message
+        print("PASS main refuses default-dir creation failure")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_default_out_dir_keeps_board():
+    # Direct-run default dir: the board lands in the minted
+    # dir and the dir is kept (no cleanup concept on the
+    # direct path; failures keep their evidence too).
+    import contextlib
+    import io
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    created = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _captive_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, dir=workdir, **kwargs)
+        created.append(path)
+        return path
+
+    tempfile.mkdtemp = _captive_mkdtemp
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = runner.main(["--lock", lock_path])
+        assert code == 2, (code, stdout.getvalue())
+        assert "refusing an empty board" in stdout.getvalue()
+        assert len(created) == 1, created
+        assert os.path.isfile(
+            os.path.join(created[0], "matrix-report.json")
+        ), created
+        print("PASS main default out-dir keeps board")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_default_out_dir_write_failure_keeps_dir():
+    # Direct-run default dir without cleanup: a board that
+    # cannot be written refuses (exit 2, single line) and
+    # the minted dir stays (unlike merge, which cleans
+    # its default dir on refusal).
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    created = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _captive_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, dir=workdir, **kwargs)
+        os.makedirs(os.path.join(path, "matrix-report.json"))
+        created.append(path)
+        return path
+
+    tempfile.mkdtemp = _captive_mkdtemp
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with redirect_stderr(stderr):
+                code = runner.main(["--lock", lock_path])
+        assert code == 2, (code, stdout.getvalue())
+        message = stderr.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.strip().count("\n") == 0, message
+        assert "cannot write report" in message, message
+        assert len(created) == 1, created
+        assert os.path.isdir(created[0]), created
+        print("PASS main default out-dir write failure keeps dir")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -5376,51 +5621,12 @@ def test_main_refuses_empty_board_when_all_cells_excluded():
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-empty-board-")
     try:
-        lock = _lock(
-            [
-                _lane(lane_id="solo-a", release="v9.1"),
-                _lane(lane_id="solo-b", release="v9.2"),
-            ]
-        )
-        lock_path = os.path.join(workdir, "lock.json")
-        with open(lock_path, "w", encoding="utf-8") as handle:
-            json.dump(lock, handle)
+        lock_path = _stubbed_direct_runner(runner, workdir)
         out_dir = os.path.join(workdir, "out")
         all_suites = tuple(
             suite_id for suite_id, _, _ in runner.SUITES
         )
         assert all_suites, "SUITES fixture empty"
-
-        def _boom(*args, **kwargs):
-            raise AssertionError(
-                "suite ran despite full exclusion"
-            )
-
-        runner.git_head = lambda: "abc123"
-        runner.git_clean = lambda: ""
-        runner.check_runner = lambda *a, **k: {
-            "farm": os.path.join(workdir, "farm"),
-            "version": "virtme-ng test",
-            "realpath": "/nonexistent/vng",
-            "digest": "d" * 64,
-            "qemu_binary": "qemu-test",
-            "qemu_path": "/nonexistent/qemu",
-            "qemu_version": "QEMU test",
-            "virtme_run_path": "/nonexistent/virtme-run",
-            "virtme_run_version": "virtme-run test",
-        }
-        runner.check_lane_cache = lambda lane: {}
-        runner.check_consumer_vng_shadow = lambda *a, **k: None
-        runner.check_consumer_qemu_shadow = lambda *a, **k: None
-        runner.check_consumer_virtme_run_shadow = (
-            lambda *a, **k: None
-        )
-        runner.run_suite = _boom
-        runner.runner_report = lambda value: {"stubbed": True}
-        runner.LANE_SUITE_EXCLUSIONS = {
-            "solo-a": all_suites,
-            "solo-b": all_suites,
-        }
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = runner.main(

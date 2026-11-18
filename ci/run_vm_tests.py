@@ -38,6 +38,14 @@ lockfile). Only the pinned ``LANE_SUITE_EXCLUSIONS`` cells skip,
 loudly and marked ``excluded``; any other unrun lane or suite is
 a failure, not a pass.
 
+Without ``--out-dir`` the run mints a temporary directory
+(``mojobpf-matrix-`` for runs, ``mojobpf-matrix-merged-`` for
+merges). The directory is kept with its board on success and
+on failure; a refused merge removes its minted directory, so a
+refused merge leaves no trace. A directory that cannot be
+created, or a board that cannot be written, refuses
+(exit 2) like any other setup problem.
+
 Suites report through the structured result protocol, not line
 scraping: each suite seals a ``test-contracts-v1`` run plan,
 emits one case result per case, and ends with a terminal
@@ -2775,7 +2783,9 @@ def build_parser():
     parser.add_argument(
         "--out-dir",
         default=None,
-        help="directory for per-suite logs and the report",
+        help="directory for per-suite logs and the report "
+        "(default: a fresh temporary directory, kept with "
+        "its board except on a refused merge)",
     )
     parser.add_argument(
         "--timeout",
@@ -2824,7 +2834,16 @@ def main(argv=None):
         out_dir = args.out_dir
         created_default = False
         if not out_dir:
-            out_dir = tempfile.mkdtemp(prefix="mojobpf-matrix-merged-")
+            try:
+                out_dir = tempfile.mkdtemp(
+                    prefix="mojobpf-matrix-merged-"
+                )
+            except OSError as exc:
+                sys.stderr.write(
+                    "run_vm_tests: cannot create default out "
+                    "dir: %s\n" % exc
+                )
+                return EXIT_SETUP
             created_default = True
         expect = None
         if args.expect_lanes:
@@ -2837,7 +2856,10 @@ def main(argv=None):
             return merge_reports(args.merge, out_dir, expect)
         except SetupFailure as exc:
             if created_default:
-                shutil.rmtree(out_dir, ignore_errors=True)
+                try:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                except OSError:
+                    pass
             sys.stderr.write("run_vm_tests: %s\n" % exc)
             return EXIT_SETUP
     if args.expect_lanes:
@@ -2923,7 +2945,14 @@ def main(argv=None):
             )
             return EXIT_SETUP
     else:
-        out_dir = tempfile.mkdtemp(prefix="mojobpf-matrix-")
+        try:
+            out_dir = tempfile.mkdtemp(prefix="mojobpf-matrix-")
+        except OSError as exc:
+            sys.stderr.write(
+                "run_vm_tests: cannot create default out "
+                "dir: %s\n" % exc
+            )
+            return EXIT_SETUP
     started = time.time()
     print("matrix: commit %s" % commit)
     print("matrix: runner %s (%s)" % (runner["version"], runner["realpath"]))
