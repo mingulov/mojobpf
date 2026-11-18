@@ -425,7 +425,9 @@ below names the current pins. The 0.3.0a1 alpha record (see
 measured behaviors on LLVM 22.1.8 with bpftool 7.6.0 /
 libbpf 1.6 under software emulation; the current tree re-proves
 them on the five KVM lanes of the release matrix (197/205
-cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), which
+cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), re-run
+green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
+exclusions, 0 red; board commit e98ea93), which
 claims kernels 6.6.0, 6.12.0, 7.0.14, 7.2, and 7.4-rc1. Other
 combinations are unproven, not supported. Full binary paths
 and hashes are recorded in `toolchains.lock.json`; rerun
@@ -490,8 +492,11 @@ of them is implied by the results above:
   compiler. An explicit `--target-triple bpfel-unknown-none` fails at
   target registration (`No available targets are compatible with
   triple`), and the supported-target list contains no BPF entry.
+  Re-probed under the pinned Mojo 1.2.0 (`2016d0cd`): 11
+  supported targets (aarch64, riscv, x86 families), zero BPF;
+  the explicit triple still fails at target registration.
   Re-probe with `mojo build --print-supported-targets` if the
-  compiler changes.
+  compiler changes again.
 - Compiler, backend, and host coverage beyond the observed
   lanes: unproven. One AArch64 guest lane and one second Mojo
   combination (1.0.0, investigational) have their own runs and
@@ -501,8 +506,9 @@ of them is implied by the results above:
   BPF still need theirs. The claimed x86-64 lanes (6.12.0,
   6.6.0, 7.0.14, 7.2, 7.4-rc1, all KVM, plus the named
   `v6.12-tcg` fallback) are pinned in `ci/kernels.lock.json`
-  and driven by `ci/run_vm_tests.py`, with the 6.6 loop-shape
-  verifier boundary pinned per lane (see the compatibility
+  and driven by `ci/run_vm_tests.py`, with per-lane loop-shape
+  verdicts pinned (all five lanes pass under the pinned 1.2.0
+  frontend; see the compatibility
   documentation); each lane is claimed by its full 41-suite
   matrix pass (197/205 cells; see
   [evidence-1.0.0.md](evidence-1.0.0.md)). Each proof above
@@ -582,9 +588,12 @@ of them is implied by the results above:
   absence (`compiler/audit.py`).
 - The stack-slot and int-to-pointer cast assembly spellings are
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
-  lifetime-marker skew, re-qualified under the pinned Mojo 1.2.0;
-  they must be revisited if a future Mojo emits backend-compatible
-  IR for those constructs.
+  lifetime-marker skew, re-qualified under the pinned Mojo 1.2.0
+  (full 41-suite x 5-lane board green: 197 passed, 8 pinned
+  exclusions, 0 red; board commit e98ea93 — see the
+  compatibility five-kernel board); they must be revisited if
+  a future Mojo emits backend-compatible IR for those
+  constructs.
 - Content-derived variable packet offsets (loading one packet byte
   to compute a second packet address) are outside the supported
   subset: the verifier cannot connect a separately computed guard

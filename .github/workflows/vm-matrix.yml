@@ -37,7 +37,7 @@
 # matrix never synthesizes a lease, so a shard without the
 # target lease fails fast before booting anything.
 #
-# Toolchain trust: `pixi install` resolves Mojo 1.1.0 from the
+# Toolchain trust: `pixi install` resolves Mojo 1.2.0 from the
 # committed pixi.lock (pixi verifies the locked hashes); the
 # lane's toolchain admission then verifies every tool against
 # toolchains.lock.json before compiling. Mojo runs through the
@@ -246,7 +246,7 @@ jobs:
           "$RUNNER_TEMP/venv/bin/python" -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - name: install the pinned Mojo toolchain
-        # pixi resolves Mojo 1.1.0 from the committed pixi.lock
+        # pixi resolves Mojo 1.2.0 from the committed pixi.lock
         # (locked hashes verified by pixi itself); the lane's
         # toolchain admission re-verifies every tool against
         # toolchains.lock.json before compiling.

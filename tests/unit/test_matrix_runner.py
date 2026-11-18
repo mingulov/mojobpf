@@ -3783,11 +3783,17 @@ def test_merge_refuses_runner_mismatch():
     try:
         first = _write_report(
             workdir, "a.json",
-            _shard_report("lane-a", digest="d" * 64),
+            _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner),
+                digest="d" * 64,
+            ),
         )
         second = _write_report(
             workdir, "b.json",
-            _shard_report("lane-b", digest="e" * 64),
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner),
+                digest="e" * 64,
+            ),
         )
         out = os.path.join(workdir, "merged")
         assert runner.main(
@@ -3817,6 +3823,59 @@ def test_merge_accepts_distinct_farm_paths():
             ["--merge", first, second, "--out-dir", out]
         ) == 0
         print("PASS merge accepts distinct farm paths")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_scrubs_ephemeral_farm_from_board():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        first_report["runner"]["farm"] = "/tmp/mojobpf-farm-aaaa"
+        second_report = _shard_report(
+            "lane-b", outcomes=_full_outcomes(runner)
+        )
+        second_report["runner"]["farm"] = "/tmp/mojobpf-farm-bbbb"
+        first = _write_report(workdir, "a.json", first_report)
+        second = _write_report(workdir, "b.json", second_report)
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out]
+        ) == 0
+        with open(
+            os.path.join(out, "matrix-report.json"), encoding="utf-8"
+        ) as handle:
+            merged = json.load(handle)
+        assert "farm" not in merged["runner"], merged["runner"]
+        print("PASS merge scrubs farm from board")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_farm_plus_digest_mismatch_still_refuses():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner),
+            digest="d" * 64,
+        )
+        first_report["runner"]["farm"] = "/tmp/mojobpf-farm-aaaa"
+        second_report = _shard_report(
+            "lane-b", outcomes=_full_outcomes(runner),
+            digest="e" * 64,
+        )
+        second_report["runner"]["farm"] = "/tmp/mojobpf-farm-bbbb"
+        first = _write_report(workdir, "a.json", first_report)
+        second = _write_report(workdir, "b.json", second_report)
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out]
+        ) == 2
+        print("PASS merge farm+digest mismatch refuses")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

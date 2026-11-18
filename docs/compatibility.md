@@ -104,7 +104,13 @@ and 7.4.0-070400rc1-generic. A kernel is claimed only when the
 full 41-suite matrix passes on its lane apart from the ruled
 exclusions following this paragraph; the v1.0 matrix passes
 197/205 cells with 0 red and 0 unexplained (see
-[evidence-1.0.0.md](evidence-1.0.0.md)). Two ruled cell groups stay
+[evidence-1.0.0.md](evidence-1.0.0.md)). The same board re-ran
+green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
+exclusions, 0 red; board commit e98ea93 via
+`ci/run_vm_tests.py` per-lane runs plus `--merge`;
+e98ea93..HEAD touches only merge aggregation, docs, and host
+unit tests — no suite, driver, adapter, SDK, or harness
+change). Two ruled cell groups stay
 out of claim: the joint suite (needs libbpf-mojo inputs,
 labelled experimental) and 7.x task-struct layouts (1.x CO-RE
 work). These rulings are mechanized as `LANE_SUITE_EXCLUSIONS`
@@ -121,7 +127,9 @@ libbpf 1.6, QEMU 10.2.2, software emulation) in both alpha
 lanes; see [evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the
 anchor board. Those observations stand as the alpha record;
 the current tree re-proved them in the v1.0 release matrix
-(see [evidence-1.0.0.md](evidence-1.0.0.md)).
+(see [evidence-1.0.0.md](evidence-1.0.0.md)) and again in the
+Mojo 1.2.0 board re-run (197 passed, 8 pinned exclusions,
+0 red; board commit e98ea93).
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
@@ -202,7 +210,8 @@ second combination needs its own maintainer decision.
 The observed verdict: Mojo-independent suites run identically
 (`tests/unit`: 311 passed), and the 1.0.0 frontend compiles
 SDK-free kernel sources to byte-identical IR and objects as
-1.1.0, proven in-guest by `tests/kernel/test_mojo_xdp.py`
+the then-pinned 1.1.0 (retired by the 1.2.0 promotion),
+proven in-guest by `tests/kernel/test_mojo_xdp.py`
 (5/5 on the x86-64 v6.12 lane). But the packaged SDK surface
 does not parse under 1.0.0: it uses the 1.1
 decorator-argument spelling `@inline(.always)` in every
@@ -216,7 +225,7 @@ so any SDK import transitively fails at parse.
 Build-driver paths additionally refuse the unpinned compiler
 at the toolchain gate (`MBPF102`) exactly as designed.
 
-## Kernel-version boundary: `loop-sum` on 6.6
+## Retired boundary: `loop-sum` on 6.6 (Mojo 1.1.0 era)
 
 The bounded-loop subset case `loop-sum` verifies and runs on
 all five matrix lanes (6.6, 6.12, 7.0.14, 7.2, and 7.4-rc1):
@@ -231,10 +240,12 @@ and any other behavior on any lane fails loudly
 (`tests/verifier/test_subset_kernel.py::test_loop_sum`,
 `docs/supported-subset.md` case table, all five matrix lanes).
 
-This is a genuine kernel-version boundary the five-lane matrix
-exists to find — not a skipped lane. Programs whose loops the
-6.6 verifier rejects must be reshaped; the remaining subset
-cases behave identically on all five lanes.
+Retired per-lane boundaries stay pinned as process, not as
+live constraints: a future lane whose verifier rejects a
+subset shape gets its own evidenced verdict instead of
+inheriting pass. No subset case currently exercises a
+kernel-version boundary; all behave identically on all five
+lanes.
 
 ## Measured tracing limitations
 
@@ -626,7 +637,8 @@ host suites, selected-but-refused vectors).
 * Kernels outside the five claimed lanes: only 6.6.0, 6.12.0,
   7.0.14, 7.2.0, and 7.4.0-rc1 are claimed (each by a full
   41-suite matrix pass on its lane apart from the ruled
-  exclusions); the historical alpha
+  exclusions, re-run green under Mojo 1.2.0 — see the
+  five-kernel board above); the historical alpha
   verdicts do not qualify the current tree.
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header
@@ -637,7 +649,9 @@ host suites, selected-but-refused vectors).
   (`v6.12-tcg`) exists solely for the no-KVM-dependence
   spot-proof. The historical alpha matrix ran under software
   emulation; the release matrix proves the KVM lanes (197/205
-  cells; see [evidence-1.0.0.md](evidence-1.0.0.md)).
+  cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), re-run
+  green under Mojo 1.2.0 (197 passed, 8 pinned exclusions,
+  0 red; board commit e98ea93).
 
 ## Audit boundaries
 

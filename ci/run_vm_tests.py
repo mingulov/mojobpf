@@ -955,7 +955,8 @@ def merge_reports(paths, out_dir, expect_lanes=None):
     shard (``--suite``) refuses instead of merging a green
     partial board, and only the pinned map excuses absent
     cells. The merged board keeps the shared blocks
-    verbatim, concatenates lanes and results in input
+    verbatim (minus the per-shard ephemeral farm path),
+    concatenates lanes and results in input
     order, and records ``merged_from``. A non-pass outcome
     anywhere fails the merge (exit 1).
     """
@@ -1057,7 +1058,11 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         "commit": first["commit"],
         "python": first["python"],
         "consumer_path": first["consumer_path"],
-        "runner": first["runner"],
+        # The merge keeps shared blocks verbatim, but the farm is
+        # per-shard ephemeral state (a removed mkdtemp path), never
+        # shared identity: scrub it rather than keep one shard's
+        # dead path as the board's.
+        "runner": _runner_merge_identity(first["runner"]),
         "lanes": lanes,
         "results": results,
         "merged_from": list(paths),
