@@ -5156,20 +5156,37 @@ def _reject_dependency_local_shadow(
 
     Every ``RECORD``-verified importable file -- source,
     sourceless bytecode, or extension module -- must be what
-    the interpreter actually selects: a winning sibling on the
-    distribution root itself (extensions beat source and
-    bytecode within a level, packages beat modules
-    structurally) means the verified bytes never execute, and
-    a namespace-only parent level falls back to any regular
-    spelling on a later root. A verified file beaten even by
-    another verified file fails closed (a ``RECORD`` listing
-    both ``stem.py`` and legacy ``stem.pyc`` binds nothing
-    for the loser). Suffix matching is posix-exact (see
-    :func:`_record_import_stems`): ``.PY``/``.PYC`` spellings
-    never win import selection, so they are skipped. Raises
-    :class:`AdmissionError` (``module-mismatch``) naming the
-    shadow, before any probe executes.
+    the interpreter actually selects, unless the winning
+    sibling is itself ``RECORD``-verified: a winning sibling
+    on the distribution root itself (extensions beat source
+    and bytecode within a level, packages beat modules
+    structurally) means the verified loser's bytes never
+    execute, which admits exactly when the winner's bytes are
+    verified too (dual shipment, such as ``stem.py`` beside
+    ``stem.<tag>.so``: the executed bytes are verified
+    bytes). A winner outside ``RECORD`` -- a planted sibling
+    the manifest never pinned -- still fails closed, as does
+    a namespace-only parent level falling back to any regular
+    spelling on a later root. Suffix matching is posix-exact
+    (see :func:`_record_import_stems`): ``.PY``/``.PYC``
+    spellings never win import selection, so they are
+    skipped. Raises :class:`AdmissionError`
+    (``module-mismatch``) naming the shadow, before any probe
+    executes.
     """
+    verified: set[str] = set()
+    for row in csv.reader(record_text.splitlines()):
+        if not row or not row[0]:
+            continue
+        rel = row[0]
+        if rel.startswith("/") or rel.startswith(".."):
+            continue
+        segments = rel.split("/")
+        if not segments or segments[0].endswith(".dist-info"):
+            continue
+        if "__pycache__" in segments:
+            continue
+        verified.add(rel)
 
     def _refuse(rel: str, beater: str, detail: str) -> None:
         raise AdmissionError(
@@ -5180,6 +5197,12 @@ def _reject_dependency_local_shadow(
         )
 
     def _refuse_same_root(rel: str, beater_rel: str) -> None:
+        if beater_rel in verified:
+            # Dual shipment: the winning sibling is itself a
+            # RECORD-verified file whose bytes were re-hashed
+            # against the lock-pinned manifest, so the
+            # executed bytes are verified bytes.
+            return
         _refuse(
             rel, "same-root %s" % beater_rel,
             " on its verified root %r" % (dist_root,),

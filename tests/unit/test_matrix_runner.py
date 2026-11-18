@@ -1810,6 +1810,207 @@ def test_distribution_sourceless_verified_beaten_by_source_refused():
         shutil.rmtree(tree["root"], ignore_errors=True)
 
 
+def _lock_with_dep_dist(tree, name, version, files):
+    """Pin a fixture distribution built from ``files``."""
+    metadata_digest, record_digest = _write_dep_dist(
+        tree["pkgdir"], name, version, files
+    )
+    lock = _pinned_runner_lock(tree)
+    lock["distribution"] = {
+        "runner": {
+            "dependencies": [
+                {
+                    "name": name,
+                    "version": version,
+                    "metadata_sha256": metadata_digest,
+                    "record_sha256": record_digest,
+                },
+            ],
+        },
+        "emulator": {"qemu_version": _QEMU_FIXTURE_VERSION},
+    }
+    return lock
+
+
+def _admitted_runner_version(runner, lock, tree):
+    """Admit the fixture runner; return its probed version."""
+    record = runner.check_runner(lock, farm_parent=tree["root"])
+    try:
+        assert record["version"] == _VNG_FIXTURE_VERSION, record
+    finally:
+        shutil.rmtree(record["farm"], ignore_errors=True)
+    return record["version"]
+
+
+def _donor_extension_bytes():
+    """Read a loadable stdlib extension, skipping without one."""
+    donor = _find_extension_donor()
+    if donor is None:
+        import pytest
+
+        pytest.skip("no loadable stdlib extension on this host")
+    with open(donor, "rb") as handle:
+        return handle.read()
+
+
+def test_distribution_verified_extension_beats_verified_source_admits():
+    """A RECORD-verified extension beside a RECORD-verified
+    source is dual shipment, not a hijack: the file finder
+    selects the extension and its bytes are verified, so the
+    distribution admits (the executed bytes are verified
+    bytes)."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_dual",
+        "1.0",
+        {
+            "matrix_dual.py": "VALUE = 1\n",
+            "matrix_dual" + suffix: _donor_extension_bytes(),
+        },
+    )
+    # Positive control: the file finder selects the extension.
+    origin = _find_spec_origin("matrix_dual", [tree["pkgdir"]])
+    assert origin.endswith(".so"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        _admitted_runner_version(runner, lock, tree)
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_unverified_extension_beats_verified_source_refused():
+    """A same-stem extension outside RECORD beside a
+    RECORD-verified source wins import selection with
+    unverified bytes, so the distribution is refused before any
+    probe with module-mismatch."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_dual",
+        "1.0",
+        {"matrix_dual.py": "VALUE = 1\n"},
+    )
+    _write_shadow_module_ext_so(tree["pkgdir"], "matrix_dual")
+    # Positive control: the file finder selects the extension.
+    origin = _find_spec_origin("matrix_dual", [tree["pkgdir"]])
+    assert origin.endswith(".so"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_verified_extension_init_beats_verified_init_admits():
+    """A RECORD-verified package extension init beside a
+    RECORD-verified __init__.py admits: the winner is verified
+    bytes."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_dualpkg",
+        "1.0",
+        {
+            "matrix_dualpkg/__init__.py": "VALUE = 1\n",
+            "matrix_dualpkg/__init__"
+            + suffix: _donor_extension_bytes(),
+        },
+    )
+    # Positive control: the file finder selects the extension.
+    origin = _find_spec_origin("matrix_dualpkg", [tree["pkgdir"]])
+    assert origin.endswith(".so"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        _admitted_runner_version(runner, lock, tree)
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_verified_source_beats_verified_bytecode_admits():
+    """A RECORD listing both stem.py and legacy stem.pyc admits:
+    the source wins import selection and its bytes are
+    verified; the losing bytecode never executes."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    stage_src = os.path.join(tree["root"], "_dmod_stage.py")
+    with open(stage_src, "w") as handle:
+        handle.write("VALUE = 1\n")
+    stage_pyc = os.path.join(tree["root"], "_dmod_stage.pyc")
+    py_compile.compile(stage_src, cfile=stage_pyc, doraise=True)
+    with open(stage_pyc, "rb") as handle:
+        pyc_bytes = handle.read()
+    os.unlink(stage_src)
+    os.unlink(stage_pyc)
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_dmod",
+        "1.0",
+        {
+            "matrix_dmod.py": "VALUE = 2\n",
+            "matrix_dmod.pyc": pyc_bytes,
+        },
+    )
+    # Positive control: the source wins over the bytecode.
+    assert _import_with_path(
+        "import matrix_dmod, sys; "
+        "sys.exit(0 if matrix_dmod.VALUE == 2 else 1)",
+        [tree["pkgdir"]],
+    ) == 0
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        _admitted_runner_version(runner, lock, tree)
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_verified_extension_init_at_ancestor_admits():
+    """A RECORD-verified package extension init at an ancestor
+    level admits: the submodule beneath still resolves under
+    the verified package and every executed init is verified
+    bytes."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_ancpkg",
+        "1.0",
+        {
+            "matrix_ancpkg/__init__.py": "VALUE = 1\n",
+            "matrix_ancpkg/__init__"
+            + suffix: _donor_extension_bytes(),
+            "matrix_ancpkg/child.py": "VALUE = 3\n",
+        },
+    )
+    # Positive control: the file finder selects the extension
+    # init for the package.
+    origin = _find_spec_origin("matrix_ancpkg", [tree["pkgdir"]])
+    assert origin.endswith(".so"), origin
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        _admitted_runner_version(runner, lock, tree)
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
 def test_later_root_namespace_fallback_shadow_refused_without_marker():
     """A bare parent on the verified root falls back to a later
     root's regular package (regular beats namespace portions),
