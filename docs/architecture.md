@@ -493,11 +493,13 @@ of them is implied by the results above:
   compiler. An explicit `--target-triple bpfel-unknown-none` fails at
   target registration (`No available targets are compatible with
   triple`), and the supported-target list contains no BPF entry.
-  Re-probed under the pinned Mojo 1.2.0 (`2016d0cd`): 11
-  supported targets (aarch64, riscv, x86 families), zero BPF;
-  the explicit triple still fails at target registration.
-  Re-probe with `mojo build --print-supported-targets` if the
-  compiler changes again.
+  Re-probed under the pinned Mojo 1.2.0 (`2016d0cd`): 15
+  supported targets (11 CPU across the aarch64, riscv, x86
+  families plus the amdgcn/amdgpu/nvptx/nvptx64 GPU
+  targets), zero BPF; the explicit triple still fails at
+  target registration (exit 1). Re-probe with
+  `mojo build --print-supported-targets` if the compiler
+  changes again.
 - Compiler, backend, and host coverage beyond the observed
   lanes: unproven. One AArch64 guest lane and one second Mojo
   combination (1.0.0, investigational) have their own runs and
