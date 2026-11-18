@@ -1375,9 +1375,9 @@ def _write_shadow_package_ext_so(package_dir):
     target = os.path.join(package_dir, "__init__" + suffix)
     donor = _find_extension_donor()
     if donor is None:
-        import pytest
-
-        pytest.skip("no loadable stdlib extension on this host")
+        _skip_direct_or_pytest(
+            "no loadable stdlib extension on this host"
+        )
     shutil.copyfile(donor, target)
     return target
 
@@ -1394,9 +1394,9 @@ def _write_shadow_module_ext_so(directory, stem):
     target = os.path.join(directory, stem + suffix)
     donor = _find_extension_donor()
     if donor is None:
-        import pytest
-
-        pytest.skip("no loadable stdlib extension on this host")
+        _skip_direct_or_pytest(
+            "no loadable stdlib extension on this host"
+        )
     shutil.copyfile(donor, target)
     return target
 
@@ -1846,9 +1846,9 @@ def _donor_extension_bytes():
     """Read a loadable stdlib extension, skipping without one."""
     donor = _find_extension_donor()
     if donor is None:
-        import pytest
-
-        pytest.skip("no loadable stdlib extension on this host")
+        _skip_direct_or_pytest(
+            "no loadable stdlib extension on this host"
+        )
     with open(donor, "rb") as handle:
         return handle.read()
 
@@ -1859,6 +1859,7 @@ def test_distribution_verified_extension_beats_verified_source_admits():
     selects the extension and its bytes are verified, so the
     distribution admits (the executed bytes are verified
     bytes)."""
+    donor_bytes = _donor_extension_bytes()
     runner = _load_runner()
     tree = _runner_tree()
     suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
@@ -1868,7 +1869,7 @@ def test_distribution_verified_extension_beats_verified_source_admits():
         "1.0",
         {
             "matrix_dual.py": "VALUE = 1\n",
-            "matrix_dual" + suffix: _donor_extension_bytes(),
+            "matrix_dual" + suffix: donor_bytes,
         },
     )
     # Positive control: the file finder selects the extension.
@@ -1928,9 +1929,8 @@ def test_distribution_second_unverified_extension_refuses():
 
     suffixes = importlib.machinery.EXTENSION_SUFFIXES
     if len(suffixes) < 2:
-        import pytest
-
-        pytest.skip("needs two real extension suffixes")
+        _skip_direct_or_pytest("needs two real extension suffixes")
+    donor_bytes = _donor_extension_bytes()
     runner = _load_runner()
     tree = _runner_tree()
     first_suffix, second_suffix = suffixes[0], suffixes[1]
@@ -1942,7 +1942,7 @@ def test_distribution_second_unverified_extension_refuses():
         "1.0",
         {
             "matrix_dual.py": "VALUE = 1\n",
-            verified_name: _donor_extension_bytes(),
+            verified_name: donor_bytes,
         },
     )
     with open(
@@ -1998,9 +1998,8 @@ def test_distribution_package_init_shadowed_by_unverified_extension_refuses():
 
     suffixes = importlib.machinery.EXTENSION_SUFFIXES
     if len(suffixes) < 2:
-        import pytest
-
-        pytest.skip("needs two real extension suffixes")
+        _skip_direct_or_pytest("needs two real extension suffixes")
+    donor_bytes = _donor_extension_bytes()
     runner = _load_runner()
     tree = _runner_tree()
     first_suffix, second_suffix = suffixes[0], suffixes[1]
@@ -2013,9 +2012,7 @@ def test_distribution_package_init_shadowed_by_unverified_extension_refuses():
         {
             "matrix_plus.py": "VALUE = 1\n",
             "matrix_plus/__init__.py": "VALUE = 2\n",
-            "matrix_plus/" + verified_name: (
-                _donor_extension_bytes()
-            ),
+            "matrix_plus/" + verified_name: donor_bytes,
         },
     )
     with open(
@@ -2068,9 +2065,8 @@ def test_distribution_sourceless_extension_init_pair_refuses():
     with a positive control proving selection."""
     suffixes = importlib.machinery.EXTENSION_SUFFIXES
     if len(suffixes) < 2:
-        import pytest
-
-        pytest.skip("needs two real extension suffixes")
+        _skip_direct_or_pytest("needs two real extension suffixes")
+    donor_bytes = _donor_extension_bytes()
     runner = _load_runner()
     tree = _runner_tree()
     first_suffix, second_suffix = suffixes[0], suffixes[1]
@@ -2081,9 +2077,7 @@ def test_distribution_sourceless_extension_init_pair_refuses():
         "matrix_solo",
         "1.0",
         {
-            "matrix_solo/" + verified_name: (
-                _donor_extension_bytes()
-            ),
+            "matrix_solo/" + verified_name: donor_bytes,
         },
     )
     with open(
@@ -2112,6 +2106,7 @@ def test_distribution_sourceless_extension_init_alone_admits():
     """A RECORD listing a lone extension init admits when no
     sibling init spelling exists: nothing competes for
     selection, so the verified bytes execute."""
+    donor_bytes = _donor_extension_bytes()
     runner = _load_runner()
     tree = _runner_tree()
     suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
@@ -2121,7 +2116,7 @@ def test_distribution_sourceless_extension_init_alone_admits():
         "1.0",
         {
             "matrix_solo/__init__"
-            + suffix: _donor_extension_bytes(),
+            + suffix: donor_bytes,
         },
     )
     saved_path = os.environ.get("PATH", "")
@@ -2179,6 +2174,7 @@ def test_distribution_verified_extension_init_beats_verified_init_admits():
     """A RECORD-verified package extension init beside a
     RECORD-verified __init__.py admits: the winner is verified
     bytes."""
+    donor_bytes = _donor_extension_bytes()
     runner = _load_runner()
     tree = _runner_tree()
     suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
@@ -2189,7 +2185,7 @@ def test_distribution_verified_extension_init_beats_verified_init_admits():
         {
             "matrix_dualpkg/__init__.py": "VALUE = 1\n",
             "matrix_dualpkg/__init__"
-            + suffix: _donor_extension_bytes(),
+            + suffix: donor_bytes,
         },
     )
     # Positive control: the file finder selects the extension.
@@ -2248,6 +2244,7 @@ def test_distribution_verified_extension_init_at_ancestor_admits():
     level admits: the submodule beneath still resolves under
     the verified package and every executed init is verified
     bytes."""
+    donor_bytes = _donor_extension_bytes()
     runner = _load_runner()
     tree = _runner_tree()
     suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
@@ -2258,7 +2255,7 @@ def test_distribution_verified_extension_init_at_ancestor_admits():
         {
             "matrix_ancpkg/__init__.py": "VALUE = 1\n",
             "matrix_ancpkg/__init__"
-            + suffix: _donor_extension_bytes(),
+            + suffix: donor_bytes,
             "matrix_ancpkg/child.py": "VALUE = 3\n",
         },
     )
@@ -4288,6 +4285,8 @@ def test_merge_refuses_malformed_result_values():
             ("suite", None),
             ("lane", 7),
             ("suite", 7),
+            ("lane", ""),
+            ("suite", ""),
         ):
             bad_report = _shard_report(
                 "lane-a", outcomes=_full_outcomes(runner)
@@ -4310,22 +4309,28 @@ def test_merge_refuses_malformed_result_values():
             assert "malformed results" in message, (
                 field, bad, message,
             )
-        missing_report = _shard_report(
-            "lane-a", outcomes=_full_outcomes(runner)
-        )
-        del missing_report["results"][0]["suite"]
-        first = _write_report(workdir, "c.json", missing_report)
-        second = _write_report(
-            workdir, "d.json",
-            _shard_report(
-                "lane-b", outcomes=_full_outcomes(runner)
-            ),
-        )
-        out = os.path.join(workdir, "merged")
-        message = _merge_rejection_text(
-            runner, ["--merge", first, second, "--out-dir", out]
-        )
-        assert "malformed results" in message, message
+        for missing in ("lane", "suite"):
+            missing_report = _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            )
+            del missing_report["results"][0][missing]
+            first = _write_report(
+                workdir, "c.json", missing_report
+            )
+            second = _write_report(
+                workdir, "d.json",
+                _shard_report(
+                    "lane-b", outcomes=_full_outcomes(runner)
+                ),
+            )
+            out = os.path.join(workdir, "merged")
+            message = _merge_rejection_text(
+                runner, ["--merge", first, second,
+                         "--out-dir", out]
+            )
+            assert "malformed results" in message, (
+                missing, message,
+            )
         print("PASS merge refuses malformed result values")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4333,8 +4338,7 @@ def test_merge_refuses_malformed_result_values():
 
 def test_direct_run_records_skip():
     if not _skip_exceptions():
-        print("SKIP direct-run skip probe needs pytest")
-        return
+        raise _DirectSkip("direct-run skip probe needs pytest")
     import pytest
 
     marker = "direct_skip_probe_for_direct_one"
@@ -4352,8 +4356,7 @@ def test_direct_run_records_skip():
 
 def test_direct_one_propagates_abort():
     if not _skip_exceptions():
-        print("SKIP abort-propagation probe needs pytest")
-        return
+        raise _DirectSkip("abort-propagation probe needs pytest")
     import pytest
 
     for signal in (KeyboardInterrupt(), SystemExit(3)):
@@ -4376,7 +4379,7 @@ def test_merge_refuses_malformed_elapsed_secs():
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
         for bad in ("junk", None, True, float("nan"),
-                    float("inf")):
+                    float("inf"), 10 ** 1000, -5.0):
             bad_report = _shard_report(
                 "lane-a", outcomes=_full_outcomes(runner)
             )
@@ -4415,6 +4418,30 @@ def test_merge_refuses_malformed_elapsed_secs():
         )
         assert "malformed elapsed_secs" in message, message
         print("PASS merge refuses malformed elapsed_secs")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_elapsed_sum_overflow():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        first_report["elapsed_secs"] = 1e308
+        second_report = _shard_report(
+            "lane-b", outcomes=_full_outcomes(runner)
+        )
+        second_report["elapsed_secs"] = 1e308
+        first = _write_report(workdir, "a.json", first_report)
+        second = _write_report(workdir, "b.json", second_report)
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out]
+        )
+        assert "overflowed" in message, message
+        print("PASS merge refuses elapsed sum overflow")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -4697,12 +4724,33 @@ def _skip_exceptions():
     return (pytest.skip.Exception,)
 
 
+class _DirectSkip(Exception):
+    """Direct-run skip signal, usable without pytest installed."""
+
+
+def _skip_direct_or_pytest(reason):
+    """Skip under pytest; signal skip under no-pytest direct-run.
+
+    Always raises: pytest's skip outcome when pytest is
+    importable, else _DirectSkip (which _direct_one records
+    as skipped instead of failed).
+    """
+    if not _skip_exceptions():
+        raise _DirectSkip(reason)
+    import pytest
+
+    pytest.skip(reason)
+
+
 def _direct_one(name):
     """Run one test for direct execution; return ok/skip/fail."""
     try:
         globals()[name]()
     except _skip_exceptions():
         print("skip %s" % name)
+        return "skip"
+    except _DirectSkip as exc:
+        print("skip %s (%s)" % (name, exc))
         return "skip"
     except Exception:
         print("FAIL %s" % name)

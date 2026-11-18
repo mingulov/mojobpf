@@ -957,8 +957,11 @@ def _load_shard_report(path):
             "refusing" % path
         )
     for item in report["results"]:
-        if not isinstance(item.get("lane"), str) or not isinstance(
-            item.get("suite"), str
+        if (
+            not isinstance(item.get("lane"), str)
+            or not item.get("lane")
+            or not isinstance(item.get("suite"), str)
+            or not item.get("suite")
         ):
             raise SetupFailure(
                 "shard report %s carries malformed results; "
@@ -973,11 +976,19 @@ def _load_shard_report(path):
     if (
         not isinstance(elapsed, (int, float))
         or isinstance(elapsed, bool)
-        or (
-            isinstance(elapsed, float)
-            and not math.isfinite(elapsed)
-        )
     ):
+        raise SetupFailure(
+            "shard report %s carries malformed elapsed_secs; "
+            "refusing" % path
+        )
+    try:
+        as_seconds = float(elapsed)
+    except OverflowError:
+        raise SetupFailure(
+            "shard report %s carries malformed elapsed_secs; "
+            "refusing" % path
+        )
+    if not math.isfinite(as_seconds) or as_seconds < 0:
         raise SetupFailure(
             "shard report %s carries malformed elapsed_secs; "
             "refusing" % path
@@ -1138,6 +1149,14 @@ def merge_reports(paths, out_dir, expect_lanes=None):
                 )
             )
     os.makedirs(out_dir, exist_ok=True)
+    total_elapsed = sum(
+        float(shard["elapsed_secs"]) for shard in shards
+    )
+    if not math.isfinite(total_elapsed):
+        raise SetupFailure(
+            "merged elapsed_secs overflowed; refusing to emit "
+            "a board the loader itself would refuse"
+        )
     merged = {
         "tool": "run_vm_tests",
         "commit": first["commit"],
@@ -1151,13 +1170,7 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         "lanes": lanes,
         "results": results,
         "merged_from": list(paths),
-        "elapsed_secs": round(
-            sum(
-                float(shard["elapsed_secs"])
-                for shard in shards
-            ),
-            1,
-        ),
+        "elapsed_secs": round(total_elapsed, 1),
     }
     report_path = os.path.join(out_dir, "matrix-report.json")
     with open(report_path, "w", encoding="utf-8") as handle:

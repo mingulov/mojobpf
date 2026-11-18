@@ -234,7 +234,7 @@ at the toolchain gate (`MBPF102`) exactly as designed.
 ## Retired boundary: `loop-sum` on 6.6 (Mojo 1.1.0 era)
 
 The bounded-loop subset case `loop-sum` verifies and runs on
-all five matrix lanes (6.6, 6.12, 7.0.14, 7.2.0, and 7.4.0-rc1)
+all five matrix lanes (6.6.0, 6.12.0, 7.0.14, 7.2.0, and 7.4.0-rc1)
 on the 1.2.0 board commit (e98ea93; tip re-confirmation
 pending, see above):
 test-run actions match the oracle on every lane. (Under the
@@ -250,7 +250,7 @@ and any other behavior on any lane fails loudly
 
 One live kernel-version boundary remains: the 7.x lanes
 refuse short test-run inputs with EINVAL where the 6.x lanes
-run them as actions (subset kernel: 6.6/6.12 report 20/20
+run them as actions (subset kernel: 6.6.0/6.12.0 report 20/20
 actions; 7.0.14/7.2.0/7.4.0-rc1 report 14 actions + 6 verified
 refusals, one per shape's guard case). Retired per-lane
 boundaries stay pinned as process, not as live constraints:
