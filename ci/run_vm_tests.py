@@ -41,10 +41,12 @@ a failure, not a pass.
 Without ``--out-dir`` the run mints a temporary directory
 (``mojobpf-matrix-`` for runs, ``mojobpf-matrix-merged-`` for
 merges). The directory is kept with its board on success and
-on failure; a refused merge removes its minted directory, so a
-refused merge leaves no trace. A directory that cannot be
-created, or a board that cannot be written, refuses
-(exit 2) like any other setup problem.
+on failure; a refused merge removes its minted directory on
+a best-effort basis, so a refused merge leaves no trace
+unless the cleanup itself fails (a failed cleanup leaves
+the minted directory behind but never changes the refusal).
+A directory that cannot be created, or a board that cannot
+be written, refuses (exit 2) like any other setup problem.
 
 Suites report through the structured result protocol, not line
 scraping: each suite seals a ``test-contracts-v1`` run plan,
@@ -905,6 +907,18 @@ EXIT_SETUP = 2
 
 class SetupFailure(Exception):
     """The matrix cannot run honestly (exit 2)."""
+
+
+def _refuse(message):
+    """Refuse with exit 2: one prefixed stderr line, always.
+
+    The message collapses to a single line, so a newline
+    inside a path or OSError text can never turn a refusal
+    into a traceback-shaped multi-line emission.
+    """
+    text = str(message).replace("\r", " ").replace("\n", " ")
+    sys.stderr.write("run_vm_tests: %s\n" % text)
+    return EXIT_SETUP
 
 
 def _runner_merge_identity(runner):
@@ -2785,7 +2799,8 @@ def build_parser():
         default=None,
         help="directory for per-suite logs and the report "
         "(default: a fresh temporary directory, kept with "
-        "its board except on a refused merge)",
+        "its board; a refused merge removes its minted "
+        "directory best-effort)",
     )
     parser.add_argument(
         "--timeout",
@@ -2839,11 +2854,9 @@ def main(argv=None):
                     prefix="mojobpf-matrix-merged-"
                 )
             except OSError as exc:
-                sys.stderr.write(
-                    "run_vm_tests: cannot create default out "
-                    "dir: %s\n" % exc
+                return _refuse(
+                    "cannot create default out dir: %s" % exc
                 )
-                return EXIT_SETUP
             created_default = True
         expect = None
         if args.expect_lanes:
@@ -2860,8 +2873,7 @@ def main(argv=None):
                     shutil.rmtree(out_dir, ignore_errors=True)
                 except OSError:
                     pass
-            sys.stderr.write("run_vm_tests: %s\n" % exc)
-            return EXIT_SETUP
+            return _refuse(exc)
     if args.expect_lanes:
         sys.stderr.write(
             "run_vm_tests: --expect-lanes needs --merge\n"
@@ -2939,20 +2951,16 @@ def main(argv=None):
         try:
             os.makedirs(out_dir, exist_ok=True)
         except OSError as exc:
-            sys.stderr.write(
-                "run_vm_tests: cannot create out dir %s: %s\n"
-                % (out_dir, exc)
+            return _refuse(
+                "cannot create out dir %s: %s" % (out_dir, exc)
             )
-            return EXIT_SETUP
     else:
         try:
             out_dir = tempfile.mkdtemp(prefix="mojobpf-matrix-")
         except OSError as exc:
-            sys.stderr.write(
-                "run_vm_tests: cannot create default out "
-                "dir: %s\n" % exc
+            return _refuse(
+                "cannot create default out dir: %s" % exc
             )
-            return EXIT_SETUP
     started = time.time()
     print("matrix: commit %s" % commit)
     print("matrix: runner %s (%s)" % (runner["version"], runner["realpath"]))
@@ -3055,11 +3063,9 @@ def main(argv=None):
             json.dump(report, handle, indent=2, sort_keys=True)
             handle.write("\n")
     except OSError as exc:
-        sys.stderr.write(
-            "run_vm_tests: cannot write report %s: %s\n"
-            % (report_path, exc)
+        return _refuse(
+            "cannot write report %s: %s" % (report_path, exc)
         )
-        return EXIT_SETUP
 
     selected = {suite_id for suite_id, _, _ in suites}
     excluded_cells = sum(
