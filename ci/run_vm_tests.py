@@ -73,6 +73,7 @@ import argparse
 import atexit
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -963,10 +964,19 @@ def _load_shard_report(path):
                 "shard report %s carries malformed results; "
                 "refusing" % path
             )
-    elapsed = report.get("elapsed_secs", 0)
+    if "elapsed_secs" not in report:
+        raise SetupFailure(
+            "shard report %s carries malformed elapsed_secs; "
+            "refusing" % path
+        )
+    elapsed = report["elapsed_secs"]
     if (
         not isinstance(elapsed, (int, float))
         or isinstance(elapsed, bool)
+        or (
+            isinstance(elapsed, float)
+            and not math.isfinite(elapsed)
+        )
     ):
         raise SetupFailure(
             "shard report %s carries malformed elapsed_secs; "
@@ -1142,7 +1152,10 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         "results": results,
         "merged_from": list(paths),
         "elapsed_secs": round(
-            sum(float(shard.get("elapsed_secs", 0)) for shard in shards),
+            sum(
+                float(shard["elapsed_secs"])
+                for shard in shards
+            ),
             1,
         ),
     }

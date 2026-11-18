@@ -1926,13 +1926,13 @@ def test_distribution_second_unverified_extension_refuses():
     pre-fix.)"""
     from unittest import mock  # noqa: E402
 
-    runner = _load_runner()
-    tree = _runner_tree()
     suffixes = importlib.machinery.EXTENSION_SUFFIXES
     if len(suffixes) < 2:
         import pytest
 
         pytest.skip("needs two real extension suffixes")
+    runner = _load_runner()
+    tree = _runner_tree()
     first_suffix, second_suffix = suffixes[0], suffixes[1]
     verified_name = "matrix_dual" + second_suffix
     foreign_name = "matrix_dual" + first_suffix
@@ -1996,13 +1996,13 @@ def test_distribution_package_init_shadowed_by_unverified_extension_refuses():
     verified-first so the old rule would admit (RED)."""
     from unittest import mock  # noqa: E402
 
-    runner = _load_runner()
-    tree = _runner_tree()
     suffixes = importlib.machinery.EXTENSION_SUFFIXES
     if len(suffixes) < 2:
         import pytest
 
         pytest.skip("needs two real extension suffixes")
+    runner = _load_runner()
+    tree = _runner_tree()
     first_suffix, second_suffix = suffixes[0], suffixes[1]
     verified_name = "__init__" + second_suffix
     foreign_name = "__init__" + first_suffix
@@ -2066,13 +2066,13 @@ def test_distribution_sourceless_extension_init_pair_refuses():
     enumeration, or a sourceless-only package admits blind.
     The foreign sibling uses a real first-precedence suffix
     with a positive control proving selection."""
-    runner = _load_runner()
-    tree = _runner_tree()
     suffixes = importlib.machinery.EXTENSION_SUFFIXES
     if len(suffixes) < 2:
         import pytest
 
         pytest.skip("needs two real extension suffixes")
+    runner = _load_runner()
+    tree = _runner_tree()
     first_suffix, second_suffix = suffixes[0], suffixes[1]
     verified_name = "__init__" + second_suffix
     foreign_name = "__init__" + first_suffix
@@ -4259,6 +4259,7 @@ def test_merge_refuses_malformed_lane_without_traceback():
             runner, ["--merge", first, second, "--out-dir", out]
         )
         assert "malformed lanes" in message, message
+        assert "Traceback" not in message, message
         print("PASS merge refuses malformed lane cleanly")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4283,6 +4284,10 @@ def test_merge_refuses_malformed_result_values():
         for field, bad in (
             ("lane", ["lane-a"]),
             ("suite", ["s1"]),
+            ("lane", None),
+            ("suite", None),
+            ("lane", 7),
+            ("suite", 7),
         ):
             bad_report = _shard_report(
                 "lane-a", outcomes=_full_outcomes(runner)
@@ -4303,14 +4308,33 @@ def test_merge_refuses_malformed_result_values():
                          "--out-dir", out]
             )
             assert "malformed results" in message, (
-                field, message,
+                field, bad, message,
             )
+        missing_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        del missing_report["results"][0]["suite"]
+        first = _write_report(workdir, "c.json", missing_report)
+        second = _write_report(
+            workdir, "d.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out]
+        )
+        assert "malformed results" in message, message
         print("PASS merge refuses malformed result values")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_direct_run_records_skip():
+    if not _skip_exceptions():
+        print("SKIP direct-run skip probe needs pytest")
+        return
     import pytest
 
     marker = "direct_skip_probe_for_direct_one"
@@ -4326,11 +4350,33 @@ def test_direct_run_records_skip():
     print("PASS direct run records skip")
 
 
+def test_direct_one_propagates_abort():
+    if not _skip_exceptions():
+        print("SKIP abort-propagation probe needs pytest")
+        return
+    import pytest
+
+    for signal in (KeyboardInterrupt(), SystemExit(3)):
+        marker = "direct_abort_probe_for_direct_one"
+
+        def _raiser(_signal=signal):
+            raise _signal
+
+        globals()[marker] = _raiser
+        try:
+            with pytest.raises(type(signal)):
+                _direct_one(marker)
+        finally:
+            del globals()[marker]
+    print("PASS direct run propagates abort")
+
+
 def test_merge_refuses_malformed_elapsed_secs():
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
-        for bad in ("junk", None, True):
+        for bad in ("junk", None, True, float("nan"),
+                    float("inf")):
             bad_report = _shard_report(
                 "lane-a", outcomes=_full_outcomes(runner)
             )
@@ -4352,6 +4398,22 @@ def test_merge_refuses_malformed_elapsed_secs():
             assert "malformed elapsed_secs" in message, (
                 bad, message,
             )
+        missing_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        del missing_report["elapsed_secs"]
+        first = _write_report(workdir, "c.json", missing_report)
+        second = _write_report(
+            workdir, "d.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out]
+        )
+        assert "malformed elapsed_secs" in message, message
         print("PASS merge refuses malformed elapsed_secs")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
