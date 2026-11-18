@@ -4575,7 +4575,8 @@ def test_merge_default_out_dir_refusal_cleans_up():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "disagrees on 'commit'" in message, message
         assert len(created) == 1, created
         assert not os.path.exists(created[0]), created
@@ -4728,7 +4729,8 @@ def test_merge_default_out_dir_write_failure_cleans_up():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot write report" in message, message
         assert len(created) == 1, created
         assert not os.path.exists(created[0]), created
@@ -4808,7 +4810,8 @@ def test_merge_refuses_default_dir_creation_failure():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot create default out dir" in message, message
         print("PASS merge refuses default-dir creation failure")
     finally:
@@ -4853,7 +4856,8 @@ def test_merge_refusal_survives_cleanup_failure():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "disagrees on 'commit'" in message, message
         assert len(created) == 1, created
         assert os.path.isdir(created[0]), created
@@ -4932,7 +4936,8 @@ def test_main_setup_refusal_collapses_newline_lock():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "lockfile not found" in message, message
         print("PASS main setup refusal collapses newline lock")
     finally:
@@ -4970,9 +4975,10 @@ def test_main_setup_refusal_collapses_newline_flag():
             assert message.startswith("run_vm_tests:"), (
                 extra, message,
             )
-            assert message.strip().count("\n") == 0, (
+            assert message.count("\n") == 1, (
                 extra, message,
             )
+            assert message.endswith("\n"), (extra, message)
             assert needle in message, (extra, message)
         print("PASS main setup refusal collapses newline flag")
     finally:
@@ -5004,7 +5010,8 @@ def test_main_setup_refusal_collapses_git_failure():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot inspect the worktree" in message, message
         print("PASS main setup refusal collapses git failure")
     finally:
@@ -5031,7 +5038,8 @@ def test_main_setup_dirt_stays_multiline():
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
         assert "worktree is dirty" in message, message
-        assert message.strip().count("\n") == 2, message
+        assert message.count("\n") == 3, message
+        assert message.endswith("\n"), message
         print("PASS main setup dirt stays multiline")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -5061,7 +5069,8 @@ def test_main_refuses_out_dir_is_a_file():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot create out dir" in message, message
         assert os.path.isfile(out), out
         print("PASS main refuses out-dir-is-a-file")
@@ -5092,7 +5101,8 @@ def test_main_refuses_unwritable_report():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot write report" in message, message
         assert not os.path.isfile(
             os.path.join(out, "matrix-report.json")
@@ -5127,7 +5137,8 @@ def test_main_refuses_default_dir_creation_failure():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot create default out dir" in message, message
         print("PASS main refuses default-dir creation failure")
     finally:
@@ -5200,7 +5211,8 @@ def test_main_default_out_dir_write_failure_keeps_dir():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot write report" in message, message
         assert len(created) == 1, created
         assert os.path.isdir(created[0]), created
@@ -5434,7 +5446,8 @@ def test_merge_mkdtemp_multiline_oserror_stays_one_line():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot create default out dir" in message, message
         print("PASS merge mkdtemp multiline OSError stays one line")
     finally:
@@ -5465,7 +5478,8 @@ def test_main_makedirs_multiline_oserror_stays_one_line():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot create out dir" in message, message
         print("PASS main makedirs multiline OSError stays one line")
     finally:
@@ -5494,7 +5508,8 @@ def test_main_report_multiline_oserror_stays_one_line():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot write report" in message, message
         print("PASS main report multiline OSError stays one line")
     finally:
@@ -5525,7 +5540,8 @@ def test_main_mkdtemp_multiline_oserror_stays_one_line():
         assert code == 2, (code, stdout.getvalue())
         message = stderr.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot create default out dir" in message, message
         print("PASS main mkdtemp multiline OSError stays one line")
     finally:
@@ -5776,7 +5792,8 @@ def test_merge_expect_lanes_refusal_cleans_default_dir():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "do not cover the expected set" in message, message
         assert len(created) == 1, created
         assert not os.path.exists(created[0]), created
@@ -5829,7 +5846,8 @@ def test_merge_write_failure_survives_cleanup_failure():
         assert code == 2, code
         message = buffer.getvalue()
         assert message.startswith("run_vm_tests:"), message
-        assert message.strip().count("\n") == 0, message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
         assert "cannot write report" in message, message
         assert len(created) == 1, created
         assert os.path.isdir(created[0]), created
@@ -5909,6 +5927,30 @@ def test_merge_refuses_unloadable_shard():
         )
         assert "cannot load shard report" in message, message
         print("PASS merge refuses unloadable shard")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_deeply_nested_shard():
+    # A shard whose JSON nests past the recursion limit
+    # refuses (exit 2, single line): RecursionError is a
+    # load failure, not an uncaught traceback.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        deep = os.path.join(workdir, "deep.json")
+        with open(deep, "w", encoding="utf-8") as handle:
+            handle.write("[" * 1000000 + "]" * 1000000)
+        good = _write_report(
+            workdir, "good.json", _shard_report("lane-a")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", deep, good, "--out-dir", out],
+            out,
+        )
+        assert "cannot load shard report" in message, message
+        print("PASS merge refuses deeply nested shard")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -6108,6 +6150,70 @@ def test_runner_docstring_discloses_pinned_exclusions():
     assert "Skips never occur" not in doc, doc
 
 
+def test_main_refuses_unknown_exclusion_lane():
+    # A direct run whose exclusion map names an unknown
+    # lane refuses (exit 2, single line) at startup.
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        runner.LANE_SUITE_EXCLUSIONS = {
+            "bogus-lane": ("s1",),
+        }
+        out = os.path.join(workdir, "out")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with redirect_stderr(stderr):
+                code = runner.main(
+                    ["--lock", lock_path, "--out-dir", out]
+                )
+        assert code == 2, (code, stdout.getvalue())
+        message = stderr.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
+        assert "unknown lane" in message, message
+        print("PASS main refuses unknown exclusion lane")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_unknown_exclusion_suite():
+    # A direct run whose exclusion map names an unknown
+    # suite refuses (exit 2, single line) at startup.
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        runner.LANE_SUITE_EXCLUSIONS = {
+            "solo-a": ("bogus-suite",),
+        }
+        out = os.path.join(workdir, "out")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with redirect_stderr(stderr):
+                code = runner.main(
+                    ["--lock", lock_path, "--out-dir", out]
+                )
+        assert code == 2, (code, stdout.getvalue())
+        message = stderr.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
+        assert "unknown suite" in message, message
+        print("PASS main refuses unknown exclusion suite")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_main_refuses_empty_board_when_all_cells_excluded():
     # Every (lane, suite) cell pinned-excluded: main writes the
     # empty board and refuses it (EXIT_SETUP), never a vacuous
@@ -6115,6 +6221,7 @@ def test_main_refuses_empty_board_when_all_cells_excluded():
     # fresh module; the verdict branch is real.
     import contextlib
     import io
+    from contextlib import redirect_stderr
 
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-empty-board-")
@@ -6126,13 +6233,16 @@ def test_main_refuses_empty_board_when_all_cells_excluded():
         )
         assert all_suites, "SUITES fixture empty"
         stdout = io.StringIO()
+        stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            code = runner.main(
-                ["--lock", lock_path, "--out-dir", out_dir]
-            )
+            with redirect_stderr(stderr):
+                code = runner.main(
+                    ["--lock", lock_path, "--out-dir", out_dir]
+                )
         text = stdout.getvalue()
         assert code == runner.EXIT_SETUP, (code, text)
         assert "refusing an empty board" in text, text
+        assert stderr.getvalue() == "", stderr.getvalue()
         assert "(%d pinned-excluded cells)" % (
             2 * len(all_suites)
         ) in text, text

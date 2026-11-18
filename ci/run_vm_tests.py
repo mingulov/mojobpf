@@ -49,10 +49,11 @@ A directory that cannot be created, or a board that cannot
 be written, refuses (exit 2) like any other setup problem.
 
 Refusals print as one prefixed stderr line, except
-argparse's own usage-error format and the intentional
-multi-line dirt list; stdout progress and board lines
-echo lockfile inputs verbatim as human evidence, not as
-part of the refusal contract.
+argparse's own usage-error format, the intentional
+multi-line dirt list, and the empty-board refusal,
+which reports on stdout only with no stderr; stdout
+progress and board lines echo lockfile inputs verbatim
+as human evidence, not as part of the refusal contract.
 
 Suites report through the structured result protocol, not line
 scraping: each suite seals a ``test-contracts-v1`` run plan,
@@ -916,7 +917,11 @@ class SetupFailure(Exception):
 
 
 class SetupFailureMultiline(SetupFailure):
-    """Setup failure whose detail stays multi-line (dirt list)."""
+    """Setup failure whose detail stays multi-line (dirt list).
+
+    Sole raiser is the dirt check in main: the carve-out
+    is exactly dirt.
+    """
 
 
 def _refuse(message):
@@ -952,7 +957,7 @@ def _load_shard_report(path):
     try:
         with open(path, encoding="utf-8") as handle:
             report = json.load(handle)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise SetupFailure(
             "cannot load shard report %s: %s" % (path, exc)
         )
