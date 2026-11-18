@@ -98,7 +98,8 @@ registers 41 suites: the 28 release-matrix suites plus the 12
 (`ci/run_vm_tests.py` `SUITES`,
 `tests/unit/test_portability_locks.py::test_x86_matrix_shape_unchanged`).
 
-Five kernels are claimed by the current tree: 6.6.0-060600-generic,
+Five kernels are claimed for the 1.2.0 board tree
+(commit e98ea93): 6.6.0-060600-generic,
 6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic,
 and 7.4.0-070400rc1-generic. A kernel is claimed only when the
 full 41-suite matrix passes on its lane apart from the ruled
@@ -108,12 +109,12 @@ exclusions following this paragraph; the v1.0 matrix passes
 green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
 exclusions, 0 red; board commit e98ea93 via
 `ci/run_vm_tests.py` per-lane runs plus `--merge`). The
-tree has since added admission hardening, a percpu case
-rename, merge checks, lock notes, and docs; kernel claims
-re-confirm on a fresh full-matrix board run on the release
-tip, which will replace this interim citation. Two ruled
-cell groups stay out of claim: the joint suite (needs
-libbpf-mojo inputs,
+tree has since added changes including admission hardening,
+a percpu case rename, merge checks, lock notes, CI workflow
+comments, and docs; kernel claims re-confirm on a fresh
+full-matrix board run on the release tip, which will replace
+this interim citation. Two ruled cell groups stay out of
+claim: the joint suite (needs libbpf-mojo inputs,
 labelled experimental) and 7.x task-struct layouts (1.x CO-RE
 work). These rulings are mechanized as `LANE_SUITE_EXCLUSIONS`
 in `ci/run_vm_tests.py` (pinned by
@@ -128,10 +129,11 @@ combination at the time (LLVM 22.1.8, bpftool 7.6.0 with
 libbpf 1.6, QEMU 10.2.2, software emulation) in both alpha
 lanes; see [evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the
 anchor board. Those observations stand as the alpha record;
-the current tree re-proved them in the v1.0 release matrix
-(see [evidence-1.0.0.md](evidence-1.0.0.md)) and again in the
-Mojo 1.2.0 board re-run (197 passed, 8 pinned exclusions,
-0 red; board commit e98ea93).
+the v1.0 release matrix re-proved them (see
+[evidence-1.0.0.md](evidence-1.0.0.md)), and the Mojo 1.2.0
+board re-run repeated that proof on its board commit (197
+passed, 8 pinned exclusions, 0 red; e98ea93; tip
+re-confirmation pending, see above).
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host

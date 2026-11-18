@@ -423,11 +423,12 @@ below names the current pins. The 0.3.0a1 alpha record (see
 [compatibility](compatibility.md) and
 [evidence-0.3.0a1.md](evidence-0.3.0a1.md)) observed the
 measured behaviors on LLVM 22.1.8 with bpftool 7.6.0 /
-libbpf 1.6 under software emulation; the current tree re-proves
-them on the five KVM lanes of the release matrix (197/205
-cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), re-run
-green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
-exclusions, 0 red; board commit e98ea93), which
+libbpf 1.6 under software emulation; the release matrix
+re-proves them on five KVM lanes (197/205 cells; see
+[evidence-1.0.0.md](evidence-1.0.0.md)), re-run green under
+the pinned Mojo 1.2.0 on its board commit (197 passed, 8
+pinned exclusions, 0 red; e98ea93; tip re-confirmation
+pending, see the compatibility five-kernel board), which
 claims kernels 6.6.0, 6.12.0, 7.0.14, 7.2, and 7.4-rc1. Other
 combinations are unproven, not supported. Full binary paths
 and hashes are recorded in `toolchains.lock.json`; rerun
@@ -591,8 +592,9 @@ of them is implied by the results above:
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
   lifetime-marker skew, re-qualified under the pinned Mojo 1.2.0
   (full 41-suite x 5-lane board green: 197 passed, 8 pinned
-  exclusions, 0 red; board commit e98ea93 — see the
-  compatibility five-kernel board); they must be revisited if
+  exclusions, 0 red; board commit e98ea93; tip
+  re-confirmation pending — see the compatibility
+  five-kernel board); they must be revisited if
   a future Mojo emits backend-compatible IR for those
   constructs.
 - Content-derived variable packet offsets (loading one packet byte

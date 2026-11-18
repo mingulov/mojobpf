@@ -955,6 +955,23 @@ def _load_shard_report(path):
             "shard report %s carries malformed results; "
             "refusing" % path
         )
+    for item in report["results"]:
+        if not isinstance(item.get("lane"), str) or not isinstance(
+            item.get("suite"), str
+        ):
+            raise SetupFailure(
+                "shard report %s carries malformed results; "
+                "refusing" % path
+            )
+    elapsed = report.get("elapsed_secs", 0)
+    if (
+        not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+    ):
+        raise SetupFailure(
+            "shard report %s carries malformed elapsed_secs; "
+            "refusing" % path
+        )
     return report
 
 

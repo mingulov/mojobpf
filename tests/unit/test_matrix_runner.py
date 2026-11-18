@@ -1928,8 +1928,13 @@ def test_distribution_second_unverified_extension_refuses():
 
     runner = _load_runner()
     tree = _runner_tree()
-    first_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
-    verified_name = "matrix_dual.abi3.so"
+    suffixes = importlib.machinery.EXTENSION_SUFFIXES
+    if len(suffixes) < 2:
+        import pytest
+
+        pytest.skip("needs two real extension suffixes")
+    first_suffix, second_suffix = suffixes[0], suffixes[1]
+    verified_name = "matrix_dual" + second_suffix
     foreign_name = "matrix_dual" + first_suffix
     lock = _lock_with_dep_dist(
         tree,
@@ -1993,8 +1998,13 @@ def test_distribution_package_init_shadowed_by_unverified_extension_refuses():
 
     runner = _load_runner()
     tree = _runner_tree()
-    first_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
-    verified_name = "__init__.abi3.so"
+    suffixes = importlib.machinery.EXTENSION_SUFFIXES
+    if len(suffixes) < 2:
+        import pytest
+
+        pytest.skip("needs two real extension suffixes")
+    first_suffix, second_suffix = suffixes[0], suffixes[1]
+    verified_name = "__init__" + second_suffix
     foreign_name = "__init__" + first_suffix
     lock = _lock_with_dep_dist(
         tree,
@@ -2058,8 +2068,13 @@ def test_distribution_sourceless_extension_init_pair_refuses():
     with a positive control proving selection."""
     runner = _load_runner()
     tree = _runner_tree()
-    first_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
-    verified_name = "__init__.abi3.so"
+    suffixes = importlib.machinery.EXTENSION_SUFFIXES
+    if len(suffixes) < 2:
+        import pytest
+
+        pytest.skip("needs two real extension suffixes")
+    first_suffix, second_suffix = suffixes[0], suffixes[1]
+    verified_name = "__init__" + second_suffix
     foreign_name = "__init__" + first_suffix
     lock = _lock_with_dep_dist(
         tree,
@@ -4232,7 +4247,6 @@ def test_merge_refuses_malformed_lane_without_traceback():
                 "cache": {},
             }
         )
-        bad_report["results"][0]["lane"] = "lane-zzz"
         first = _write_report(workdir, "a.json", bad_report)
         second = _write_report(
             workdir, "b.json",
@@ -4241,9 +4255,10 @@ def test_merge_refuses_malformed_lane_without_traceback():
             ),
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out]
+        )
+        assert "malformed lanes" in message, message
         print("PASS merge refuses malformed lane cleanly")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4259,6 +4274,71 @@ def _merge_rejection_text(runner, args):
         code = runner.main(args)
     assert code == 2, code
     return buffer.getvalue()
+
+
+def test_merge_refuses_malformed_result_values():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        for field, bad in (
+            ("lane", ["lane-a"]),
+            ("suite", ["s1"]),
+        ):
+            bad_report = _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            )
+            bad_report["results"][0][field] = bad
+            first = _write_report(
+                workdir, "a.json", bad_report
+            )
+            second = _write_report(
+                workdir, "b.json",
+                _shard_report(
+                    "lane-b", outcomes=_full_outcomes(runner)
+                ),
+            )
+            out = os.path.join(workdir, "merged")
+            message = _merge_rejection_text(
+                runner, ["--merge", first, second,
+                         "--out-dir", out]
+            )
+            assert "malformed results" in message, (
+                field, message,
+            )
+        print("PASS merge refuses malformed result values")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_malformed_elapsed_secs():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        for bad in ("junk", None):
+            bad_report = _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            )
+            bad_report["elapsed_secs"] = bad
+            first = _write_report(
+                workdir, "a.json", bad_report
+            )
+            second = _write_report(
+                workdir, "b.json",
+                _shard_report(
+                    "lane-b", outcomes=_full_outcomes(runner)
+                ),
+            )
+            out = os.path.join(workdir, "merged")
+            message = _merge_rejection_text(
+                runner, ["--merge", first, second,
+                         "--out-dir", out]
+            )
+            assert "malformed elapsed_secs" in message, (
+                bad, message,
+            )
+        print("PASS merge refuses malformed elapsed_secs")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_merge_refuses_vacuous_shard():
