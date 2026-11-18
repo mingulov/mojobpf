@@ -433,7 +433,7 @@ and hashes are recorded in `toolchains.lock.json`; rerun
 
 | Role | Pinned identity |
 | --- | --- |
-| Mojo compiler | 1.1.0 (`8189361e`), pixi-pinned from the Modular channel |
+| Mojo compiler | 1.2.0 (`2016d0cd`), pixi-pinned from the Modular channel |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, cpu `v3` |
 | Loader/observer | bpftool 7.6.0 with libbpf 1.6, unmodified |
 | Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; claimed kernels 6.12.0, 6.6.0, 7.0.14, 7.2, 7.4-rc1 plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
@@ -582,8 +582,9 @@ of them is implied by the results above:
   absence (`compiler/audit.py`).
 - The stack-slot and int-to-pointer cast assembly spellings are
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
-  lifetime-marker skew; they must be revisited if a future Mojo
-  emits backend-compatible IR for those constructs.
+  lifetime-marker skew, re-qualified under the pinned Mojo 1.2.0;
+  they must be revisited if a future Mojo emits backend-compatible
+  IR for those constructs.
 - Content-derived variable packet offsets (loading one packet byte
   to compute a second packet address) are outside the supported
   subset: the verifier cannot connect a separately computed guard

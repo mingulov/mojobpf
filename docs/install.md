@@ -19,7 +19,7 @@ unprivileged and needs no root.
   standard library).
 * External toolchain, provided by you (never bundled, never
   downloaded by the installer):
-  * Mojo 1.1.0 (the pinned compiler; the project's
+  * Mojo 1.2.0 (the pinned compiler; the project's
     `toolchains.lock.json` records its exact version and hash),
   * LLVM `llc` matching the lockfile (BPF backend, `bpfel`
     triple, `v3` CPU),

@@ -21,7 +21,7 @@ failed=0, and 500 drained records with contiguous sequences 0..499
 carrying the monitored identity; no owned pin, link, program, or map
 survives.
 
-Requires an independently installed Mojo 1.1.0 plus ``cc``, ``llc``
+Requires an independently installed Mojo 1.2.0 plus ``cc``, ``llc``
 and ``vng`` on PATH (default release v6.12; MOJOBPF_VNG_RELEASE selects
 the matrix lane). Missing tools fail loudly as environment failures,
 never as passes.
@@ -942,7 +942,7 @@ def test_consumer_builds_with_installed_tool():
 def test_consumer_toolchain_resolved_path_only():
     fix = fixture()
     mojo = fix["mojo"]
-    assert mojo["version"].startswith("Mojo 1.1.0"), mojo
+    assert mojo["version"].startswith("Mojo 1.2.0"), mojo
     assert not _under_repo(mojo["path"]), mojo
     assert not _under_repo(mojo["realpath"]), mojo
     home = fix["mojo"].get("home")

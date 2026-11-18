@@ -325,7 +325,7 @@ LOWER_TIMEOUT_S = 300
 # Producer model the parsed lowering is qualified against (mirrors
 # the lowering's frozen ModelID; a new producer needs its own
 # compatibility check, never a silent substitution here).
-LOWER_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+LOWER_MODEL_ID = "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
 
 # Bound the manifest re-read for spec authoring; the driver seals
 # the manifest separately, this is only the service's input cap.

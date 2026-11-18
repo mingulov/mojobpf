@@ -19,7 +19,7 @@ and the profile list below match the current tree.
 
 * Linux on x86-64.
 * Python 3.11 or later with `venv` and `pip`.
-* Mojo 1.1.0 on `PATH` (see [compatibility](compatibility.md)
+* Mojo 1.2.0 on `PATH` (see [compatibility](compatibility.md)
   for the supported toolchain).
 * LLVM `llc` with the BPF backend, `bpftool`, and `vng`
   (virtme-ng) with a cached guest image for the kernel check.
@@ -100,7 +100,7 @@ mojobpf doctor
 informational discovery only: pins are qualified by check/build with --lockfile, never here
 mojobpf 1.0.0 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
 platform: linux/x86_64
-tool mojo: present Mojo 1.1.0 (8189361e) at <mojo-on-PATH>
+tool mojo: present Mojo 1.2.0 (2016d0cd) at <mojo-on-PATH>
 tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>
 tool bpftool: present bpftool v7.6.0 at <bpftool-on-PATH>
 tool python: present Python 3.14.8 at <qs>/.venv/bin/python3
@@ -235,9 +235,9 @@ built <qs>/build/counter.evidence.json (4800 bytes, sha256 48ebae7ff2a3fe93a97dd
 
 The directory holds the object plus its evidence sidecar; see
 [artifact-format](artifact-format.md) for both layouts. The
-build above used an independently installed Mojo 1.1.0 with
+build above used an independently installed Mojo 1.2.0 with
 no repository paths. The object bytes are deterministic for
-the pinned toolchain (Mojo 1.1.0 `8189361e`, LLVM 22.1.8):
+the pinned toolchain (Mojo 1.2.0 `2016d0cd`, LLVM 22.1.8):
 rebuilding these exact sources reproduces the same object
 bytes (`tests/kernel/test_cleanup.py::test_reproducible_two_paths`).
 The evidence line is illustrative — `counter.evidence.json`

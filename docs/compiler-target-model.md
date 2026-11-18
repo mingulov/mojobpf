@@ -2,8 +2,8 @@
 
 # Candidate compiler target model
 
-The internal C++ reader can check genuine Mojo 1.1.0 output against
-`mojo-1.1.0-x86_64-bpfel-v3-minimal-v1`. This is source admission on an
+The internal C++ reader can check genuine Mojo 1.2.0 output against
+`mojo-1.2.0-x86_64-bpfel-v3-minimal-v1`. This is source admission on an
 x86-64 build host for a little-endian BPF v3 candidate. Its explicit `lower`
 mode emits verified LLVM IR for the eight admitted profiles and their
 map/program contracts (classifier, map, combined, tracepoint, event,
@@ -14,7 +14,7 @@ are separate requirements.
 
 Build with CMake 3.20+, C++17 and the exact LLVM 22.1.8 development package.
 Python 3.11+ and pytest are required for tests; genuine captures and native
-controls also need the admitted Mojo 1.1.0 compiler environment and Clang
+controls also need the admitted Mojo 1.2.0 compiler environment and Clang
 22.1.8. The frozen executable, stdlib and dynamic closure identities are
 listed in [the test case ledger](../compiler/tests/target_model_cases.json).
 The capture harness checks those identities before invoking the producer.
@@ -43,7 +43,7 @@ The specification must contain exactly these fields. The entry name is
 supplied by the caller, rather than recognized as an algorithm identity.
 
 ```json
-{"schema_version":1,"model_id":"mojo-1.1.0-x86_64-bpfel-v3-minimal-v1","profile_id":"linux-bpfel-v3","entry":"xdp_entry","program_type":"xdp","section":"xdp","kernel_license":"Apache-2.0 WITH LLVM-exception","cpu":"v3","features":"","map":null}
+{"schema_version":1,"model_id":"mojo-1.2.0-x86_64-bpfel-v3-minimal-v1","profile_id":"linux-bpfel-v3","entry":"xdp_entry","program_type":"xdp","section":"xdp","kernel_license":"Apache-2.0 WITH LLVM-exception","cpu":"v3","features":"","map":null}
 ```
 
 `cpu` names the requested BPF CPU explicitly (`v3` is the only

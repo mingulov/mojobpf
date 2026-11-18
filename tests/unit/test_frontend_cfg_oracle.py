@@ -63,7 +63,7 @@ sys.path.insert(
 
 from mojobpf import inputs as inputs_module  # noqa: E402
 
-PINNED_MOJO_VERSION = "1.1.0"
+PINNED_MOJO_VERSION = "1.2.0"
 STD_MISSING_MARKER = "unable to locate module 'std'"
 PROBE_TIMEOUT_S = 120
 HELLO_SOURCE = 'def main():\n    print("hi")\n'
@@ -79,7 +79,7 @@ def _require_pinned_version(version, returncode):
 
     Parses the first ``X.Y.Z`` token and requires it to equal
     ``PINNED_MOJO_VERSION`` with no version suffix, so
-    ``1.1.0.dev1`` and ``21.1.0`` both reject; a nonzero exit
+    ``1.2.0.dev1`` and ``21.1.0`` both reject; a nonzero exit
     rejects too. The asserted rule was observed against
     exactly this frontend; anything else must re-validate, not
     silently inherit the expectations. Returns the parsed
@@ -361,9 +361,10 @@ def test_frontend_oracle_version_pin_rejects_lookalikes():
     # The pin is exact: dev qualifiers, other majors and
     # failed probes must all reject, never inherit the rule.
     for text, code in (
-        ("Mojo 1.1.0.dev1", 0),
+        ("Mojo 1.2.0.dev1", 0),
         ("Mojo 21.1.0", 0),
-        ("Mojo 1.1.0", 1),
+        ("Mojo 1.2.0", 1),
+        ("Mojo 1.1.0 (8189361e)", 0),
         ("version unknown", 0),
     ):
         try:
@@ -376,7 +377,7 @@ def test_frontend_oracle_version_pin_rejects_lookalikes():
             )
     assert (
         _require_pinned_version(
-            "Mojo %s (8189361e)\n" % PINNED_MOJO_VERSION, 0
+            "Mojo %s (2016d0cd)\n" % PINNED_MOJO_VERSION, 0
         )
         == PINNED_MOJO_VERSION
     )

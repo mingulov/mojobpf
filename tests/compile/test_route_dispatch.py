@@ -347,7 +347,7 @@ def test_author_spec_classifier():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3",
         "entry": "xdp_entry",
         "program_type": "xdp",
@@ -475,7 +475,7 @@ def test_author_spec_subprog():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3-subprog",
         "entry": "xdp_entry",
         "program_type": "xdp",
@@ -578,7 +578,7 @@ printf '{"mode":"lower","spec":"%s"}\\n' "$spec" > "$report"
     ) as handle:
         spec = json.load(handle)
     assert spec["model_id"] == (
-        "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+        "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
     ), spec
     assert spec["entry"] == "xdp_entry", spec
     assert spec["map"] is None, spec
@@ -992,7 +992,7 @@ def test_author_spec_map():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3",
         "entry": "xdp_entry",
         "program_type": "xdp",
@@ -1402,7 +1402,7 @@ def test_author_spec_event_two_maps():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3",
         "entry": "trace_entry",
         "program_type": "tracepoint",
@@ -1521,7 +1521,7 @@ def test_author_spec_uprobe():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3-uprobe",
         "entry": "uprobe_entry",
         "program_type": "uprobe",
@@ -1618,7 +1618,7 @@ def test_author_spec_reserve():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3-reserve",
         "entry": "trace_entry",
         "program_type": "tracepoint",
@@ -1728,7 +1728,7 @@ def test_author_spec_core():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3-core",
         "entry": "xdp_entry",
         "program_type": "xdp",
@@ -1887,7 +1887,7 @@ def test_author_spec_skb_socket():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3-net",
         "entry": "socket_entry",
         "program_type": "socket",
@@ -1913,7 +1913,7 @@ def test_author_spec_skb_loadmap():
     assert refusal is None
     assert spec == {
         "schema_version": 1,
-        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
         "profile_id": "linux-bpfel-v3-net",
         "entry": "tc_entry",
         "program_type": "tc",

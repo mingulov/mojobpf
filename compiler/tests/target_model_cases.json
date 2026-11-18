@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+  "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
   "producer": {
-    "mojo_sha256": "1250f6dc59317aa7c85718d425900aff89558fc851fab50a3c61ae2236b3f738",
-    "stdlib_sha256": "6dd60988aca3d036845f3d72ceb53315a9a2f2cbe35a36c4b8d5811b9cba3fb6",
-    "config_sha256": "cd4263b7aabc4132485ef4de69afa4d0994c4aeeb07df144af3114749397984b",
+    "mojo_sha256": "2e61d34f18fe3430abc2c398b31c02cf26f2f2a6e0e71df5313acee8dd6a0551",
+    "stdlib_sha256": "be760e71e17bb9252981292aea1209bdea430fc2be14ad1a5db2fd35381ef329",
+    "config_sha256": "49469a8c2865ea4d5d153d337839e50f55533b36eeae67e2a1e588ac3abbe62a",
     "cpu": "znver4",
     "features": "+adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,+crc32,+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,+xsavec,+xsaveopt,+xsaves",
     "dynamic_closure": {
@@ -19,12 +19,12 @@
         "relative": "lib/libstdc++.so.6.0.36"
       },
       "libMSupportGlobals.so": {
-        "sha256": "3095c31589c65d166efd0938bf0e06dbe991719714a2d7fadc747f779d0bb4f7",
+        "sha256": "5cec8730d291375941f235604dcf9778ac9508cf6e41bd5f308572d7bc8c65db",
         "kind": "prefix",
         "relative": "lib/libMSupportGlobals.so"
       },
       "libAsyncRTRuntimeGlobals.so": {
-        "sha256": "89e2a0bb0931b33b403259665d2fe952f0c6ab79838e39735615ea289621ff40",
+        "sha256": "a27c591c97b7066377a6c5a12ecc1fecf2f600d9ccf869a371c441c8a1946648",
         "kind": "prefix",
         "relative": "lib/libAsyncRTRuntimeGlobals.so"
       },

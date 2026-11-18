@@ -359,10 +359,10 @@ def test_investigational_lock_pins_second_combo():
 def test_release_toolchain_pins_unchanged():
     lock = _load_json(RELEASE_LOCK)
     mojo = lock["tools"]["mojo"]
-    assert mojo["version"] == "Mojo 1.1.0 (8189361e)"
+    assert mojo["version"] == "Mojo 1.2.0 (2016d0cd)"
     assert (
         mojo["sha256"]
-        == "1250f6dc59317aa7c85718d425900aff89558fc851fab50a3c61ae2236b3f738"
+        == "2e61d34f18fe3430abc2c398b31c02cf26f2f2a6e0e71df5313acee8dd6a0551"
     )
     llc = lock["tools"]["llc"]
     assert llc["version"] == "LLVM (http://llvm.org/):"
@@ -372,7 +372,7 @@ def test_release_toolchain_pins_unchanged():
     )
     with open(os.path.join(REPO_ROOT, "pixi.toml"), encoding="utf-8") as handle:
         pixi = handle.read()
-    assert 'mojo = "==1.1.0"' in pixi
+    assert 'mojo = "==1.2.0"' in pixi
 
 
 def test_x86_matrix_shape_unchanged():

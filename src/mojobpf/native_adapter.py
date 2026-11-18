@@ -43,7 +43,7 @@ import threading
 import time
 
 ROUTE_ID = "parsed-xdp-array-candidate-v1"
-MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+MODEL_ID = "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
 PROFILE_ID = "linux-bpfel-v3"
 LICENSE = "Apache-2.0 WITH LLVM-exception"
 ADMISSION_ENV = "MOJOBPF_NATIVE_ADMISSION"

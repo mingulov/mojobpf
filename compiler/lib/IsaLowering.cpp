@@ -5,7 +5,7 @@ using namespace llvm;
 namespace mojobpf {
 Expected<ResolvedIsaCpu> resolveCpu(StringRef Cpu, StringRef Features) {
   // The route targets BPF CPU v3 exactly (ModelID
-  // mojo-1.1.0-x86_64-bpfel-v3-minimal-v1). v1/v2 lack lowering the
+  // mojo-1.2.0-x86_64-bpfel-v3-minimal-v1). v1/v2 lack lowering the
   // route relies on (native 32-bit forms, fetch atomics); v4 adds
   // MEMSX the audit does not model; generic aliases v1 per the
   // pinned-llc oracle. Refusal is MBPF202, the contract-mismatch

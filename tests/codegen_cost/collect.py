@@ -932,7 +932,7 @@ def validate_producer_evidence(provenance_raw, inventory_raw, blobs, admission_r
 
 TOOL_FIELDS = tuple("tool_id role executable_sha256 distribution_sha256 version_text llvm_lineage origin_location dependency_manifest_ref origin_record_refs claim_map".split())
 COMMAND_FIELDS = tuple("argv exit_code cwd files environment stdout stderr".split())
-NATIVE_MODEL = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+NATIVE_MODEL = "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
 
 
 def _json_pointer(record, pointer):

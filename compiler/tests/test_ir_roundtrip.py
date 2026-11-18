@@ -3,7 +3,7 @@
 
 Run directly with Python 3.11+ or with pytest. Requires CMake 3.20+, a C++17
 compiler, LLVM 22.1.8 development files and its opt/llvm-as/llvm-dis tools,
-and the working Mojo 1.1.0 environment on PATH. No kernel access is used.
+and the working Mojo 1.2.0 environment on PATH. No kernel access is used.
 The default invocation builds the tool once in an owned temporary directory.
 MOJOBPF_LOWER may select an already built executable; MOJOBPF_LLVM_CONFIG
 may select llvm-config. A missing dependency fails rather than skipping.

@@ -18,7 +18,7 @@ import pytest
 
 
 LICENSE = "Apache-2.0 WITH LLVM-exception"
-MODEL = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+MODEL = "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
 ROUTE = "parsed-xdp-array-candidate-v1"
 
 

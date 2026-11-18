@@ -211,7 +211,7 @@ def build_object(source, workdir, name):
     with open(spec_path, "w", encoding="utf-8") as handle:
         json.dump({
             "schema_version": 1,
-            "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+            "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1",
             "profile_id": "linux-bpfel-v3",
             "entry": "xdp_entry",
             "program_type": "xdp",

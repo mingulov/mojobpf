@@ -9,7 +9,7 @@ its own ``consumer_target.c`` probe-target executable, which
 carries the subscriber's own probe sites) to an unrelated
 working directory with the MojoBPF tree scrubbed from every
 search path, resolves ``mojo`` from PATH only (an independently
-installed Mojo 1.1.0, never the checkout's developer
+installed Mojo 1.2.0, never the checkout's developer
 environment), builds through the installed ``mojobpf`` command,
 and requires the exact kernel result through the standard
 loader/attach flow.
@@ -26,7 +26,7 @@ The consumer pins its own toolchain: the suite writes a
 ``toolchains.lock.json`` beside the copied manifest from the
 PATH-resolved tools, the way a real user pins theirs.
 
-Requires an independent Mojo 1.1.0 plus ``llc`` and ``vng`` on
+Requires an independent Mojo 1.2.0 plus ``llc`` and ``vng`` on
 PATH outside the checkout, and ``cc`` plus ``readelf`` for
 suite-side staging of the subscriber's own C sources. The guest
 release comes from ``MOJOBPF_VNG_RELEASE`` (``v6.12`` by
@@ -1032,7 +1032,7 @@ def test_consumer_builds_with_installed_tool():
 def test_consumer_toolchain_resolved_path_only():
     fix = fixture()
     mojo = fix["mojo"]
-    assert mojo["version"].startswith("Mojo 1.1.0"), mojo
+    assert mojo["version"].startswith("Mojo 1.2.0"), mojo
     assert not _under_repo(mojo["path"]), mojo
     assert not _under_repo(mojo["realpath"]), mojo
     home = fix["mojo"].get("home")

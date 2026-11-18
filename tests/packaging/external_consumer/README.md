@@ -17,7 +17,7 @@ installs the release-candidate wheel into a fresh virtual
 environment, copies this directory to an unrelated working
 directory with the MojoBPF tree scrubbed from every search path,
 resolves `mojo` from PATH only (an independently installed Mojo
-1.1.0, never the checkout's developer environment), builds through
+1.2.0, never the checkout's developer environment), builds through
 the installed `mojobpf` command, and requires the exact kernel
 result through the standard loader/test runner.
 

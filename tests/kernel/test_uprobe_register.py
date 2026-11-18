@@ -173,7 +173,7 @@ def stack_depth_line():
 # Lowering model contract, pinned with
 # compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
 # loudly at spec parse, never as a silent mismatch.
-GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+GUEST_MODEL_ID = "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
 MUTANT_OBJECT_HASH = (
     "4ed4c334b1f8e0d3be6a14a7fff72419d818b16ef69b85288cf47a366fdacb1e"
 )

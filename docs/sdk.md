@@ -59,7 +59,7 @@ objects built under different versions never share a cache entry
 ## Import rules
 
 These are the only accepted import shapes (verified against the
-Mojo 1.1.0 frontend; `as` aliases are transparent):
+Mojo 1.2.0 frontend; `as` aliases are transparent):
 
 ```mojo
 from mojobpf.packet import XDP_PASS, load_u8

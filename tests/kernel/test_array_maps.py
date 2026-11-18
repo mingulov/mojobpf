@@ -83,7 +83,7 @@ GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
 # Lowering model contract, pinned with
 # compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
 # loudly at spec parse, never as a silent mismatch.
-GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+GUEST_MODEL_ID = "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
 
 INIT_VALUE = 41
 AFTER_VALUE = 42

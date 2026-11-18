@@ -36,7 +36,7 @@ A compiler target listing, disassembly, constant return or successful load alone
 
 ## Compiler and SDK invariants
 
-Mojo 1.1.0 is the pinned compiler (see `toolchains.lock.json` and `docs/compatibility.md`); anything else needs its own qualification run. Use official Mojo syntax guidance where available, then compile against the pinned version. An agent skill is not a product dependency or a source of kernel support guarantees.
+Mojo 1.2.0 is the pinned compiler (see `toolchains.lock.json` and `docs/compatibility.md`); anything else needs its own qualification run. Use official Mojo syntax guidance where available, then compile against the pinned version. An agent skill is not a product dependency or a source of kernel support guarantees.
 
 Build/test hosts are x86-64 Linux with little-endian BPF; `linux-bpfel-v3` is the base profile with seven capability profiles beside it (see `docs/compatibility.md`). Candidate guest kernels are pinned by hash in `ci/kernels.lock.json`; no kernel is supported until the release matrix proves it.
 

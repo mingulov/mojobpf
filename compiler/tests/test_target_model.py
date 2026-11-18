@@ -2,7 +2,7 @@
 """Typed target admission, genuine producer controls and failure boundaries.
 
 Dependencies: Python 3.11+, pytest, CMake, C++17, LLVM 22.1.8 and the
-admitted Mojo 1.1.0 environment on PATH. All operations are unprivileged.
+admitted Mojo 1.2.0 environment on PATH. All operations are unprivileged.
 MOJOBPF_LOWER selects an existing build; otherwise a temporary build is used.
 MOJOBPF_TEST_EVIDENCE optionally retains actual commands and captured files.
 Missing required tools fail. Native controls are not BPF runtime tests.
@@ -305,7 +305,7 @@ def admitted_producer(executable=None):
     for identity in CASES["producer"]["dynamic_closure"].values():
         path = prefix / identity["relative"] if identity["kind"] == "prefix" else Path(identity["relative"])
         assert digest(path) == identity["sha256"], "unadmitted producer dynamic closure"
-    assert checked([mojo, "--version"]).stdout.strip() == "Mojo 1.1.0 (8189361e)"
+    assert checked([mojo, "--version"]).stdout.strip() == "Mojo 1.2.0 (2016d0cd)"
     return mojo
 
 

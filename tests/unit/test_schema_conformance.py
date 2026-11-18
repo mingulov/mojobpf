@@ -284,7 +284,7 @@ def _make_target(**overrides):
             "namespaces": ["net:mojobpf-1"],
         },
         "build_host": {
-            "identity": "mojo-1.1.0/x86-64",
+            "identity": "mojo-1.2.0/x86-64",
             "flags": ["-O2"],
         },
     }

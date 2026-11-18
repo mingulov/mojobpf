@@ -1531,7 +1531,7 @@ def adapter_fixture(adapter, *, slots=3, source=b"synthetic algorithm input\n", 
                 "sdk_import_closure": {"sdk": sha(fixture["files"]["sdk"][1])}, "producer_sha256": executable,
                 "emit": "llvm", "producer_optimization": "default (no explicit optimization option)"}
             fixture["files"]["source-capture"] = ("source_capture", canonical_json(capture))
-            spec = {"schema_version": 1, "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1", "profile_id": "linux-bpfel-v3",
+            spec = {"schema_version": 1, "model_id": "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1", "profile_id": "linux-bpfel-v3",
                 "entry": "main", "program_type": "xdp", "section": "xdp", "kernel_license": "Apache-2.0 WITH LLVM-exception", "map": None}
             fixture["image"] = control(MOV * (slots - 1) + EXIT, extra=[("license", 1, 0, spec["kernel_license"].encode() + b"\0")])
             fixture["files"]["object"] = ("object", fixture["image"])

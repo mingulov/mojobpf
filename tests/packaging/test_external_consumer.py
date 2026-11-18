@@ -20,7 +20,7 @@ checkout lockfile copy. The consumer pins its own toolchain the way
 a real user pins theirs (a ``toolchains.lock.json`` written beside
 the copied manifest from the PATH-resolved tools); the suite
 records which ``mojo`` ran and where it came from, and fails
-cleanly as an environment failure when no Mojo 1.1.0 is on PATH.
+cleanly as an environment failure when no Mojo 1.2.0 is on PATH.
 Only the tool under test (package, SDK, adapter) must come from the
 fresh virtual environment; only the toolchain (Mojo, LLVM, guest
 runner) comes from the ambient machine.
@@ -909,7 +909,7 @@ def test_consumer_builds_with_installed_tool():
 def test_consumer_toolchain_resolved_path_only():
     fix = fixture()
     mojo = fix["mojo"]
-    assert mojo["version"].startswith("Mojo 1.1.0"), mojo
+    assert mojo["version"].startswith("Mojo 1.2.0"), mojo
     assert not _under_repo(mojo["path"]), mojo
     assert not _under_repo(mojo["realpath"]), mojo
     home = fix["mojo"].get("home")

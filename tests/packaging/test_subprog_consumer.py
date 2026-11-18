@@ -7,7 +7,7 @@ subscriber's own manifest plus its own ``subscriber.mojo`` XDP
 decision source, which differs from every in-tree Mojo source)
 to an unrelated working directory with the MojoBPF tree scrubbed
 from every search path, resolves ``mojo`` from PATH only (an
-independently installed Mojo 1.1.0, never the checkout's
+independently installed Mojo 1.2.0, never the checkout's
 developer environment), builds through the installed ``mojobpf``
 command, and requires the exact kernel result through the
 standard loader/test runner.
@@ -25,7 +25,7 @@ The consumer pins its own toolchain: the suite writes a
 ``toolchains.lock.json`` beside the copied manifest from the
 PATH-resolved tools, the way a real user pins theirs.
 
-Requires an independent Mojo 1.1.0 plus ``llc`` and ``vng`` on
+Requires an independent Mojo 1.2.0 plus ``llc`` and ``vng`` on
 PATH outside the checkout. The guest release comes from
 ``MOJOBPF_VNG_RELEASE`` (``v6.12`` by default). Only the vng
 guest performs BPF loads. The guest boots as a session leader,
@@ -918,7 +918,7 @@ def test_consumer_builds_with_installed_tool():
 def test_consumer_toolchain_resolved_path_only():
     fix = fixture()
     mojo = fix["mojo"]
-    assert mojo["version"].startswith("Mojo 1.1.0"), mojo
+    assert mojo["version"].startswith("Mojo 1.2.0"), mojo
     assert not _under_repo(mojo["path"]), mojo
     assert not _under_repo(mojo["realpath"]), mojo
     home = fix["mojo"].get("home")

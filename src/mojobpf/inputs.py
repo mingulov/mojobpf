@@ -13,7 +13,7 @@ directory can neither alter the compiled object nor forge the
 attributed hashes: the build consumes the snapshot or rejects, never
 reports the clean hash for changed consumed bytes.
 
-Import model: the pinned Mojo frontend (1.1.0) offers no
+Import model: the pinned Mojo frontend (1.2.0) offers no
 dependency-output mode (``mojo build --help`` lists no
 ``--emit-dependencies``/``-MD`` spelling), so the snapshot cannot
 prefer compiler dependency output and instead implements the bounded

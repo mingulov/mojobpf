@@ -19,7 +19,7 @@ must produce exact kernel results: seed keys 0 and 1 with 41, run
 once, both read 42; run again, both read 43; the standard runner
 passes on the consumer bytes; no owned pin survives.
 
-Requires an independently installed Mojo 1.1.0 plus ``llc`` and
+Requires an independently installed Mojo 1.2.0 plus ``llc`` and
 ``vng`` on PATH (default release v6.12; MOJOBPF_VNG_RELEASE selects
 the matrix lane). Missing tools fail loudly as environment failures,
 never as passes.
@@ -898,7 +898,7 @@ def test_consumer_builds_with_installed_tool():
 def test_consumer_toolchain_resolved_path_only():
     fix = fixture()
     mojo = fix["mojo"]
-    assert mojo["version"].startswith("Mojo 1.1.0"), mojo
+    assert mojo["version"].startswith("Mojo 1.2.0"), mojo
     assert not _under_repo(mojo["path"]), mojo
     assert not _under_repo(mojo["realpath"]), mojo
     home = fix["mojo"].get("home")

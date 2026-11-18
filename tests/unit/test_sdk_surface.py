@@ -42,7 +42,7 @@ SDK_ROOT = os.path.join(
 SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 
 # Checker truth table: (source, expected violation count).
-# Twenty-three rows are re-verified against the genuine Mojo 1.1.0
+# Twenty-three rows are re-verified against the genuine Mojo 1.2.0
 # frontend on every run of the packaging compatibility suite
 # (``mojo build --emit llvm -I <sdk>``): the plain accept, the
 # parenthesized-list accept, the ``load_u8 as lu8`` alias
@@ -124,7 +124,7 @@ CHECKER_CASES = (
     # inside a comment never starts a string.
     ('x = "a#b"\nfrom mojobpf import _impl\n', 1),
     ("# don't\nfrom mojobpf import _impl\n", 1),
-    # Semicolons separate statements (Mojo 1.1.0 accepts them):
+    # Semicolons separate statements (Mojo 1.2.0 accepts them):
     # every segment judges independently, so a forbidden import
     # after a ';' is still reported.
     ("import mojobpf.packet; import mojobpf.core\n", 0),
