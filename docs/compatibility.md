@@ -108,9 +108,9 @@ exclusions following this paragraph; the v1.0 matrix passes
 green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
 exclusions, 0 red; board commit e98ea93 via
 `ci/run_vm_tests.py` per-lane runs plus `--merge`;
-e98ea93..HEAD touches only merge aggregation, docs, and host
-unit tests — no suite, driver, adapter, SDK, or harness
-change). Two ruled cell groups stay
+e98ea93..HEAD touches only merge aggregation, docs, CI
+workflow comments, and host unit tests — no suite, driver,
+adapter, SDK, or harness change). Two ruled cell groups stay
 out of claim: the joint suite (needs libbpf-mojo inputs,
 labelled experimental) and 7.x task-struct layouts (1.x CO-RE
 work). These rulings are mechanized as `LANE_SUITE_EXCLUSIONS`
