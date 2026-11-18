@@ -763,6 +763,26 @@ def test_load_lock_rejects_non_list_argv_prefix():
     print("PASS load lock rejects non-list argv prefix")
 
 
+def test_load_lock_rejects_non_string_release():
+    runner = _load_runner()
+    lane = _lane(lane_id="a", release="v9.1")
+    lane["release"] = 7
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "release must be a string" in message, message
+    print("PASS load lock rejects non-string release")
+
+
+def test_load_lock_rejects_non_string_kernel_release():
+    runner = _load_runner()
+    lane = _lane(lane_id="a", release="v9.1")
+    lane["kernel_release"] = 7
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "kernel_release must be a string" in message, message
+    print("PASS load lock rejects non-string kernel release")
+
+
 def test_load_lock_requires_the_qemu_pin():
     runner = _load_runner()
     lock = _lock(
@@ -3411,6 +3431,94 @@ def test_accept_deeply_nested_record_fails_suite():
     print("PASS accept deeply nested record fails suite")
 
 
+def _deep_value(depth=800):
+    value = None
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def test_accept_deeply_nested_behavior_fails_suite():
+    # A behavior value deep enough to overflow the
+    # recursive comparison (but shallow enough to load)
+    # fails the suite instead of crashing the matrix.
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    deep = _deep_value()
+    result_docs[0]["expected"]["value"] = deep
+    result_docs[0]["observed"]["value"] = deep
+    output = "\n".join((
+        "MOJOBPF_RUN_PLAN "
+        + json.dumps(plan_doc, sort_keys=True),
+        "MOJOBPF_CASE_RESULT "
+        + json.dumps(result_docs[0], sort_keys=True),
+        "MOJOBPF_SUITE_RESULT "
+        + json.dumps(suite_doc, sort_keys=True),
+    )) + "\n"
+    manifest = runner.lane_target_manifest(_LANE)
+    outcome, note, _detail = runner.accept_suite_output(
+        "fake-suite", ["test_alpha"], output, 0, _FAKE_COMMIT,
+        manifest, "0" * 64,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "too deeply nested" in note, note
+    print("PASS accept deeply nested behavior fails suite")
+
+
+def test_accept_recursion_failure_fails_suite():
+    # Routing pin: a RecursionError from any validation
+    # step (plan/case/terminal parse, aggregate, verify)
+    # fails the suite instead of crashing the matrix.
+    # (Only the case site is reachable with crafted
+    # documents — see the behavior test above; the rest
+    # is defensive routing for direct library use.)
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    patches = (
+        (
+            validation_mod.RunPlan, "from_dict",
+            "run plan too deeply nested",
+        ),
+        (
+            validation_mod.CaseResult, "from_dict",
+            "case result #0 too deeply nested",
+        ),
+        (
+            validation_mod.SuiteResult, "from_dict",
+            "terminal suite record too deeply nested",
+        ),
+        (
+            validation_mod, "aggregate",
+            "aggregation too deeply nested",
+        ),
+        (
+            runner, "verify_suite_result",
+            "terminal record too deeply nested",
+        ),
+    )
+    for obj, name, needle in patches:
+        real = getattr(obj, name)
+
+        def _boom(*args, **kwargs):
+            raise RecursionError("routing probe")
+
+        setattr(obj, name, _boom)
+        try:
+            outcome, note, _detail = _accept_output(
+                runner, ["test_alpha"],
+                plan_doc, result_docs, suite_doc,
+            )
+        finally:
+            setattr(obj, name, real)
+        assert outcome == "fail", (name, outcome, note)
+        assert needle in note, (name, needle, note)
+    print("PASS accept recursion failure fails suite")
+
+
 def test_accept_plan_case_drift_fails():
     runner = _load_runner()
     # Extra plan case the pins do not know.
@@ -4774,6 +4882,46 @@ def test_merge_refuses_out_dir_is_a_file():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_merge_refuses_undumpable_board():
+    # A board that loads but cannot be serialized (deep
+    # nesting past the dump limit) refuses (exit 2,
+    # single line) instead of an uncaught traceback.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        report["lanes"][0]["cache"] = "CACHE_MARKER"
+        first = os.path.join(workdir, "a.json")
+        with open(first, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(report).replace(
+                    '"CACHE_MARKER"',
+                    "[" * 10000 + "]" * 10000,
+                    1,
+                )
+            )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out, must_not_exist=False,
+        )
+        assert "cannot write report" in message, message
+        assert not os.path.isfile(
+            os.path.join(out, "matrix-report.json")
+        ), out
+        print("PASS merge refuses undumpable board")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_merge_refuses_unwritable_report():
     # A validated merge whose board cannot be written
     # refuses (exit 2, single line) instead of an uncaught
@@ -5443,6 +5591,60 @@ def test_main_default_out_dir_keeps_failure_board():
         print("PASS main default out-dir keeps failure board")
     finally:
         tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_undumpable_board():
+    # A direct-run board that cannot be serialized
+    # refuses (exit 2, single line) instead of an
+    # uncaught traceback; no board file appears.
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        runner.LANE_SUITE_EXCLUSIONS = {}
+        value = None
+        for _ in range(10000):
+            value = [value]
+
+        def _deep(suite_id, relpath, lane, *args, **kwargs):
+            return {
+                "lane": lane["id"],
+                "suite": suite_id,
+                "commit": "abc123",
+                "outcome": "pass",
+                "exit_code": 0,
+                "verdict": "PASS",
+                "passes": 1,
+                "failures": 0,
+                "envfailures": 0,
+                "elapsed_secs": 0.1,
+                "deep": value,
+            }
+
+        runner.run_suite = _deep
+        out = os.path.join(workdir, "out")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with redirect_stderr(stderr):
+                code = runner.main(
+                    ["--lock", lock_path, "--out-dir", out]
+                )
+        assert code == 2, (code, stdout.getvalue())
+        message = stderr.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.count("\n") == 1, message
+        assert message.endswith("\n"), message
+        assert "cannot write report" in message, message
+        assert not os.path.isfile(
+            os.path.join(out, "matrix-report.json")
+        ), out
+        print("PASS main refuses undumpable board")
+    finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 

@@ -1221,7 +1221,11 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(merged, handle, indent=2, sort_keys=True)
             handle.write("\n")
-    except OSError as exc:
+    except (OSError, RecursionError) as exc:
+        try:
+            os.remove(report_path)
+        except OSError:
+            pass
         raise SetupFailure(
             "cannot write report %s: %s" % (report_path, exc)
         )
@@ -1354,6 +1358,14 @@ def load_lock(path):
                 )
         if not isinstance(lane["id"], str):
             raise SetupFailure("lockfile lane id must be a string")
+        if not isinstance(lane["release"], str):
+            raise SetupFailure(
+                "lockfile lane release must be a string"
+            )
+        if not isinstance(lane["kernel_release"], str):
+            raise SetupFailure(
+                "lockfile lane kernel_release must be a string"
+            )
         if lane["id"] in seen_ids:
             raise SetupFailure(
                 "duplicate lane id %r" % lane["id"]
@@ -2132,6 +2144,11 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
             % (exc.code, exc.diagnostic.explanation),
             detail,
         )
+    except RecursionError as exc:
+        return (
+            "fail", "run plan too deeply nested: %s" % exc,
+            detail,
+        )
     detail["plan_hash"] = plan.plan_hash
     got = set(case.case_id for case in plan.cases)
     want = set(expected_cases)
@@ -2244,6 +2261,13 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
                 % (index, exc.code, exc.diagnostic.explanation),
                 detail,
             )
+        except RecursionError as exc:
+            return (
+                "fail",
+                "case result #%d too deeply nested: %s"
+                % (index, exc),
+                detail,
+            )
     for result in results:
         consumer = result.identities["consumer"]
         if (
@@ -2274,6 +2298,12 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
             % (exc.code, exc.diagnostic.explanation),
             detail,
         )
+    except RecursionError as exc:
+        return (
+            "fail",
+            "terminal suite record too deeply nested: %s" % exc,
+            detail,
+        )
     try:
         decision = validation_mod.aggregate(plan, results)
     except validation_mod.ContractError as exc:
@@ -2283,6 +2313,11 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
             % (exc.code, exc.diagnostic.explanation),
             detail,
         )
+    except RecursionError as exc:
+        return (
+            "fail", "aggregation too deeply nested: %s" % exc,
+            detail,
+        )
     try:
         verify_suite_result(suite, plan, results)
     except validation_mod.ContractError as exc:
@@ -2290,6 +2325,12 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
             "fail",
             "terminal record disagrees with recomputation "
             "(%s): %s" % (exc.code, exc.diagnostic.explanation),
+            detail,
+        )
+    except RecursionError as exc:
+        return (
+            "fail",
+            "terminal record too deeply nested: %s" % exc,
             detail,
         )
     detail["verdict"] = decision.verdict
@@ -3098,7 +3139,11 @@ def main(argv=None):
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True)
             handle.write("\n")
-    except OSError as exc:
+    except (OSError, RecursionError) as exc:
+        try:
+            os.remove(report_path)
+        except OSError:
+            pass
         return _refuse(
             "cannot write report %s: %s" % (report_path, exc)
         )
