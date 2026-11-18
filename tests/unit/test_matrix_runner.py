@@ -4138,7 +4138,8 @@ def test_merge_farm_plus_digest_mismatch_still_refuses():
         second = _write_report(workdir, "b.json", second_report)
         out = os.path.join(workdir, "merged")
         message = _merge_rejection_text(
-            runner, ["--merge", first, second, "--out-dir", out]
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
         )
         assert "disagrees on 'runner'" in message, message
         print("PASS merge farm+digest mismatch refuses")
@@ -4165,7 +4166,8 @@ def test_merge_refuses_cell_from_foreign_lane():
         second = _write_report(workdir, "b.json", second_report)
         out = os.path.join(workdir, "merged")
         message = _merge_rejection_text(
-            runner, ["--merge", first, second, "--out-dir", out]
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
         )
         assert "outside its own lanes" in message, message
         print("PASS merge refuses foreign-lane cell")
@@ -4190,7 +4192,8 @@ def test_merge_refuses_cell_commit_mismatch():
         )
         out = os.path.join(workdir, "merged")
         message = _merge_rejection_text(
-            runner, ["--merge", first, second, "--out-dir", out]
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
         )
         assert "not the shard commit" in message, message
         print("PASS merge refuses cell commit mismatch")
@@ -4218,7 +4221,8 @@ def test_merge_refuses_pass_with_bad_exit_or_verdict():
             )
             out = os.path.join(workdir, "merged")
             message = _merge_rejection_text(
-                runner, ["--merge", first, second, "--out-dir", out]
+                runner, ["--merge", first, second, "--out-dir", out],
+                out,
             )
             assert "claims pass with" in message, (
                 field, message,
@@ -4253,7 +4257,8 @@ def test_merge_refuses_malformed_lane_without_traceback():
         )
         out = os.path.join(workdir, "merged")
         message = _merge_rejection_text(
-            runner, ["--merge", first, second, "--out-dir", out]
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
         )
         assert "malformed lanes" in message, message
         assert "Traceback" not in message, message
@@ -4262,8 +4267,13 @@ def test_merge_refuses_malformed_lane_without_traceback():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _merge_rejection_text(runner, args):
-    """Run a merge expecting refusal; return its stderr text."""
+def _merge_rejection_text(runner, args, out_dir):
+    """Run a merge expecting refusal; return its stderr text.
+
+    Pins the refusal contract: exit 2, a single stderr line
+    (no traceback), and no emitted board directory (refused
+    merges leave no trace).
+    """
     import io
     from contextlib import redirect_stderr
 
@@ -4271,7 +4281,10 @@ def _merge_rejection_text(runner, args):
     with redirect_stderr(buffer):
         code = runner.main(args)
     assert code == 2, code
-    return buffer.getvalue()
+    message = buffer.getvalue()
+    assert message.strip().count("\n") == 0, message
+    assert not os.path.exists(out_dir), out_dir
+    return message
 
 
 def test_merge_refuses_malformed_result_values():
@@ -4304,7 +4317,8 @@ def test_merge_refuses_malformed_result_values():
             out = os.path.join(workdir, "merged")
             message = _merge_rejection_text(
                 runner, ["--merge", first, second,
-                         "--out-dir", out]
+                         "--out-dir", out],
+                out,
             )
             assert "malformed results" in message, (
                 field, bad, message,
@@ -4326,7 +4340,8 @@ def test_merge_refuses_malformed_result_values():
             out = os.path.join(workdir, "merged")
             message = _merge_rejection_text(
                 runner, ["--merge", first, second,
-                         "--out-dir", out]
+                         "--out-dir", out],
+                out,
             )
             assert "malformed results" in message, (
                 missing, message,
@@ -4352,6 +4367,20 @@ def test_direct_run_records_skip():
     finally:
         del globals()[marker]
     print("PASS direct run records skip")
+
+
+def test_direct_one_records_direct_skip():
+    marker = "direct_directskip_probe_for_direct_one"
+
+    def _raiser():
+        raise _DirectSkip("probe")
+
+    globals()[marker] = _raiser
+    try:
+        assert _direct_one(marker) == "skip"
+    finally:
+        del globals()[marker]
+    print("PASS direct run records direct skip")
 
 
 def test_direct_one_propagates_abort():
@@ -4396,7 +4425,8 @@ def test_merge_refuses_malformed_elapsed_secs():
             out = os.path.join(workdir, "merged")
             message = _merge_rejection_text(
                 runner, ["--merge", first, second,
-                         "--out-dir", out]
+                         "--out-dir", out],
+                out,
             )
             assert "malformed elapsed_secs" in message, (
                 bad, message,
@@ -4414,7 +4444,8 @@ def test_merge_refuses_malformed_elapsed_secs():
         )
         out = os.path.join(workdir, "merged")
         message = _merge_rejection_text(
-            runner, ["--merge", first, second, "--out-dir", out]
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
         )
         assert "malformed elapsed_secs" in message, message
         print("PASS merge refuses malformed elapsed_secs")
@@ -4438,7 +4469,8 @@ def test_merge_refuses_elapsed_sum_overflow():
         second = _write_report(workdir, "b.json", second_report)
         out = os.path.join(workdir, "merged")
         message = _merge_rejection_text(
-            runner, ["--merge", first, second, "--out-dir", out]
+            runner, ["--merge", first, second, "--out-dir", out],
+            out,
         )
         assert "overflowed" in message, message
         print("PASS merge refuses elapsed sum overflow")

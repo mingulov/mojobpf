@@ -1148,7 +1148,6 @@ def merge_reports(paths, out_dir, expect_lanes=None):
                     sorted(got - want),
                 )
             )
-    os.makedirs(out_dir, exist_ok=True)
     total_elapsed = sum(
         float(shard["elapsed_secs"]) for shard in shards
     )
@@ -1157,6 +1156,7 @@ def merge_reports(paths, out_dir, expect_lanes=None):
             "merged elapsed_secs overflowed; refusing to emit "
             "a board the loader itself would refuse"
         )
+    os.makedirs(out_dir, exist_ok=True)
     merged = {
         "tool": "run_vm_tests",
         "commit": first["commit"],
