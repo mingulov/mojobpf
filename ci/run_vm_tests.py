@@ -1180,9 +1180,14 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         "elapsed_secs": round(total_elapsed, 1),
     }
     report_path = os.path.join(out_dir, "matrix-report.json")
-    with open(report_path, "w", encoding="utf-8") as handle:
-        json.dump(merged, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    try:
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(merged, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except OSError as exc:
+        raise SetupFailure(
+            "cannot write report %s: %s" % (report_path, exc)
+        )
     print("matrix board (commit %s, merged %d shards):"
           % (merged["commit"], len(shards)))
     excluded_cells = 0
@@ -2909,7 +2914,14 @@ def main(argv=None):
 
     if args.out_dir:
         out_dir = args.out_dir
-        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            sys.stderr.write(
+                "run_vm_tests: cannot create out dir %s: %s\n"
+                % (out_dir, exc)
+            )
+            return EXIT_SETUP
     else:
         out_dir = tempfile.mkdtemp(prefix="mojobpf-matrix-")
     started = time.time()
@@ -3009,9 +3021,16 @@ def main(argv=None):
         "elapsed_secs": round(time.time() - started, 1),
     }
     report_path = os.path.join(out_dir, "matrix-report.json")
-    with open(report_path, "w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    try:
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except OSError as exc:
+        sys.stderr.write(
+            "run_vm_tests: cannot write report %s: %s\n"
+            % (report_path, exc)
+        )
+        return EXIT_SETUP
 
     selected = {suite_id for suite_id, _, _ in suites}
     excluded_cells = sum(
