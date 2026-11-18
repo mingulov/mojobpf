@@ -48,6 +48,12 @@ the minted directory behind but never changes the refusal).
 A directory that cannot be created, or a board that cannot
 be written, refuses (exit 2) like any other setup problem.
 
+Refusals print as one prefixed stderr line, except
+argparse's own usage-error format and the intentional
+multi-line dirt list; stdout progress and board lines
+echo lockfile inputs verbatim as human evidence, not as
+part of the refusal contract.
+
 Suites report through the structured result protocol, not line
 scraping: each suite seals a ``test-contracts-v1`` run plan,
 emits one case result per case, and ends with a terminal
@@ -907,6 +913,10 @@ EXIT_SETUP = 2
 
 class SetupFailure(Exception):
     """The matrix cannot run honestly (exit 2)."""
+
+
+class SetupFailureMultiline(SetupFailure):
+    """Setup failure whose detail stays multi-line (dirt list)."""
 
 
 def _refuse(message):
@@ -2800,7 +2810,8 @@ def build_parser():
         help="directory for per-suite logs and the report "
         "(default: a fresh temporary directory, kept with "
         "its board; a refused merge removes its minted "
-        "directory best-effort)",
+        "directory best-effort, leaving it only if "
+        "cleanup fails)",
     )
     parser.add_argument(
         "--timeout",
@@ -2884,7 +2895,7 @@ def main(argv=None):
         commit = git_head()
         dirt = git_clean()
         if dirt:
-            raise SetupFailure(
+            raise SetupFailureMultiline(
                 "worktree is dirty; commit first so every lane "
                 "tests the same bits:\n%s" % dirt
             )
@@ -2942,9 +2953,11 @@ def main(argv=None):
                     "lane %r"
                     % (sorted(unknown), lane_id)
                 )
-    except SetupFailure as exc:
+    except SetupFailureMultiline as exc:
         sys.stderr.write("run_vm_tests: %s\n" % exc)
         return EXIT_SETUP
+    except SetupFailure as exc:
+        return _refuse(exc)
 
     if args.out_dir:
         out_dir = args.out_dir

@@ -4326,12 +4326,13 @@ def test_merge_refuses_malformed_lane_without_traceback():
 def _merge_rejection_text(runner, args, out_dir, must_not_exist=True):
     """Run a merge expecting refusal; return its stderr text.
 
-    Pins the refusal contract: exit 2, a single stderr line
-    (no traceback) carrying the tool prefix, and no emitted
-    board directory (refused merges leave no trace, barring
-    cleanup failure). Pass must_not_exist=False when the out
-    path pre-exists (e.g. out_dir-is-a-file): the refusal
-    shape is still pinned, but there is nothing to not-emit.
+    Pins the refusal contract: exit 2, exactly one stderr
+    line (no traceback, no blank padding) carrying the tool
+    prefix, and no emitted board directory (refused merges
+    leave no trace, barring cleanup failure). Pass
+    must_not_exist=False when the out path pre-exists (e.g.
+    out_dir-is-a-file): the refusal shape is still pinned,
+    but there is nothing to not-emit.
     """
     import io
     from contextlib import redirect_stderr
@@ -4342,7 +4343,8 @@ def _merge_rejection_text(runner, args, out_dir, must_not_exist=True):
     assert code == 2, code
     message = buffer.getvalue()
     assert message.startswith("run_vm_tests:"), message
-    assert message.strip().count("\n") == 0, message
+    assert message.count("\n") == 1, message
+    assert message.endswith("\n"), message
     if must_not_exist:
         assert not os.path.exists(out_dir), out_dir
     return message
@@ -4910,6 +4912,129 @@ def _stubbed_direct_runner(runner, workdir):
         "solo-b": all_suites,
     }
     return lock_path
+
+
+def test_main_setup_refusal_collapses_newline_lock():
+    # A newline-bearing --lock refuses as one line: the
+    # setup handler collapses like every other refusal
+    # site. No stubs needed (the lock load fails first).
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    try:
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            code = runner.main(
+                ["--lock", os.path.join(workdir, "a\nb.json")]
+            )
+        assert code == 2, code
+        message = buffer.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.strip().count("\n") == 0, message
+        assert "lockfile not found" in message, message
+        print("PASS main setup refusal collapses newline lock")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_setup_refusal_collapses_newline_flag():
+    # Newline-bearing --lane/--suite/--consumer-path
+    # refuse as one line each (live-probed, not inferred).
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        cases = (
+            (["--lane", "a\nb"], "unknown lane"),
+            (["--suite", "x\ny"], "unknown suite"),
+            (
+                ["--consumer-path", os.path.join(workdir, "n\no")],
+                "not a directory",
+            ),
+        )
+        for extra, needle in cases:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                with redirect_stderr(stderr):
+                    code = runner.main(
+                        ["--lock", lock_path] + extra
+                    )
+            assert code == 2, (extra, code, stdout.getvalue())
+            message = stderr.getvalue()
+            assert message.startswith("run_vm_tests:"), (
+                extra, message,
+            )
+            assert message.strip().count("\n") == 0, (
+                extra, message,
+            )
+            assert needle in message, (extra, message)
+        print("PASS main setup refusal collapses newline flag")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_setup_refusal_collapses_git_failure():
+    # Multi-line git failure text collapses to one line:
+    # only the dirt list keeps multi-line stderr.
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+
+        def _boom():
+            raise runner.SetupFailure(
+                "cannot inspect the worktree: a\nb"
+            )
+
+        runner.git_clean = _boom
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with redirect_stderr(stderr):
+                code = runner.main(["--lock", lock_path])
+        assert code == 2, (code, stdout.getvalue())
+        message = stderr.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert message.strip().count("\n") == 0, message
+        assert "cannot inspect the worktree" in message, message
+        print("PASS main setup refusal collapses git failure")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_setup_dirt_stays_multiline():
+    # Carve-out guard: the dirt list intentionally stays
+    # multi-line stderr (the collapse must not eat it).
+    import contextlib
+    import io
+    from contextlib import redirect_stderr
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-direct-io-")
+    try:
+        lock_path = _stubbed_direct_runner(runner, workdir)
+        runner.git_clean = lambda: " M foo\n M bar"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with redirect_stderr(stderr):
+                code = runner.main(["--lock", lock_path])
+        assert code == 2, (code, stdout.getvalue())
+        message = stderr.getvalue()
+        assert message.startswith("run_vm_tests:"), message
+        assert "worktree is dirty" in message, message
+        assert message.strip().count("\n") == 2, message
+        print("PASS main setup dirt stays multiline")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_main_refuses_out_dir_is_a_file():
