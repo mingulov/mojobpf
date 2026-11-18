@@ -16,10 +16,9 @@ closed to XDP_DROP):
 
 * loop_sum: drop when the frame holds at least 18 bytes and bytes
   14-17 (summed by a bounded ``for`` loop) exceed 100, else pass --
-  on lanes whose verifier accepts this back-edge shape (v6.12); on
-  the v6.6 lane the verifier rejects the shape at load with a pinned
-  log line, which the suite asserts instead (a version boundary, not
-  a skip);
+  on every pinned lane (the 1.1.0-era v6.6 rejection retired when
+  the pinned 1.2.0 frontend changed the loop emission; the reject
+  branch stays for any future lane that refuses);
 * call_inline: drop when the frame holds at least 22 bytes and
   bytes 20-21 read 0xAA55 little-endian through a plain helper the
   frontend inlines, else pass;
@@ -112,14 +111,17 @@ def short_expect():
 VNG_TIMEOUT = 900
 MASK64 = (1 << 64) - 1
 
-# Per-lane loop_sum verdict. The shape's bounded-``for`` back edge
-# needs a 6.12-era verifier; the 6.6 verifier rejects it at load
-# ("back-edge from insn 18 to 19", observed). A lane not listed here
-# fails loudly until its verdict is pinned with evidence -- a new
-# lane never silently inherits either branch.
+# Per-lane loop_sum verdict. Every pinned lane currently accepts
+# the shape: the 1.1.0-era 6.6 rejection ("back-edge from insn 18
+# to 19", observed) retired with the pinned 1.2.0 frontend, whose
+# loop emission the 6.6 verifier accepts with oracle-matching
+# actions. A lane not listed here fails loudly until its verdict
+# is pinned with evidence -- a new lane never silently inherits
+# either branch, and the reject branch stays for any future lane
+# that refuses.
 LOOP_SUM_LANE = {
     "v6.12": "pass",
-    "v6.6": "reject",
+    "v6.6": "pass",
     "v7.0.14": "pass",
     "v7.2": "pass",
     "v7.4-rc1": "pass",

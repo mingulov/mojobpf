@@ -219,13 +219,16 @@ at the toolchain gate (`MBPF102`) exactly as designed.
 ## Kernel-version boundary: `loop-sum` on 6.6
 
 The bounded-loop subset case `loop-sum` verifies and runs on
-6.12, 7.0.14, 7.2, and 7.4-rc1 but is rejected by the 6.6
-verifier with the kernel's own reason (`back-edge from insn
-18 to 19`). Every lane verdict is pinned exactly: the suite
-passes on a run lane only when test-run actions match the
-oracle, and passes on 6.6 only when the verifier rejects with
-that exact log line; any other behavior on any lane fails
-loudly (`tests/verifier/test_subset_kernel.py::test_loop_sum`,
+all five matrix lanes (6.6, 6.12, 7.0.14, 7.2, and 7.4-rc1):
+test-run actions match the oracle on every lane. (Under the
+retired Mojo 1.1.0 frontend the 6.6 verifier rejected the shape
+at load with `back-edge from insn 18 to 19`; the pinned 1.2.0
+frontend emits a loop the 6.6 verifier accepts, and the lane
+verdict was re-pinned to pass on the observed oracle-matching
+actions.) Every lane verdict stays pinned exactly: the suite
+passes on a lane only when test-run actions match the oracle,
+and any other behavior on any lane fails loudly
+(`tests/verifier/test_subset_kernel.py::test_loop_sum`,
 `docs/supported-subset.md` case table, all five matrix lanes).
 
 This is a genuine kernel-version boundary the five-lane matrix

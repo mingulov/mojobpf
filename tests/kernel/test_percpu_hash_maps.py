@@ -1965,32 +1965,47 @@ def test_unchecked_rejected_by_verifier():
 
 
 def test_license_gate_agrees():
-    """Inspection + preflight agree with the kernel on per-CPU-hash objects."""
+    """Refused profile: inspection + preflight agree on MBPF101.
+
+    Guard form: the per-CPU-hash profile id is not admitted, so
+    every gate that resolves it refuses with MBPF101 (the kind
+    stays unclaimed; the retained implementation beneath keeps
+    its behavior proofs in the other cases of this suite).
+    """
     sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
     from mojobpf import inspect as inspect_module  # noqa: E402
 
     stage = executed()["stage"]
     for name in ("percpuhash_rmw1.bpf.o", "percpuhash_rmw2.bpf.o", "percpuhash_rmw4.bpf.o",
                  "percpuhash_del.bpf.o"):
-        report = guest_proc.inspect_consumed(
-            os.path.join(stage, name),
-            PERCPUHASH_PROFILE,
-        )
-        assert report.ok is True, (name, report.to_dict())
-    assert inspect_module.preflight_helper_licenses(
-        [1, 2, 3], APACHE, PERCPUHASH_PROFILE
-    ) is None
-    try:
-        inspect_module.preflight_helper_licenses(
-            [35], APACHE, PERCPUHASH_PROFILE
-        )
-    except Exception as exc:  # noqa: BLE001 - assert the carried code
-        assert exc.diagnostic.code == "MBPF709", exc.diagnostic
-        assert exc.diagnostic.stage == "inspect.license", exc.diagnostic
-    else:
-        raise AssertionError(
-            "the preflight must still refuse the GPL-only witness"
-        )
+        try:
+            guest_proc.inspect_consumed(
+                os.path.join(stage, name),
+                PERCPUHASH_PROFILE,
+            )
+        except Exception as exc:  # noqa: BLE001 - assert the carried code
+            assert exc.diagnostic.code == "MBPF101", exc.diagnostic
+            assert exc.diagnostic.stage == "profile.resolve", (
+                exc.diagnostic
+            )
+        else:
+            raise AssertionError(
+                "%s: the refused profile must not inspect" % name
+            )
+    for helpers in ([1, 2, 3], [35]):
+        try:
+            inspect_module.preflight_helper_licenses(
+                helpers, APACHE, PERCPUHASH_PROFILE
+            )
+        except Exception as exc:  # noqa: BLE001 - assert the carried code
+            assert exc.diagnostic.code == "MBPF101", exc.diagnostic
+            assert exc.diagnostic.stage == "profile.resolve", (
+                exc.diagnostic
+            )
+        else:
+            raise AssertionError(
+                "the preflight must refuse the unadmitted profile"
+            )
 
 
 def test_guest_provenance():

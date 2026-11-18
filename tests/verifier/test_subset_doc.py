@@ -65,9 +65,9 @@ DERIVED_SOURCE = {
 CANON = (
     (
         "loop-sum", "accept", "kernel",
-        "v6.12/7.0.14/7.2/7.4-rc1: test-run actions match the "
-        "oracle; v6.6 verifier rejects the back edge (pinned "
-        "log line)",
+        "all five matrix lanes: test-run actions match the "
+        "oracle (the 1.1.0-era v6.6 back-edge rejection retired "
+        "with the pinned 1.2.0 frontend)",
         "subset_loop_sum",
         (
             (AUDIT_TEST, "test_positive_programs_validate"),
