@@ -1314,8 +1314,12 @@ def load_lock(path):
     try:
         with open(path, encoding="utf-8") as handle:
             lock = json.load(handle)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise SetupFailure("lockfile %s is unreadable: %s" % (path, exc))
+    if not isinstance(lock, dict):
+        raise SetupFailure(
+            "lockfile %s must be a JSON object" % path
+        )
     if lock.get("schema_version") != 1:
         raise SetupFailure("lockfile schema_version must be 1")
     runner = lock.get("runner")
@@ -1331,6 +1335,11 @@ def load_lock(path):
         raise SetupFailure("lockfile must pin at least two lanes")
     seen_ids = set()
     for lane in lanes:
+        if not isinstance(lane, dict):
+            raise SetupFailure(
+                "lockfile lane entry is %s, not an object"
+                % type(lane).__name__
+            )
         for key in (
             "id",
             "release",
@@ -1343,12 +1352,17 @@ def load_lock(path):
                 raise SetupFailure(
                     "lane %r lacks %s" % (lane.get("id"), key)
                 )
+        if not isinstance(lane["id"], str):
+            raise SetupFailure("lockfile lane id must be a string")
         if lane["id"] in seen_ids:
             raise SetupFailure(
                 "duplicate lane id %r" % lane["id"]
             )
         seen_ids.add(lane["id"])
-        if not lane["kernel_debs"]:
+        if (
+            not isinstance(lane["kernel_debs"], list)
+            or not lane["kernel_debs"]
+        ):
             raise SetupFailure(
                 "lane %r pins no kernel debs" % lane["id"]
             )
@@ -1360,6 +1374,10 @@ def load_lock(path):
                     "lane %r carries a deb without file+sha256"
                     % lane["id"]
                 )
+        if not isinstance(lane["vng_argv_prefix"], list):
+            raise SetupFailure(
+                "lane %r argv prefix is not a list" % lane["id"]
+            )
         if lane["vng_argv_prefix"][:3] != ["vng", "--run", lane["release"]]:
             raise SetupFailure(
                 "lane %r argv prefix does not match its release"
@@ -2103,7 +2121,7 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
         )
     try:
         plan_doc = json.loads(plans[0])
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         return ("fail", "malformed run plan: %s" % exc, detail)
     try:
         plan = validation_mod.RunPlan.from_dict(plan_doc)
@@ -2209,7 +2227,7 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
     for index, line in enumerate(result_lines):
         try:
             doc = json.loads(line)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             return (
                 "fail",
                 "malformed case result #%d: %s" % (index, exc),
@@ -2241,7 +2259,7 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
             )
     try:
         suite_doc = json.loads(suite_lines[0])
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         return (
             "fail",
             "malformed terminal suite record: %s" % exc,

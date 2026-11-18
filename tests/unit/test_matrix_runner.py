@@ -692,6 +692,77 @@ def test_load_lock_rejects_accelerator_argv_mismatch():
     assert "accelerator" in message, message
 
 
+def test_load_lock_rejects_non_dict_document():
+    runner = _load_runner()
+    for bad in (["lanes"], "lanes", 7, None):
+        message = _assert_setup_failure(
+            _load_lock_text, runner, bad
+        )
+        assert "must be a JSON object" in message, (bad, message)
+    print("PASS load lock rejects non-dict document")
+
+
+def test_load_lock_rejects_deeply_nested_document():
+    runner = _load_runner()
+    root = tempfile.mkdtemp(prefix="mojobpf-lock-unit-")
+    path = os.path.join(root, "lock.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("[" * 1000000 + "]" * 1000000)
+    try:
+        message = _assert_setup_failure(runner.load_lock, path)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    assert "unreadable" in message, message
+    print("PASS load lock rejects deeply nested document")
+
+
+def test_load_lock_rejects_non_dict_lane():
+    runner = _load_runner()
+    lock = _lock([
+        ["not", "a", "dict"],
+        _lane(lane_id="b", release="v9.2"),
+    ])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "not an object" in message, message
+    print("PASS load lock rejects non-dict lane")
+
+
+def test_load_lock_rejects_non_string_lane_id():
+    runner = _load_runner()
+    lane = _lane(lane_id="a", release="v9.1")
+    lane["id"] = ["a"]
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "id must be a string" in message, message
+    print("PASS load lock rejects non-string lane id")
+
+
+def test_load_lock_rejects_non_list_kernel_debs():
+    runner = _load_runner()
+    for bad in (7, {"file": "a.deb"}):
+        lane = _lane(lane_id="a", release="v9.1")
+        lane["kernel_debs"] = bad
+        lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+        message = _assert_setup_failure(
+            _load_lock_text, runner, lock
+        )
+        assert "pins no kernel debs" in message, (bad, message)
+    print("PASS load lock rejects non-list kernel debs")
+
+
+def test_load_lock_rejects_non_list_argv_prefix():
+    runner = _load_runner()
+    for bad in (7, {"vng": True}):
+        lane = _lane(lane_id="a", release="v9.1")
+        lane["vng_argv_prefix"] = bad
+        lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+        message = _assert_setup_failure(
+            _load_lock_text, runner, lock
+        )
+        assert "argv prefix is not a list" in message, (bad, message)
+    print("PASS load lock rejects non-list argv prefix")
+
+
 def test_load_lock_requires_the_qemu_pin():
     runner = _load_runner()
     lock = _lock(
@@ -3292,6 +3363,52 @@ def test_accept_truncated_json_fails():
     )
     assert outcome == "fail", (outcome, note)
     assert "malformed terminal" in note, note
+
+
+def test_accept_deeply_nested_record_fails_suite():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    deep = "[" * 1000000 + "]" * 1000000
+    manifest = runner.lane_target_manifest(_LANE)
+    kinds = (
+        (
+            "MOJOBPF_RUN_PLAN " + deep,
+            "MOJOBPF_CASE_RESULT "
+            + json.dumps(result_docs[0], sort_keys=True),
+            "MOJOBPF_SUITE_RESULT "
+            + json.dumps(suite_doc, sort_keys=True),
+            "malformed run plan",
+        ),
+        (
+            "MOJOBPF_RUN_PLAN "
+            + json.dumps(plan_doc, sort_keys=True),
+            "MOJOBPF_CASE_RESULT " + deep,
+            "MOJOBPF_SUITE_RESULT "
+            + json.dumps(suite_doc, sort_keys=True),
+            "malformed case result",
+        ),
+        (
+            "MOJOBPF_RUN_PLAN "
+            + json.dumps(plan_doc, sort_keys=True),
+            "MOJOBPF_CASE_RESULT "
+            + json.dumps(result_docs[0], sort_keys=True),
+            "MOJOBPF_SUITE_RESULT " + deep,
+            "malformed terminal",
+        ),
+    )
+    for plan_line, result_line, suite_line, needle in kinds:
+        output = "\n".join(
+            (plan_line, result_line, suite_line)
+        ) + "\n"
+        outcome, note, _detail = runner.accept_suite_output(
+            "fake-suite", ["test_alpha"], output, 0, _FAKE_COMMIT,
+            manifest, "0" * 64,
+        )
+        assert outcome == "fail", (needle, outcome, note)
+        assert needle in note, (needle, note)
+    print("PASS accept deeply nested record fails suite")
 
 
 def test_accept_plan_case_drift_fails():
@@ -5906,6 +6023,60 @@ def test_merge_refuses_unknown_suite_exclusion():
         )
         assert "unknown suite" in message, message
         print("PASS merge refuses unknown suite exclusion")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_ignores_unknown_exclusion_lane():
+    # Exclusion keys for unknown lanes are inert lookup
+    # misses, never excuses: a full board still merges,
+    # and a lane missing a real suite still refuses
+    # despite the bogus entry. (Merge-time lane-key
+    # validation would false-refuse partial merges, so
+    # committed-map typos are caught by the exact
+    # contract pin and run-path startup validation
+    # instead.)
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        runner.LANE_SUITE_EXCLUSIONS = dict(
+            runner.LANE_SUITE_EXCLUSIONS,
+            **{"bogus-lane": (runner.SUITES[0][0],)},
+        )
+        full_first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            ),
+        )
+        full_second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", full_first, full_second,
+             "--out-dir", out]
+        ) == 0
+        part_first = _write_report(
+            workdir, "c.json",
+            _shard_report("lane-a", outcomes=(("s1", "pass"),)),
+        )
+        part_second = _write_report(
+            workdir, "d.json",
+            _shard_report("lane-b", outcomes=(("s1", "pass"),)),
+        )
+        partial = os.path.join(workdir, "partial")
+        message = _merge_rejection_text(
+            runner, ["--merge", part_first, part_second,
+                     "--out-dir", partial,
+                     "--expect-lanes", "lane-a,lane-b"],
+            partial,
+        )
+        assert "only pinned exclusions excuse" in message, message
+        print("PASS merge ignores unknown exclusion lane")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
