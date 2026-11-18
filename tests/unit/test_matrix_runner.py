@@ -1911,6 +1911,213 @@ def test_distribution_unverified_extension_beats_verified_source_refused():
         shutil.rmtree(tree["root"], ignore_errors=True)
 
 
+def test_distribution_second_unverified_extension_refuses():
+    """A verified extension beside a verified source still
+    refuses when a second same-stem extension is unverified:
+    loader precedence (not directory order) picks the winner,
+    so any unverified sibling fails the stem closed. The
+    directory order is pinned verified-first so the old
+    first-match exemption would admit (RED) while the
+    stem-closed rule refuses."""
+    from unittest import mock  # noqa: E402
+
+    runner = _load_runner()
+    tree = _runner_tree()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_dual",
+        "1.0",
+        {
+            "matrix_dual.py": "VALUE = 1\n",
+            "matrix_dual" + suffix: _donor_extension_bytes(),
+        },
+    )
+    foreign = os.path.join(
+        tree["pkgdir"], "matrix_dual.zzz-tag.so"
+    )
+    with open(foreign, "wb") as handle:
+        handle.write(b"unverified-native-bytes")
+    pkgdir = os.path.realpath(tree["pkgdir"])
+    real_listdir = os.listdir
+
+    def _verified_first(path):
+        entries = real_listdir(path)
+        if os.path.realpath(path) == pkgdir:
+            entries = sorted(entries)
+        return entries
+
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        with mock.patch.object(
+            os, "listdir", side_effect=_verified_first
+        ):
+            message = _assert_setup_failure(
+                runner.check_runner, lock
+            )
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_package_init_shadowed_by_unverified_extension_refuses():
+    """A verified package init beside a verified extension init
+    still refuses when a second init extension is unverified:
+    first-match order would admit the verified one while the
+    unverified sibling can win selection, so the stem must
+    close over every init spelling. Directory order is pinned
+    verified-first so the old rule would admit (RED)."""
+    from unittest import mock  # noqa: E402
+
+    runner = _load_runner()
+    tree = _runner_tree()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_plus",
+        "1.0",
+        {
+            "matrix_plus.py": "VALUE = 1\n",
+            "matrix_plus/__init__.py": "VALUE = 2\n",
+            "matrix_plus/__init__"
+            + suffix: _donor_extension_bytes(),
+        },
+    )
+    foreign = os.path.join(
+        tree["pkgdir"], "matrix_plus", "__init__.zzz-tag.so"
+    )
+    with open(foreign, "wb") as handle:
+        handle.write(b"unverified-native-bytes")
+    pkgdir = os.path.realpath(tree["pkgdir"])
+    real_listdir = os.listdir
+
+    def _verified_first(path):
+        entries = real_listdir(path)
+        if os.path.realpath(path) in (
+            pkgdir, os.path.join(pkgdir, "matrix_plus"),
+        ):
+            entries = sorted(entries)
+        return entries
+
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        with mock.patch.object(
+            os, "listdir", side_effect=_verified_first
+        ):
+            message = _assert_setup_failure(
+                runner.check_runner, lock
+            )
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_sourceless_extension_init_pair_refuses():
+    """A RECORD listing only an extension init still refuses
+    when a second init extension sits beside it unverified:
+    the early precedence return must not skip the sibling
+    enumeration, or a sourceless-only package admits blind."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_solo",
+        "1.0",
+        {
+            "matrix_solo/__init__"
+            + suffix: _donor_extension_bytes(),
+        },
+    )
+    foreign = os.path.join(
+        tree["pkgdir"], "matrix_solo", "__init__.zzz-tag.so"
+    )
+    with open(foreign, "wb") as handle:
+        handle.write(b"unverified-native-bytes")
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_distribution_sourceless_extension_init_alone_admits():
+    """A RECORD listing a lone extension init admits when no
+    sibling init spelling exists: nothing competes for
+    selection, so the verified bytes execute."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    lock = _lock_with_dep_dist(
+        tree,
+        "matrix_solo",
+        "1.0",
+        {
+            "matrix_solo/__init__"
+            + suffix: _donor_extension_bytes(),
+        },
+    )
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        _admitted_runner_version(runner, lock, tree)
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_stem_level_importables_enumerates_winners():
+    """The stem set collects every file that could win import
+    selection: module spellings plus package-init spellings
+    for module beaters, init spellings only for package
+    beaters (parent module spellings lose to packages)."""
+    from mojobpf import execution as execution_mod  # noqa: E402
+
+    workdir = tempfile.mkdtemp(prefix="stem-level-")
+    try:
+        pkgdir = os.path.join(workdir, "pkg")
+        os.makedirs(os.path.join(pkgdir, "mod", "sub"))
+        for rel in (
+            "mod.py",
+            "mod.zzz-tag.so",
+            "mod/sub.py",
+            "mod/__init__.py",
+            "mod/__init__.zzz-tag.so",
+            "other.py",
+        ):
+            with open(os.path.join(pkgdir, rel), "w") as handle:
+                handle.write("VALUE = 1\n")
+        assert execution_mod._stem_level_importables(
+            pkgdir, "mod.zzz-tag.so"
+        ) == [
+            "mod.py",
+            "mod.zzz-tag.so",
+            "mod/__init__.py",
+            "mod/__init__.zzz-tag.so",
+        ]
+        assert execution_mod._stem_level_importables(
+            pkgdir, "mod/__init__.py"
+        ) == [
+            "mod/__init__.py",
+            "mod/__init__.zzz-tag.so",
+        ]
+        assert execution_mod._stem_level_importables(
+            pkgdir, "sub.py"
+        ) == []
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_distribution_verified_extension_init_beats_verified_init_admits():
     """A RECORD-verified package extension init beside a
     RECORD-verified __init__.py admits: the winner is verified
@@ -3645,8 +3852,12 @@ def _shard_report(lane_id, commit="abc123", outcomes=(("s1", "pass"),),
             {
                 "lane": lane_id,
                 "suite": name,
+                "commit": commit,
                 "outcome": outcome,
                 "exit_code": 0,
+                "verdict": (
+                    "PASS" if outcome == "pass" else "FAIL"
+                ),
                 "passes": 1,
                 "failures": 0,
                 "envfailures": 0,
@@ -3876,6 +4087,83 @@ def test_merge_farm_plus_digest_mismatch_still_refuses():
             ["--merge", first, second, "--out-dir", out]
         ) == 2
         print("PASS merge farm+digest mismatch refuses")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_cell_from_foreign_lane():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        # Swap one cell between shards: pairs stay unique and
+        # per-lane coverage stays full, so only the
+        # cell-membership check can refuse.
+        first_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        second_report = _shard_report(
+            "lane-b", outcomes=_full_outcomes(runner)
+        )
+        first_report["results"][0]["lane"] = "lane-b"
+        second_report["results"][0]["lane"] = "lane-a"
+        first = _write_report(workdir, "a.json", first_report)
+        second = _write_report(workdir, "b.json", second_report)
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out]
+        ) == 2
+        print("PASS merge refuses foreign-lane cell")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_cell_commit_mismatch():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        first_report["results"][0]["commit"] = "zzz999"
+        first = _write_report(workdir, "a.json", first_report)
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out]
+        ) == 2
+        print("PASS merge refuses cell commit mismatch")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_pass_with_bad_exit_or_verdict():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        for field, bad in (
+            ("exit_code", 1), ("verdict", "FAIL"),
+        ):
+            first_report = _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            )
+            first_report["results"][0][field] = bad
+            first = _write_report(workdir, "a.json", first_report)
+            second = _write_report(
+                workdir, "b.json",
+                _shard_report(
+                    "lane-b", outcomes=_full_outcomes(runner)
+                ),
+            )
+            out = os.path.join(workdir, "merged")
+            assert runner.main(
+                ["--merge", first, second, "--out-dir", out]
+            ) == 2, field
+        print("PASS merge refuses incoherent pass cells")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

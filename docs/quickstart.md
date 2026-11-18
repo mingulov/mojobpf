@@ -9,11 +9,10 @@ reference run with only machine-specific absolute paths
 shortened (the working directory to `<qs>`, user tool
 installations to their bare tool names). Absolute paths on
 your machine will differ; versions, exit codes, and result
-lines must match. The transcribed hashes are from the
-reference run, executed verbatim from a fresh environment
-against the release wheel (see the [1.0.0 release
-notes](release-notes-1.0.0.md)); the tool and SDK versions
-and the profile list below match the current tree.
+lines must match. The reference run below used the pinned
+Mojo 1.2.0 toolchain against a wheel built from the current
+tree (step 1); the transcribed hashes, versions, and profile
+list all come from that run.
 
 ## Prerequisites
 
@@ -36,7 +35,7 @@ pip wheel . --no-deps --no-build-isolation -w dist
 
 ```text
   Building wheel for mojobpf (pyproject.toml): finished with status 'done'
-  Created wheel for mojobpf: filename=mojobpf-1.0.0-py3-none-any.whl size=497232 sha256=c338159473d844e7ba1b5e855f700783aeea62736d78355e9b55c4bbf3327bfc
+  Created wheel for mojobpf: filename=mojobpf-1.0.0-py3-none-any.whl size=512705 sha256=1b0f16ba0e2b34561a95c3bc1a409abb64c1e09d373b255659b9efa3d6ab5f66
 Successfully built mojobpf
 ```
 
@@ -47,7 +46,7 @@ metadata may differ — even the container hash varies between
 same-tree builds. The release contents are pinned
 separately in the checksums record (the alpha record is
 [checksums-0.3.0a1.md](checksums-0.3.0a1.md); the 1.0.0
-record lands with the release artifacts). pip's
+record is [checksums-1.0.0.md](checksums-1.0.0.md)). pip's
 `Building wheel ...: started` progress line and the
 `Stored in directory` cache line are elided.)
 
@@ -353,21 +352,13 @@ model name	: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
 libbpf: elf: skipping unrecognized data section(17) .eh_frame
 libbpf: elf: skipping relo section(18) .rel.eh_frame for section(17) .eh_frame
 == run x3 ==
-Return value: 2, duration (average): 499ns
+Return value: 2, duration (average): 387ns
 == map after x3 ==
-[{
-        "key": 0,
-        "value": 3
-    }
-]
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0x03","0x00","0x00","0x00","0x00","0x00","0x00","0x00"],"formatted":{"key":0,"value":3}}]
 == run x5 ==
-Return value: 2, duration (average): 155ns
+Return value: 2, duration (average): 267ns
 == map after x5 ==
-[{
-        "key": 0,
-        "value": 8
-    }
-]
+[{"key":["0x00","0x00","0x00","0x00"],"value":["0x08","0x00","0x00","0x00","0x00","0x00","0x00","0x00"],"formatted":{"key":0,"value":8}}]
 == unload ==
 ```
 

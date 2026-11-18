@@ -2802,6 +2802,75 @@ def _package_init_extension(package_dir: str) -> str | None:
     return None
 
 
+def _stem_level_importables(
+    dist_root: str, beater_rel: str
+) -> list[str]:
+    """Same-stem importable files beside a shadow beater.
+
+    The import winner is always one of these, so a beater
+    admits only when every one is verified (order- and
+    precedence-agnostic: no FileFinder suffix modeling).
+    A package-init beater (``__init__.*``) collects the init
+    spellings in its own directory (a module spelling in the
+    parent directory loses to the package and is excluded).
+    A module beater (``stem.*``) collects the module
+    spellings plus the package-init spellings in the stem
+    subdirectory (a package beats the module structurally).
+    Matching is posix-exact. Returns root-relative rels with
+    ``/`` separators, sorted.
+    """
+    head, sep, base = beater_rel.rpartition("/")
+    level_dir = (
+        os.path.join(dist_root, head) if sep else dist_root
+    )
+    prefix = head + "/" if sep else ""
+    try:
+        entries = os.listdir(level_dir)
+    except OSError:
+        entries = []
+    present = {
+        entry
+        for entry in entries
+        if os.path.isfile(os.path.join(level_dir, entry))
+    }
+    found: list[str] = []
+    if base.startswith("__init__."):
+        for name in ("__init__.py", "__init__.pyc"):
+            if name in present:
+                found.append(prefix + name)
+        for entry in present:
+            if (
+                entry.startswith("__init__.")
+                and entry.endswith(".so")
+            ):
+                found.append(prefix + entry)
+        return sorted(found)
+    stem = base.split(".", 1)[0]
+    for name in (stem + ".py", stem + ".pyc"):
+        if name in present:
+            found.append(prefix + name)
+    for entry in present:
+        if entry.startswith(stem + ".") and entry.endswith(
+            ".so"
+        ):
+            found.append(prefix + entry)
+    pkg_dir = os.path.join(level_dir, stem)
+    try:
+        inits = os.listdir(pkg_dir)
+    except OSError:
+        inits = []
+    for entry in inits:
+        full = os.path.join(pkg_dir, entry)
+        if not os.path.isfile(full):
+            continue
+        if entry in ("__init__.py", "__init__.pyc") or (
+            entry.startswith("__init__.")
+            and entry.endswith(".so")
+        ):
+            found.append(prefix + stem + "/" + entry)
+    return sorted(found)
+
+
 def _reject_cross_root_shadow(
     entry_path: str,
     dotted: str,
@@ -5156,19 +5225,21 @@ def _reject_dependency_local_shadow(
 
     Every ``RECORD``-verified importable file -- source,
     sourceless bytecode, or extension module -- must be what
-    the interpreter actually selects, unless the winning
-    sibling is itself ``RECORD``-verified: a winning sibling
-    on the distribution root itself (extensions beat source
-    and bytecode within a level, packages beat modules
+    the interpreter actually selects, unless its whole stem
+    level is ``RECORD``-verified: a winning sibling on the
+    distribution root itself (extensions beat source and
+    bytecode within a level, packages beat modules
     structurally) means the verified loser's bytes never
-    execute, which admits exactly when the winner's bytes are
-    verified too (dual shipment, such as ``stem.py`` beside
-    ``stem.<tag>.so``: the executed bytes are verified
-    bytes). A winner outside ``RECORD`` -- a planted sibling
-    the manifest never pinned -- still fails closed, as does
-    a namespace-only parent level falling back to any regular
-    spelling on a later root. Suffix matching is posix-exact
-    (see :func:`_record_import_stems`): ``.PY``/``.PYC``
+    execute, which admits exactly when every same-stem
+    importable file is verified too (dual shipment, such as
+    ``stem.py`` beside ``stem.<tag>.so``: the executed bytes
+    are verified bytes whatever wins). A single unverified
+    same-stem sibling -- a planted file the manifest never
+    pinned, whatever its loader precedence or directory
+    order -- still fails closed, as does a namespace-only
+    parent level falling back to any regular spelling on a
+    later root. Suffix matching is posix-exact (see
+    :func:`_record_import_stems`): ``.PY``/``.PYC``
     spellings never win import selection, so they are
     skipped. Raises :class:`AdmissionError`
     (``module-mismatch``) naming the shadow, before any probe
@@ -5197,11 +5268,18 @@ def _reject_dependency_local_shadow(
         )
 
     def _refuse_same_root(rel: str, beater_rel: str) -> None:
-        if beater_rel in verified:
-            # Dual shipment: the winning sibling is itself a
-            # RECORD-verified file whose bytes were re-hashed
-            # against the lock-pinned manifest, so the
-            # executed bytes are verified bytes.
+        if beater_rel in verified and all(
+            member in verified
+            for member in _stem_level_importables(
+                dist_root, beater_rel
+            )
+        ):
+            # Dual shipment with a closed verified stem: every
+            # file that could win import selection for this
+            # stem is RECORD-verified (bytes re-hashed against
+            # the lock-pinned manifest), so the executed bytes
+            # are verified bytes regardless of loader
+            # precedence or directory order.
             return
         _refuse(
             rel, "same-root %s" % beater_rel,
@@ -5223,7 +5301,30 @@ def _reject_dependency_local_shadow(
         first = base.split(".", 1)[0]
         if kind == "extension" and first == "__init__":
             # A verified package extension init sits atop import
-            # precedence; nothing beats it.
+            # precedence, but a second same-stem extension init
+            # leaves selection to directory order: every sibling
+            # init extension goes through the stem closure, so a
+            # sourceless-extension-only package (no __init__.py
+            # rel of its own) is still bound.
+            try:
+                entries = os.listdir(leaf_dir)
+            except OSError:
+                entries = []
+            for entry in entries:
+                if (
+                    entry != base
+                    and entry.startswith("__init__.")
+                    and entry.endswith(".so")
+                    and os.path.isfile(
+                        os.path.join(leaf_dir, entry)
+                    )
+                ):
+                    _refuse_same_root(
+                        rel,
+                        os.path.join(
+                            os.path.dirname(rel), entry
+                        ),
+                    )
             return
         if kind == "source" and base == "__init__.py":
             sibling = _package_init_extension(leaf_dir)

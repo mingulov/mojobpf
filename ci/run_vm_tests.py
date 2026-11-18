@@ -677,7 +677,8 @@ SUITE_CASES = {
         "test_full_map_refuses_fifth_insert test_guest_provenance  "
         "test_isolation_moves_only_running_cpu  "
         "test_iteration_set_and_bytes test_kernel_delete_removes_entries  "
-        "test_key_value_byte_helpers test_license_gate_agrees  "
+        "test_key_value_byte_helpers  "
+        "test_license_gate_refuses_unadmitted_profile  "
         "test_lifecycle_init_run_observe test_miss_path_inserts_nothing  "
         "test_oob_rejected_by_verifier test_parse_possible_list_forms  "
         "test_percpu_stride_padding  "
@@ -954,7 +955,11 @@ def merge_reports(paths, out_dir, expect_lanes=None):
     ``LANE_SUITE_EXCLUSIONS`` exactly: a manually subsetted
     shard (``--suite``) refuses instead of merging a green
     partial board, and only the pinned map excuses absent
-    cells. The merged board keeps the shared blocks
+    cells. Every result must also name one of its own
+    shard's lanes, carry the shard commit, and (on a pass
+    outcome) agree with its exit code and verdict, so a
+    mixed or hand-edited board refuses instead of merging.
+    The merged board keeps the shared blocks
     verbatim (minus the per-shard ephemeral farm path),
     concatenates lanes and results in input
     order, and records ``merged_from``. A non-pass outcome
@@ -995,8 +1000,44 @@ def merge_reports(paths, out_dir, expect_lanes=None):
     seen_cases = set()
     results = []
     for path, shard in zip(paths, shards):
+        own_lanes = {
+            lane.get("id") for lane in shard["lanes"]
+        }
         for item in shard["results"]:
             case = (item.get("lane"), item.get("suite"))
+            if case[0] not in own_lanes:
+                raise SetupFailure(
+                    "shard %s result %s/%s names a lane outside "
+                    "its own lanes %s; refusing a mixed board"
+                    % (
+                        path, case[0], case[1],
+                        sorted(own_lanes),
+                    )
+                )
+            if item.get("commit") != shard["commit"]:
+                raise SetupFailure(
+                    "shard %s result %s/%s carries commit %r, "
+                    "not the shard commit %r; refusing a mixed "
+                    "board"
+                    % (
+                        path, case[0], case[1],
+                        item.get("commit"), shard["commit"],
+                    )
+                )
+            if item.get("outcome") == "pass" and (
+                item.get("exit_code") != 0
+                or item.get("verdict") != "PASS"
+            ):
+                raise SetupFailure(
+                    "shard %s result %s/%s claims pass with "
+                    "exit %r / verdict %r; refusing an "
+                    "incoherent board"
+                    % (
+                        path, case[0], case[1],
+                        item.get("exit_code"),
+                        item.get("verdict"),
+                    )
+                )
             if case in seen_cases:
                 raise SetupFailure(
                     "lane-suite %s/%s is covered by more than one "

@@ -240,12 +240,14 @@ and any other behavior on any lane fails loudly
 (`tests/verifier/test_subset_kernel.py::test_loop_sum`,
 `docs/supported-subset.md` case table, all five matrix lanes).
 
-Retired per-lane boundaries stay pinned as process, not as
-live constraints: a future lane whose verifier rejects a
-subset shape gets its own evidenced verdict instead of
-inheriting pass. No subset case currently exercises a
-kernel-version boundary; all behave identically on all five
-lanes.
+One live kernel-version boundary remains: the 7.x lanes
+refuse short test-run inputs with EINVAL where the 6.x lanes
+run them as actions (subset kernel: 6.6/6.12 report 20/20
+actions; 7.0.14/7.2/7.4-rc1 report 14 actions + 6 verified
+refusals, one per shape's guard case). Retired per-lane
+boundaries stay pinned as process, not as live constraints:
+a future lane whose verifier rejects a subset shape gets
+its own evidenced verdict instead of inheriting pass.
 
 ## Measured tracing limitations
 

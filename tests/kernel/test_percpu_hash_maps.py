@@ -76,12 +76,12 @@ dump`` cross-checks every slot (the independent oracle). The
 guest reports 2 CPUs and the host asserts the count before any
 per-CPU assertion runs.
 
-The license gate agrees with the kernel: the built per-CPU-hash
-objects pass inspection cleanly under the per-CPU-hash
-capability profile, the helper-license preflight admits the
-used helpers (1, 2, 3) under the project's non-GPL declaration,
-and the same preflight still refuses the GPL-only witness
-there, so the admission is not vacuous.
+The license gate refuses the unadmitted profile: the per-CPU-hash
+profile id is not a capability profile, so inspection and the
+helper-license preflight both refuse it with MBPF101 at
+profile resolution (guard form; the kind stays unclaimed while
+the behavior cases below keep proving the retained
+implementation).
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng`` (virtme-ng)
 with a cached guest image on PATH (default release v6.12;
@@ -1964,7 +1964,7 @@ def test_unchecked_rejected_by_verifier():
     return check_verifier_rejection("unchecked", UNCHECKED_LOG_LINE)
 
 
-def test_license_gate_agrees():
+def test_license_gate_refuses_unadmitted_profile():
     """Refused profile: inspection + preflight agree on MBPF101.
 
     Guard form: the per-CPU-hash profile id is not admitted, so
@@ -2203,7 +2203,7 @@ CASE_INPUTS = {
         "objects": [("stage", "percpuhash_unchecked.bpf.o")],
         "corpus": [],
     },
-    "test_license_gate_agrees": {
+    "test_license_gate_refuses_unadmitted_profile": {
         "sources": [RMW1_SOURCE, RMW2_SOURCE, RMW4_SOURCE,
                     DELETE_SOURCE],
         "objects": [("stage", "percpuhash_rmw1.bpf.o"),
@@ -2312,8 +2312,8 @@ def main():
     if failures or unavailable_seen:
         return _finish(rec, unavailable_seen)
     print("percpuhash maps: lifecycle, count, miss, delete, iteration, "
-          "full, isolation, control, negative, license and provenance "
-          "checks passed")
+          "full, isolation, control, negative, refusal-guard and "
+          "provenance checks passed")
     return _finish(rec, unavailable_seen)
 
 

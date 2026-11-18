@@ -65,9 +65,9 @@ DERIVED_SOURCE = {
 CANON = (
     (
         "loop-sum", "accept", "kernel",
-        "all five matrix lanes: test-run actions match the "
-        "oracle (the 1.1.0-era v6.6 back-edge rejection retired "
-        "with the pinned 1.2.0 frontend)",
+        "6.x 3/3 actions, 7.x 2 actions + 1 verified refusal "
+        "(all oracle-matching; 1.1.0-era v6.6 back-edge "
+        "rejection retired with the pinned 1.2.0 frontend)",
         "subset_loop_sum",
         (
             (AUDIT_TEST, "test_positive_programs_validate"),
@@ -76,7 +76,8 @@ CANON = (
     ),
     (
         "call-inline", "accept", "kernel",
-        "plain helper inlined; test-run actions match",
+        "plain helper inlined; 6.x 3/3 actions, 7.x 2 + 1 "
+        "verified refusal",
         "subset_call_inline",
         (
             (AUDIT_TEST, "test_positive_shapes"),
@@ -85,7 +86,8 @@ CANON = (
     ),
     (
         "stack-array", "accept", "kernel",
-        "initialized array promotes (no alloca); actions match",
+        "initialized array promotes (no alloca); 6.x 3/3, "
+        "7.x 2 + 1 verified refusal",
         "subset_stack_array",
         (
             (AUDIT_TEST, "test_positive_shapes"),
@@ -94,7 +96,8 @@ CANON = (
     ),
     (
         "casts", "accept", "kernel",
-        "narrow/widen round trip; test-run actions match",
+        "narrow/widen round trip; 6.x 3/3, 7.x 2 + 1 "
+        "verified refusal",
         "subset_casts",
         (
             (AUDIT_TEST, "test_positive_programs_validate"),
@@ -103,7 +106,8 @@ CANON = (
     ),
     (
         "checked-arith", "accept", "kernel",
-        "wrap and headroom checks; test-run actions match",
+        "wrap and headroom checks; 6.x 5/5, 7.x 4 + 1 "
+        "verified refusal",
         "subset_checked_arith",
         (
             (AUDIT_TEST, "test_positive_programs_validate"),

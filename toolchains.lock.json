@@ -87,10 +87,10 @@
     }
   },
   "vm": {
-    "accelerator": "tcg",
-    "guest_kernel": "6.12.0-061200-generic, 6.6.0-060600-generic (Ubuntu mainline; both TCG lanes observed 2026-10-30)",
+    "accelerator": "kvm (5 lanes) + tcg (v6.12-tcg spot only)",
+    "guest_kernel": "6.6.0-060600-generic, 6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc1-generic KVM lanes per ci/kernels.lock.json (Ubuntu mainline) + v6.12-tcg spot",
     "host_kernel": "7.2.13-200.fc44.x86_64",
-    "note": "fp43 qualifying host: /dev/kvm exists but lanes run software emulation (TCG) per ci/kernels.lock.json; runner is uv-tool vng",
+    "note": "fp43 qualifying host: /dev/kvm present; lanes run KVM per ci/kernels.lock.json with the named TCG fallback for the no-KVM spot-proof only; runner is uv-tool vng",
     "qemu": "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)",
     "virtme_ng": "virtme-ng 1.41 (uv tool install virtme-ng)"
   }

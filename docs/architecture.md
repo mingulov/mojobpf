@@ -504,15 +504,16 @@ of them is implied by the results above:
   Mojo/LLVM combination, every `llc` backend version but
   22.1.8, every host architecture but x86-64, and big-endian
   BPF still need theirs. The claimed x86-64 lanes (6.12.0,
-  6.6.0, 7.0.14, 7.2, 7.4-rc1, all KVM, plus the named
-  `v6.12-tcg` fallback) are pinned in `ci/kernels.lock.json`
-  and driven by `ci/run_vm_tests.py`, with per-lane loop-shape
-  verdicts pinned (all five lanes pass under the pinned 1.2.0
-  frontend; see the compatibility
-  documentation); each lane is claimed by its full 41-suite
-  matrix pass (197/205 cells; see
-  [evidence-1.0.0.md](evidence-1.0.0.md)). Each proof above
-  names the suite that demonstrates it.
+  6.6.0, 7.0.14, 7.2, 7.4-rc1, all KVM) are pinned in
+  `ci/kernels.lock.json` and driven by `ci/run_vm_tests.py`,
+  with per-lane loop-shape verdicts pinned (all five lanes
+  pass under the pinned 1.2.0 frontend; see the compatibility
+  documentation); each claimed lane is proven by its full
+  41-suite matrix pass (197/205 cells; see
+  [evidence-1.0.0.md](evidence-1.0.0.md)). The named
+  `v6.12-tcg` fallback is a two-suite spot-proof lane
+  (kernel-xdp + kernel-map), not a claimed kernel. Each
+  proof above names the suite that demonstrates it.
 - CO-RE beyond the proven slice, and multi-program objects:
   unproven. BTF covers map metadata only, with no function
   records and no `.BTF.ext`, except on the CO-RE probe object
