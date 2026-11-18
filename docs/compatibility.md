@@ -108,7 +108,9 @@ exclusions following this paragraph; the v1.0 matrix passes
 [evidence-1.0.0.md](evidence-1.0.0.md)). The same board re-ran
 green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
 exclusions, 0 red; board commit e98ea93 via
-`ci/run_vm_tests.py` per-lane runs plus `--merge`). The
+`ci/run_vm_tests.py` per-lane runs plus `--merge`; tally,
+per-lane counts and merged-report sha256 attested in-repo
+via `git log --grep='1.2.0 board attestation'`). The
 tree has since added changes including admission hardening,
 a percpu case rename, merge checks, lock notes, CI workflow
 comments, and docs; kernel claims re-confirm on a fresh
@@ -232,7 +234,9 @@ at the toolchain gate (`MBPF102`) exactly as designed.
 ## Retired boundary: `loop-sum` on 6.6 (Mojo 1.1.0 era)
 
 The bounded-loop subset case `loop-sum` verifies and runs on
-all five matrix lanes (6.6, 6.12, 7.0.14, 7.2, and 7.4-rc1):
+all five matrix lanes (6.6, 6.12, 7.0.14, 7.2, and 7.4-rc1)
+on the 1.2.0 board commit (e98ea93; tip re-confirmation
+pending, see above):
 test-run actions match the oracle on every lane. (Under the
 retired Mojo 1.1.0 frontend the 6.6 verifier rejected the shape
 at load with `back-edge from insn 18 to 19`; the pinned 1.2.0
@@ -657,7 +661,8 @@ host suites, selected-but-refused vectors).
   emulation; the release matrix proves the KVM lanes (197/205
   cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), re-run
   green under Mojo 1.2.0 (197 passed, 8 pinned exclusions,
-  0 red; board commit e98ea93).
+  0 red; board commit e98ea93; tip re-confirmation pending,
+  see above).
 
 ## Audit boundaries
 

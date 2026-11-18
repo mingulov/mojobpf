@@ -4310,11 +4310,27 @@ def test_merge_refuses_malformed_result_values():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_direct_run_records_skip():
+    import pytest
+
+    marker = "direct_skip_probe_for_direct_one"
+
+    def _raiser():
+        pytest.skip("probe")
+
+    globals()[marker] = _raiser
+    try:
+        assert _direct_one(marker) == "skip"
+    finally:
+        del globals()[marker]
+    print("PASS direct run records skip")
+
+
 def test_merge_refuses_malformed_elapsed_secs():
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
-        for bad in ("junk", None):
+        for bad in ("junk", None, True):
             bad_report = _shard_report(
                 "lane-a", outcomes=_full_outcomes(runner)
             )
@@ -4604,22 +4620,47 @@ def _direct_names():
     )
 
 
+def _skip_exceptions():
+    """pytest skip outcome for direct execution (no spawn).
+
+    Returns a tuple suitable for ``except``: the pytest skip
+    outcome when pytest is importable, else an empty tuple
+    that matches nothing (tests needing pytest then fail on
+    their own import, as before).
+    """
+    try:
+        import pytest
+    except ImportError:
+        return ()
+    return (pytest.skip.Exception,)
+
+
+def _direct_one(name):
+    """Run one test for direct execution; return ok/skip/fail."""
+    try:
+        globals()[name]()
+    except _skip_exceptions():
+        print("skip %s" % name)
+        return "skip"
+    except Exception:
+        print("FAIL %s" % name)
+        import traceback
+
+        traceback.print_exc()
+        return "fail"
+    else:
+        print("ok %s" % name)
+        return "ok"
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
         return 2
     failures = 0
     for name in _direct_names():
-        try:
-            globals()[name]()
-        except Exception:
+        if _direct_one(name) == "fail":
             failures += 1
-            print("FAIL %s" % name)
-            import traceback
-
-            traceback.print_exc()
-        else:
-            print("ok %s" % name)
     print("%d tests, %d failures" % (len(_direct_names()), failures))
     return 1 if failures else 0
 

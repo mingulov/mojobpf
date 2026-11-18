@@ -429,7 +429,7 @@ re-proves them on five KVM lanes (197/205 cells; see
 the pinned Mojo 1.2.0 on its board commit (197 passed, 8
 pinned exclusions, 0 red; e98ea93; tip re-confirmation
 pending, see the compatibility five-kernel board), which
-claims kernels 6.6.0, 6.12.0, 7.0.14, 7.2, and 7.4-rc1. Other
+claims kernels 6.6.0, 6.12.0, 7.0.14, 7.2.0, and 7.4.0-rc1. Other
 combinations are unproven, not supported. Full binary paths
 and hashes are recorded in `toolchains.lock.json`; rerun
 `tests/probes/toolchain_inventory.py` to re-probe any machine.
@@ -439,7 +439,7 @@ and hashes are recorded in `toolchains.lock.json`; rerun
 | Mojo compiler | 1.2.0 (`2016d0cd`), pixi-pinned from the Modular channel |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, cpu `v3` |
 | Loader/observer | bpftool 7.6.0 with libbpf 1.6, unmodified |
-| Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; claimed kernels 6.12.0, 6.6.0, 7.0.14, 7.2, 7.4-rc1 plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
+| Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; claimed kernels 6.12.0, 6.6.0, 7.0.14, 7.2.0, 7.4.0-rc1 plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
 | Host drivers | Python 3.11+ (3.14.8 observed), pixi-managed Mojo environment, standard library only |
 | C reference | Clang 22.1.8 builds the independent C controls and fixtures in `tests/reference_c/` (XDP controls, ring-buffer controls, license witness pair, map references) |
 
@@ -505,13 +505,16 @@ of them is implied by the results above:
   Mojo/LLVM combination, every `llc` backend version but
   22.1.8, every host architecture but x86-64, and big-endian
   BPF still need theirs. The claimed x86-64 lanes (6.12.0,
-  6.6.0, 7.0.14, 7.2, 7.4-rc1, all KVM) are pinned in
+  6.6.0, 7.0.14, 7.2.0, 7.4.0-rc1, all KVM) are pinned in
   `ci/kernels.lock.json` and driven by `ci/run_vm_tests.py`,
   with per-lane loop-shape verdicts pinned (all five lanes
   pass under the pinned 1.2.0 frontend; see the compatibility
   documentation); each claimed lane is proven by its full
   41-suite matrix pass (197/205 cells; see
-  [evidence-1.0.0.md](evidence-1.0.0.md)). The named
+  [evidence-1.0.0.md](evidence-1.0.0.md)), re-run green
+  under Mojo 1.2.0 on its board commit (197/8/0, e98ea93;
+  tip re-confirmation pending, see the compatibility
+  five-kernel board). The named
   `v6.12-tcg` fallback is a two-suite spot-proof lane
   (kernel-xdp + kernel-map), not a claimed kernel. Each
   proof above names the suite that demonstrates it.
