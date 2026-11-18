@@ -938,6 +938,23 @@ def _load_shard_report(path):
             "shard report %s carries no lanes or no results; "
             "a vacuous shard never merges" % path
         )
+    if not isinstance(report["lanes"], list) or not all(
+        isinstance(lane, dict)
+        and isinstance(lane.get("id"), str)
+        and lane.get("id")
+        for lane in report["lanes"]
+    ):
+        raise SetupFailure(
+            "shard report %s carries malformed lanes; "
+            "refusing" % path
+        )
+    if not isinstance(report["results"], list) or not all(
+        isinstance(item, dict) for item in report["results"]
+    ):
+        raise SetupFailure(
+            "shard report %s carries malformed results; "
+            "refusing" % path
+        )
     return report
 
 

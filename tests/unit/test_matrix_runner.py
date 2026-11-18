@@ -1913,51 +1913,68 @@ def test_distribution_unverified_extension_beats_verified_source_refused():
 
 def test_distribution_second_unverified_extension_refuses():
     """A verified extension beside a verified source still
-    refuses when a second same-stem extension is unverified:
-    loader precedence (not directory order) picks the winner,
-    so any unverified sibling fails the stem closed. The
-    directory order is pinned verified-first so the old
-    first-match exemption would admit (RED) while the
-    stem-closed rule refuses."""
+    refuses when a second same-stem extension is unverified,
+    under both directory orders: loader precedence (not
+    listdir order) picks the winner, so any unverified
+    sibling fails the stem closed. The foreign sibling uses
+    a real first-precedence suffix, and a positive control
+    proves the file finder would select it: this pins
+    order-independent refusal of a genuinely winnable
+    sibling. (Pre/post discrimination for the stem-closure
+    change lives in the package-init tests: the module
+    extension-rel exhaustive loop already refused this shape
+    pre-fix.)"""
     from unittest import mock  # noqa: E402
 
     runner = _load_runner()
     tree = _runner_tree()
-    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    first_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    verified_name = "matrix_dual.abi3.so"
+    foreign_name = "matrix_dual" + first_suffix
     lock = _lock_with_dep_dist(
         tree,
         "matrix_dual",
         "1.0",
         {
             "matrix_dual.py": "VALUE = 1\n",
-            "matrix_dual" + suffix: _donor_extension_bytes(),
+            verified_name: _donor_extension_bytes(),
         },
     )
-    foreign = os.path.join(
-        tree["pkgdir"], "matrix_dual.zzz-tag.so"
-    )
-    with open(foreign, "wb") as handle:
+    with open(
+        os.path.join(tree["pkgdir"], foreign_name), "wb"
+    ) as handle:
         handle.write(b"unverified-native-bytes")
+    # Positive control: the foreign sibling genuinely wins
+    # import selection (first suffix precedence).
+    origin = _find_spec_origin("matrix_dual", [tree["pkgdir"]])
+    assert origin.endswith(foreign_name), origin
     pkgdir = os.path.realpath(tree["pkgdir"])
     real_listdir = os.listdir
 
-    def _verified_first(path):
+    def _pinned_order(path, first):
         entries = real_listdir(path)
         if os.path.realpath(path) == pkgdir:
-            entries = sorted(entries)
+            rest = sorted(e for e in entries if e != first)
+            entries = [first] + rest
         return entries
 
     saved_path = os.environ.get("PATH", "")
     os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
     try:
-        with mock.patch.object(
-            os, "listdir", side_effect=_verified_first
-        ):
-            message = _assert_setup_failure(
-                runner.check_runner, lock
+        for first in (verified_name, foreign_name):
+            with mock.patch.object(
+                os, "listdir",
+                side_effect=lambda path, _first=first: (
+                    _pinned_order(path, _first)
+                ),
+            ):
+                message = _assert_setup_failure(
+                    runner.check_runner, lock
+                )
+            assert "distribution refused" in message, (
+                first, message,
             )
-        assert "distribution refused" in message, message
-        assert "shadowed" in message, message
+            assert "shadowed" in message, (first, message)
     finally:
         os.environ["PATH"] = saved_path
         shutil.rmtree(tree["root"], ignore_errors=True)
@@ -1968,13 +1985,17 @@ def test_distribution_package_init_shadowed_by_unverified_extension_refuses():
     still refuses when a second init extension is unverified:
     first-match order would admit the verified one while the
     unverified sibling can win selection, so the stem must
-    close over every init spelling. Directory order is pinned
+    close over every init spelling. The foreign sibling uses
+    a real first-precedence suffix with a positive control
+    proving selection; directory order is pinned
     verified-first so the old rule would admit (RED)."""
     from unittest import mock  # noqa: E402
 
     runner = _load_runner()
     tree = _runner_tree()
-    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    first_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    verified_name = "__init__.abi3.so"
+    foreign_name = "__init__" + first_suffix
     lock = _lock_with_dep_dist(
         tree,
         "matrix_plus",
@@ -1982,24 +2003,34 @@ def test_distribution_package_init_shadowed_by_unverified_extension_refuses():
         {
             "matrix_plus.py": "VALUE = 1\n",
             "matrix_plus/__init__.py": "VALUE = 2\n",
-            "matrix_plus/__init__"
-            + suffix: _donor_extension_bytes(),
+            "matrix_plus/" + verified_name: (
+                _donor_extension_bytes()
+            ),
         },
     )
-    foreign = os.path.join(
-        tree["pkgdir"], "matrix_plus", "__init__.zzz-tag.so"
-    )
-    with open(foreign, "wb") as handle:
+    with open(
+        os.path.join(tree["pkgdir"], "matrix_plus", foreign_name),
+        "wb",
+    ) as handle:
         handle.write(b"unverified-native-bytes")
+    # Positive control: the foreign init genuinely wins
+    # import selection (first suffix precedence).
+    origin = _find_spec_origin(
+        "matrix_plus", [tree["pkgdir"]]
+    )
+    assert origin.endswith(foreign_name), origin
     pkgdir = os.path.realpath(tree["pkgdir"])
+    subdir = os.path.join(pkgdir, "matrix_plus")
     real_listdir = os.listdir
 
     def _verified_first(path):
         entries = real_listdir(path)
-        if os.path.realpath(path) in (
-            pkgdir, os.path.join(pkgdir, "matrix_plus"),
-        ):
-            entries = sorted(entries)
+        current = os.path.realpath(path)
+        if current == subdir:
+            rest = sorted(
+                e for e in entries if e != verified_name
+            )
+            entries = [verified_name] + rest
         return entries
 
     saved_path = os.environ.get("PATH", "")
@@ -2022,24 +2053,35 @@ def test_distribution_sourceless_extension_init_pair_refuses():
     """A RECORD listing only an extension init still refuses
     when a second init extension sits beside it unverified:
     the early precedence return must not skip the sibling
-    enumeration, or a sourceless-only package admits blind."""
+    enumeration, or a sourceless-only package admits blind.
+    The foreign sibling uses a real first-precedence suffix
+    with a positive control proving selection."""
     runner = _load_runner()
     tree = _runner_tree()
-    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    first_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    verified_name = "__init__.abi3.so"
+    foreign_name = "__init__" + first_suffix
     lock = _lock_with_dep_dist(
         tree,
         "matrix_solo",
         "1.0",
         {
-            "matrix_solo/__init__"
-            + suffix: _donor_extension_bytes(),
+            "matrix_solo/" + verified_name: (
+                _donor_extension_bytes()
+            ),
         },
     )
-    foreign = os.path.join(
-        tree["pkgdir"], "matrix_solo", "__init__.zzz-tag.so"
-    )
-    with open(foreign, "wb") as handle:
+    with open(
+        os.path.join(tree["pkgdir"], "matrix_solo", foreign_name),
+        "wb",
+    ) as handle:
         handle.write(b"unverified-native-bytes")
+    # Positive control: the foreign init genuinely wins
+    # import selection (first suffix precedence).
+    origin = _find_spec_origin(
+        "matrix_solo", [tree["pkgdir"]]
+    )
+    assert origin.endswith(foreign_name), origin
     saved_path = os.environ.get("PATH", "")
     os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
     try:
@@ -4083,9 +4125,10 @@ def test_merge_farm_plus_digest_mismatch_still_refuses():
         first = _write_report(workdir, "a.json", first_report)
         second = _write_report(workdir, "b.json", second_report)
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out]
+        )
+        assert "disagrees on 'runner'" in message, message
         print("PASS merge farm+digest mismatch refuses")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4109,9 +4152,10 @@ def test_merge_refuses_cell_from_foreign_lane():
         first = _write_report(workdir, "a.json", first_report)
         second = _write_report(workdir, "b.json", second_report)
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out]
+        )
+        assert "outside its own lanes" in message, message
         print("PASS merge refuses foreign-lane cell")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4133,9 +4177,10 @@ def test_merge_refuses_cell_commit_mismatch():
             ),
         )
         out = os.path.join(workdir, "merged")
-        assert runner.main(
-            ["--merge", first, second, "--out-dir", out]
-        ) == 2
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out]
+        )
+        assert "not the shard commit" in message, message
         print("PASS merge refuses cell commit mismatch")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -4160,12 +4205,60 @@ def test_merge_refuses_pass_with_bad_exit_or_verdict():
                 ),
             )
             out = os.path.join(workdir, "merged")
-            assert runner.main(
-                ["--merge", first, second, "--out-dir", out]
-            ) == 2, field
+            message = _merge_rejection_text(
+                runner, ["--merge", first, second, "--out-dir", out]
+            )
+            assert "claims pass with" in message, (
+                field, message,
+            )
         print("PASS merge refuses incoherent pass cells")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_malformed_lane_without_traceback():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        bad_report = _shard_report(
+            "lane-a", outcomes=_full_outcomes(runner)
+        )
+        bad_report["lanes"].append(
+            {
+                "id": None,
+                "release": "vX",
+                "accelerator": "kvm",
+                "kernel_release": "9.9-test",
+                "cache": {},
+            }
+        )
+        bad_report["results"][0]["lane"] = "lane-zzz"
+        first = _write_report(workdir, "a.json", bad_report)
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.main(
+            ["--merge", first, second, "--out-dir", out]
+        ) == 2
+        print("PASS merge refuses malformed lane cleanly")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _merge_rejection_text(runner, args):
+    """Run a merge expecting refusal; return its stderr text."""
+    import io
+    from contextlib import redirect_stderr
+
+    buffer = io.StringIO()
+    with redirect_stderr(buffer):
+        code = runner.main(args)
+    assert code == 2, code
+    return buffer.getvalue()
 
 
 def test_merge_refuses_vacuous_shard():

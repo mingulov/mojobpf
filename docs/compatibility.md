@@ -107,11 +107,13 @@ exclusions following this paragraph; the v1.0 matrix passes
 [evidence-1.0.0.md](evidence-1.0.0.md)). The same board re-ran
 green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
 exclusions, 0 red; board commit e98ea93 via
-`ci/run_vm_tests.py` per-lane runs plus `--merge`;
-e98ea93..HEAD touches only merge aggregation, docs, CI
-workflow comments, and host unit tests — no suite, driver,
-adapter, SDK, or harness change). Two ruled cell groups stay
-out of claim: the joint suite (needs libbpf-mojo inputs,
+`ci/run_vm_tests.py` per-lane runs plus `--merge`). The
+tree has since added admission hardening, a percpu case
+rename, merge checks, lock notes, and docs; kernel claims
+re-confirm on a fresh full-matrix board run on the release
+tip, which will replace this interim citation. Two ruled
+cell groups stay out of claim: the joint suite (needs
+libbpf-mojo inputs,
 labelled experimental) and 7.x task-struct layouts (1.x CO-RE
 work). These rulings are mechanized as `LANE_SUITE_EXCLUSIONS`
 in `ci/run_vm_tests.py` (pinned by

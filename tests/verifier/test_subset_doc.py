@@ -116,7 +116,8 @@ CANON = (
     ),
     (
         "loop-pressure", "accept", "kernel",
-        "frame spills within the 512-byte budget; total exact",
+        "frame spills within the 512-byte budget; total exact; "
+        "6.x 3/3 actions, 7.x 2 + 1 verified refusal",
         "subset_loop_pressure",
         (
             (AUDIT_TEST, "test_loop_pressure_frame_within_budget"),
