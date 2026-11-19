@@ -1368,13 +1368,20 @@ def load_lock(path):
             raise SetupFailure(
                 "lockfile lane id must be a non-empty string"
             )
-        if not isinstance(lane["release"], str):
+        if (
+            not isinstance(lane["release"], str)
+            or not lane["release"]
+        ):
             raise SetupFailure(
-                "lockfile lane release must be a string"
+                "lockfile lane release must be a non-empty string"
             )
-        if not isinstance(lane["kernel_release"], str):
+        if (
+            not isinstance(lane["kernel_release"], str)
+            or not lane["kernel_release"]
+        ):
             raise SetupFailure(
-                "lockfile lane kernel_release must be a string"
+                "lockfile lane kernel_release must be a "
+                "non-empty string"
             )
         if lane["id"] in seen_ids:
             raise SetupFailure(
@@ -2926,7 +2933,7 @@ def _remove_farm(farm_dir):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.merge:
-        if args.lane or args.suite or args.timeout:
+        if args.lane or args.suite or args.timeout is not None:
             sys.stderr.write(
                 "run_vm_tests: --merge takes no --lane/--suite/--timeout\n"
             )
@@ -2959,6 +2966,10 @@ def main(argv=None):
                 except OSError:
                     pass
             return _refuse(exc)
+    if args.timeout is not None and args.timeout <= 0:
+        return _refuse(
+            "--timeout needs a positive number of seconds"
+        )
     if args.expect_lanes:
         sys.stderr.write(
             "run_vm_tests: --expect-lanes needs --merge\n"

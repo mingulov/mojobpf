@@ -769,7 +769,7 @@ def test_load_lock_rejects_non_string_release():
     lane["release"] = 7
     lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
     message = _assert_setup_failure(_load_lock_text, runner, lock)
-    assert "release must be a string" in message, message
+    assert "release must be a non-empty string" in message, message
     print("PASS load lock rejects non-string release")
 
 
@@ -779,7 +779,9 @@ def test_load_lock_rejects_non_string_kernel_release():
     lane["kernel_release"] = 7
     lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
     message = _assert_setup_failure(_load_lock_text, runner, lock)
-    assert "kernel_release must be a string" in message, message
+    assert "kernel_release must be a non-empty string" in message, (
+        message,
+    )
     print("PASS load lock rejects non-string kernel release")
 
 
@@ -792,6 +794,29 @@ def test_load_lock_rejects_empty_lane_id():
     message = _assert_setup_failure(_load_lock_text, runner, lock)
     assert "non-empty" in message, message
     print("PASS load lock rejects empty lane id")
+
+
+def test_load_lock_rejects_empty_release():
+    runner = _load_runner()
+    lane = _lane(lane_id="a", release="v9.1")
+    lane["release"] = ""
+    lane["vng_argv_prefix"] = ["vng", "--run", "", "--disable-kvm"]
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "release must be a non-empty string" in message, message
+    print("PASS load lock rejects empty release")
+
+
+def test_load_lock_rejects_empty_kernel_release():
+    runner = _load_runner()
+    lane = _lane(lane_id="a", release="v9.1")
+    lane["kernel_release"] = ""
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "kernel_release must be a non-empty string" in message, (
+        message,
+    )
+    print("PASS load lock rejects empty kernel release")
 
 
 def test_load_lock_requires_the_qemu_pin():
@@ -6525,6 +6550,72 @@ def test_main_refuses_merge_with_run_flags():
                 extra, message,
             )
         print("PASS main refuses merge with run flags")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_non_positive_timeout():
+    # --timeout needs a positive number of seconds: 0
+    # must not silently fall back, negatives must not
+    # become instant timeouts. Each refuses exit-2.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-timeout-")
+    try:
+        for flag in ("0", "-5"):
+            out = os.path.join(workdir, "merged-%s" % flag)
+            if flag.startswith("-"):
+                args = ["--timeout=%s" % flag, "--out-dir", out]
+            else:
+                args = ["--timeout", flag, "--out-dir", out]
+            message = _merge_rejection_text(
+                runner, args, out,
+            )
+            assert "positive number of seconds" in message, (
+                flag, message,
+            )
+        print("PASS main refuses non-positive timeout")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_merge_with_zero_timeout():
+    # --merge takes no --timeout, including 0: the guard
+    # tests presence, not truthiness.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a")
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--merge", first, "--out-dir", out,
+             "--timeout", "0"],
+            out,
+        )
+        assert "--merge takes no" in message, message
+        print("PASS main refuses merge with zero timeout")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_positive_timeout_passes_validation():
+    # A positive --timeout passes validation and reaches
+    # later checks (here: the --expect-lanes pairing
+    # refusal).
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-timeout-")
+    try:
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--expect-lanes", "lane-a", "--out-dir", out,
+             "--timeout", "5"],
+            out,
+        )
+        assert "--expect-lanes needs --merge" in message, message
+        print("PASS main positive timeout passes validation")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
