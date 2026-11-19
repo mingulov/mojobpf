@@ -733,7 +733,7 @@ def test_load_lock_rejects_non_string_lane_id():
     lane["id"] = ["a"]
     lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
     message = _assert_setup_failure(_load_lock_text, runner, lock)
-    assert "id must be a string" in message, message
+    assert "id must be a non-empty string" in message, message
     print("PASS load lock rejects non-string lane id")
 
 
@@ -781,6 +781,17 @@ def test_load_lock_rejects_non_string_kernel_release():
     message = _assert_setup_failure(_load_lock_text, runner, lock)
     assert "kernel_release must be a string" in message, message
     print("PASS load lock rejects non-string kernel release")
+
+
+def test_load_lock_rejects_empty_lane_id():
+    runner = _load_runner()
+    lock = _lock([
+        _lane(lane_id="", release="v9.1"),
+        _lane(lane_id="b", release="v9.2"),
+    ])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "non-empty" in message, message
+    print("PASS load lock rejects empty lane id")
 
 
 def test_load_lock_requires_the_qemu_pin():
@@ -6279,6 +6290,78 @@ def test_merge_ignores_unknown_exclusion_lane():
         )
         assert "only pinned exclusions excuse" in message, message
         print("PASS merge ignores unknown exclusion lane")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_non_dict_runner():
+    # Runner blocks must be mappings: identical junk
+    # blocks across shards refuse instead of merging a
+    # board with a junk runner.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        for junk in ("evil", None, [1]):
+            first_report = _shard_report("lane-a")
+            first_report["runner"] = junk
+            first = _write_report(
+                workdir, "a.json", first_report
+            )
+            second_report = _shard_report("lane-b")
+            second_report["runner"] = junk
+            second = _write_report(
+                workdir, "b.json", second_report
+            )
+            out = os.path.join(workdir, "merged")
+            message = _merge_rejection_text(
+                runner,
+                ["--merge", first, second, "--out-dir", out],
+                out,
+            )
+            assert "malformed runner" in message, (
+                junk, message,
+            )
+        print("PASS merge refuses non-dict runner")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_accepts_path_entries():
+    # Library callers may pass pathlib.Path entries:
+    # merged_from records them as strings.
+    import json
+    import pathlib
+
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            ),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        assert runner.merge_reports(
+            [pathlib.Path(first), pathlib.Path(second)], out
+        ) == 0
+        with open(
+            os.path.join(out, "matrix-report.json"),
+            encoding="utf-8",
+        ) as handle:
+            merged = json.load(handle)
+        assert merged["merged_from"] == [first, second], merged
+        assert all(
+            isinstance(entry, str)
+            for entry in merged["merged_from"]
+        ), merged
+        print("PASS merge accepts path entries")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

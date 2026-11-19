@@ -5089,6 +5089,17 @@ def test_qualify_rejects_malformed_and_dup_keys():
         assert "duplicate" in exc.diagnostic.explanation
 
 
+def test_qualify_rejects_deeply_nested_sidecar():
+    qualify = evidence_module.qualify_artifacts
+    deep = b"[" * 1000000 + b"]" * 1000000
+    exc = _expect_verify_error(
+        lambda: qualify(
+            {"demo": deep}, {"demo.bpf.o": b"object-bytes"}
+        )
+    )
+    assert "not valid JSON" in exc.diagnostic.explanation
+
+
 def test_qualify_rejects_bad_envelopes():
     qualify = evidence_module.qualify_artifacts
     with _scratch() as parent:

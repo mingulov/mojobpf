@@ -1059,7 +1059,7 @@ def _run_parsed_lowering(lower, spec, input_ir, output_dir):
     try:
         with open(report_path, encoding="utf-8") as handle:
             report = json.load(handle)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         return (
             None,
             [],

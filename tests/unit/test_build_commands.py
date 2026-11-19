@@ -7785,6 +7785,35 @@ def test_read_source_excerpt_open_failure_returns_none():
             os.open = real_os_open
 
 
+def test_parsed_lowering_deep_report_refuses():
+    service = load_module("adapter_service_deep_report", SERVICE)
+    parent = tempfile.mkdtemp(prefix="lower-deep-")
+    try:
+        fake = os.path.join(parent, "fake-lower")
+        write_executable(
+            fake,
+            "#!{python}\n"
+            "import sys\n"
+            "out = sys.argv[sys.argv.index('--report') + 1]\n"
+            "open(out, 'w').write"
+            "('[' * 1000000 + ']' * 1000000)\n",
+        )
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        adapted, _warnings, refusal = service._run_parsed_lowering(
+            fake,
+            {"entry": "fake-entry"},
+            os.path.join(parent, "in.ll"),
+            out_dir,
+        )
+        assert adapted is None, adapted
+        assert isinstance(refusal, service.RouteRefused), refusal
+        assert "emitted no report" in refusal.explanation, refusal
+        print("PASS parsed lowering deep report refuses")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

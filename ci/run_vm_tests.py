@@ -971,6 +971,11 @@ def _load_shard_report(path):
             raise SetupFailure(
                 "shard report %s lacks %r" % (path, key)
             )
+    if not isinstance(report["runner"], dict):
+        raise SetupFailure(
+            "shard report %s carries malformed runner; "
+            "refusing" % path
+        )
     if not report["lanes"] or not report["results"]:
         raise SetupFailure(
             "shard report %s carries no lanes or no results; "
@@ -1213,7 +1218,7 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         "runner": _runner_merge_identity(first["runner"]),
         "lanes": lanes,
         "results": results,
-        "merged_from": list(paths),
+        "merged_from": [str(entry) for entry in paths],
         "elapsed_secs": round(total_elapsed, 1),
     }
     report_path = os.path.join(out_dir, "matrix-report.json")
@@ -1356,8 +1361,13 @@ def load_lock(path):
                 raise SetupFailure(
                     "lane %r lacks %s" % (lane.get("id"), key)
                 )
-        if not isinstance(lane["id"], str):
-            raise SetupFailure("lockfile lane id must be a string")
+        if (
+            not isinstance(lane["id"], str)
+            or not lane["id"]
+        ):
+            raise SetupFailure(
+                "lockfile lane id must be a non-empty string"
+            )
         if not isinstance(lane["release"], str):
             raise SetupFailure(
                 "lockfile lane release must be a string"

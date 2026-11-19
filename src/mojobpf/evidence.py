@@ -2680,7 +2680,7 @@ def _parse_sidecar(artifact: str, raw: bytes) -> dict:
             artifact,
             "re-read the published sidecar bytes",
         )
-    except ValueError:
+    except (ValueError, RecursionError):
         raise _verify_fail(
             "sidecar for %r is not valid JSON" % (artifact,),
             artifact,
