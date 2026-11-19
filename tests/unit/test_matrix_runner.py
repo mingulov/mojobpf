@@ -667,6 +667,29 @@ def test_load_lock_rejects_empty_kernel_debs():
     assert "no kernel debs" in message, message
 
 
+def test_load_lock_rejects_non_string_deb_fields():
+    runner = _load_runner()
+    for field, bad in (
+        ("file", 7),
+        ("sha256", 7),
+        ("file", ["a.deb"]),
+        ("sha256", {"h": 1}),
+    ):
+        lane = _lane(lane_id="a", release="v9.1")
+        lane["kernel_debs"] = [
+            {"file": "a.deb", "sha256": "b" * 64}
+        ]
+        lane["kernel_debs"][0][field] = bad
+        lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+        message = _assert_setup_failure(
+            _load_lock_text, runner, lock
+        )
+        assert "file+sha256 must be strings" in message, (
+            field, bad, message,
+        )
+    print("PASS load lock rejects non-string deb fields")
+
+
 def test_load_lock_rejects_deb_without_file_or_hash():
     runner = _load_runner()
     lane = _lane(lane_id="a", release="v9.1")
@@ -6519,6 +6542,36 @@ def test_merge_reports_refuses_empty_shard_list():
             raise AssertionError("empty shard list merged")
         assert not os.path.exists(out), out
         print("PASS merge reports refuses empty shard list")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_merge_with_lock_or_consumer_path():
+    # --merge reads neither --lock nor --consumer-path:
+    # passing either refuses instead of silently
+    # ignoring it.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json", _shard_report("lane-a")
+        )
+        for extra in (
+            ["--lock", os.path.join(workdir, "lock.json")],
+            ["--consumer-path", os.path.join(workdir, "c")],
+        ):
+            out = os.path.join(
+                workdir, "merged-%s" % extra[0].lstrip("-")
+            )
+            message = _merge_rejection_text(
+                runner,
+                ["--merge", first, "--out-dir", out] + extra,
+                out,
+            )
+            assert "--merge takes no" in message, (
+                extra, message,
+            )
+        print("PASS main refuses merge with lock/consumer-path")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

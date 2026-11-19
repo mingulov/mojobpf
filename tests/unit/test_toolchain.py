@@ -1247,6 +1247,40 @@ def test_version_probe_reverifies_before_spawn():
     assert not os.path.exists(marker), "drifted probe executed"
 
 
+def test_non_string_version_pin_refuses_mismatch():
+    # A non-string pinned version fails closed (mismatch
+    # refusal with a %r-formatted message), never a
+    # crash: the compare is != and formatting is safe.
+    with tempfile.TemporaryDirectory(
+        prefix="toolchain-version-type-"
+    ) as parent:
+        bindir = os.path.join(parent, "bin")
+        os.makedirs(bindir)
+        link = os.path.join(bindir, "mojo")
+        _write_executable(
+            link, "#!/bin/sh\necho '%s'\n" % FIXTURE_TOOLS["mojo"]
+        )
+        try:
+            execution_module.admit_execution(
+                execution_module.ExecutionRequest(
+                    name="mojo",
+                    argv0=link,
+                    allow_path_lookup=False,
+                    version_argv=("--version",),
+                    probe_version=True,
+                ),
+                execution_module.ExecutionPins(
+                    version=7,
+                    entry_sha256=sha256_of(link),
+                ),
+            )
+        except AdmissionError as exc:
+            assert exc.reason == "version-mismatch", exc
+            assert "7" in str(exc), exc
+        else:
+            raise AssertionError("non-string version pin admitted")
+
+
 def test_conditional_wrapper_rejected_without_execution():
     # A launcher whose image selection runs through a conditional
     # is rejected as an unknown launcher, never resolved by

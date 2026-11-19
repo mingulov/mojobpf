@@ -1403,6 +1403,13 @@ def load_lock(path):
                     "lane %r carries a deb without file+sha256"
                     % lane["id"]
                 )
+            if not isinstance(deb["file"], str) or not isinstance(
+                deb["sha256"], str
+            ):
+                raise SetupFailure(
+                    "lane %r deb file+sha256 must be strings"
+                    % lane["id"]
+                )
         if not isinstance(lane["vng_argv_prefix"], list):
             raise SetupFailure(
                 "lane %r argv prefix is not a list" % lane["id"]
@@ -2933,9 +2940,16 @@ def _remove_farm(farm_dir):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.merge:
-        if args.lane or args.suite or args.timeout is not None:
+        if (
+            args.lane
+            or args.suite
+            or args.timeout is not None
+            or args.lock != DEFAULT_LOCK
+            or args.consumer_path
+        ):
             sys.stderr.write(
-                "run_vm_tests: --merge takes no --lane/--suite/--timeout\n"
+                "run_vm_tests: --merge takes no --lane/--suite/"
+                "--timeout/--lock/--consumer-path\n"
             )
             return EXIT_SETUP
         out_dir = args.out_dir
