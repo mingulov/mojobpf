@@ -2879,7 +2879,11 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Run the kernel proof suites in every pinned VM lane."
     )
-    parser.add_argument("--lock", default=DEFAULT_LOCK)
+    parser.add_argument(
+        "--lock",
+        default=None,
+        help="kernels lockfile (default: ci/kernels.lock.json)",
+    )
     parser.add_argument(
         "--lane",
         action="append",
@@ -2944,7 +2948,7 @@ def main(argv=None):
             args.lane
             or args.suite
             or args.timeout is not None
-            or args.lock != DEFAULT_LOCK
+            or args.lock is not None
             or args.consumer_path
         ):
             sys.stderr.write(
@@ -2980,6 +2984,8 @@ def main(argv=None):
                 except OSError:
                     pass
             return _refuse(exc)
+    if args.lock is None:
+        args.lock = DEFAULT_LOCK
     if args.timeout is not None and args.timeout <= 0:
         return _refuse(
             "--timeout needs a positive number of seconds"

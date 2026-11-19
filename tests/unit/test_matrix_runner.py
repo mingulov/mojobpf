@@ -943,6 +943,37 @@ def test_check_qemu_matches_and_mismatches():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_check_qemu_non_string_version_refuses():
+    # A truthy non-string pinned qemu version fails
+    # closed (refusal, no traceback) through the matrix
+    # qemu check.
+    runner = _load_runner()
+    root = tempfile.mkdtemp(prefix="mojobpf-qemu-unit-")
+    saved_path = os.environ.get("PATH", "")
+    try:
+        stub = _write_stub_qemu(root, "stub-qemu", "QEMU stub 1.0")
+        os.environ["PATH"] = root + os.pathsep + saved_path
+        lanes = [
+            _lane(lane_id="a", release="v9.1"),
+            _lane(lane_id="b", release="v9.2"),
+        ]
+        message = _assert_setup_failure(
+            runner.check_qemu,
+            _lock(
+                lanes, qemu=7,
+                runner_extra={
+                    "qemu_binary": "stub-qemu",
+                    "qemu_sha256": _sha256_of(stub),
+                },
+            ),
+        )
+        assert "version" in message, message
+        print("PASS check qemu non-string version refuses")
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_check_qemu_rejects_unrelated_same_version_binary():
     # F-041 scratch reproducer, preserved: an unrelated binary
     # printing the locked version string is refused by hash
@@ -1166,6 +1197,29 @@ def test_check_runner_admits_pinned_chain():
             )
         finally:
             shutil.rmtree(record["farm"], ignore_errors=True)
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_check_runner_non_string_version_refuses():
+    # A truthy non-string pinned runner version fails
+    # closed (refusal, no traceback) through the matrix
+    # runner check.
+    runner = _load_runner()
+    tree = _runner_tree()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        lock = _pinned_runner_lock(tree)
+        lock["runner"]["version"] = 7
+        message = _assert_setup_failure(
+            lambda: runner.check_runner(
+                lock, farm_parent=tree["root"]
+            )
+        )
+        assert "version" in message, message
+        print("PASS check runner non-string version refuses")
     finally:
         os.environ["PATH"] = saved_path
         shutil.rmtree(tree["root"], ignore_errors=True)
@@ -6572,6 +6626,37 @@ def test_main_refuses_merge_with_lock_or_consumer_path():
                 extra, message,
             )
         print("PASS main refuses merge with lock/consumer-path")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_merge_with_default_lock():
+    # Presence, not value: even --lock naming the
+    # default path refuses under --merge.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "lane-a", outcomes=_full_outcomes(runner)
+            ),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--merge", first, second, "--out-dir", out,
+             "--lock", runner.DEFAULT_LOCK],
+            out,
+        )
+        assert "--merge takes no" in message, message
+        print("PASS main refuses merge with default lock")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
