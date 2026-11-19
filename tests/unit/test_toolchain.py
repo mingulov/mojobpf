@@ -1284,7 +1284,8 @@ def test_non_string_version_pin_refuses_mismatch():
 def test_non_string_entry_sha256_refuses_mismatch():
     # A non-string pinned entry hash fails closed
     # (mismatch refusal), never a crash: the compare
-    # is != and the message %r-formats.
+    # is != and the message formats the entry path
+    # plus the observed hash (never the pin).
     with tempfile.TemporaryDirectory(
         prefix="toolchain-entry-type-"
     ) as parent:
@@ -1310,7 +1311,8 @@ def test_non_string_entry_sha256_refuses_mismatch():
             )
         except AdmissionError as exc:
             assert exc.reason == "hash-mismatch", exc
-            assert "7" in str(exc), exc
+            assert "entry hash" in str(exc), exc
+            assert link in str(exc), exc
         else:
             raise AssertionError("non-string entry hash admitted")
 
