@@ -5865,15 +5865,25 @@ def _declaration_roles(unit, *, work_limit=None):
             return ends[first + 1] + 1
         return None
 
+    def standard_attribute(first):
+        """Recognize one whole bracketed standard attribute group."""
+        charge()
+        if (tokens[first] == '[' and first in ends and
+                first + 1 < len(tokens) and tokens[first + 1] == '['):
+            return ends[first] + 1
+        return None
+
     def role_declarator(first):
         """One mapped finite projection on the leading declarator path.
 
         GNU aliases have a structural role only after a pointer prefix.
         Bare attributes require a leading pointer or grouping path; their
         entire argument group is omitted without inspecting its contents.
-        Stop at the direct name, before any parameter or array suffix;
-        never delete an arbitrary name to make a grouping path parse.
-        The semantic parser and its accepted qualifier set stay unchanged.
+        Standard bracketed attributes skip the same way, since neither
+        spelling declares. Stop at the direct name, before any parameter
+        or array suffix; never delete an arbitrary name to make a
+        grouping path parse. The semantic parser and its accepted
+        qualifier set stay unchanged.
         """
         charge()
         if first in role_parses:
@@ -5894,12 +5904,20 @@ def _declaration_roles(unit, *, work_limit=None):
                         charge(after - cursor)
                         prefix_attributes.append((cursor, after))
                         cursor = after
+                    elif (after := standard_attribute(cursor)) is not None:
+                        charge(after - cursor)
+                        prefix_attributes.append((cursor, after))
+                        cursor = after
                     else:
                         break
             elif tokens[cursor] == '(' and cursor in ends:
                 leading = True
                 cursor += 1
             elif leading and (after := bare_attribute(cursor)) is not None:
+                charge(after - cursor)
+                prefix_attributes.append((cursor, after))
+                cursor = after
+            elif leading and (after := standard_attribute(cursor)) is not None:
                 charge(after - cursor)
                 prefix_attributes.append((cursor, after))
                 cursor = after

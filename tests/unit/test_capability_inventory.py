@@ -12618,6 +12618,27 @@ def test_reference_consumers():
         [("if", ("opaque", "__bitop_1"), "0", missing)], "prog"), "invalid-reference")
 
 
+def test_declaration_ownership_declarator_standard_attributes():
+    # Ported from the thirteenth-round inventory repair
+    # (b39283a): [[...]] attributes before the name behave
+    # like GNU attributes in the declarator parser: parsing
+    # binds the owner instead of failing. Oracle (-13, -13):
+    # the static pointer reads null.
+    body = _membership_condition_body("in_set && TRUE")
+    headers = [
+        "static bool * [[gnu::unused]] (TRUE);",
+        "static bool * [[gnu::unused]] TRUE;",
+        "static bool * [[gnu::unused]] ((TRUE));",
+        "static bool * [[gnu::unused]] _Atomic (TRUE);",
+        "static bool * __attribute((unused)) (TRUE);",
+    ]
+    for header in headers:
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings and "TRUE" in unknown, (header, bindings, unknown)
+        _compiled_membership_pair(header, body, (-13, -13))
+        _f01_expect(header, body, True)
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
