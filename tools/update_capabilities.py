@@ -5471,7 +5471,7 @@ _DECL_QUALIFIERS = frozenset({"const", "volatile", "restrict", "_Atomic"})
 _DECL_BUILTINS = frozenset({"void", "_Bool", "char", "short", "int", "long",
                             "signed", "unsigned"})
 _DECL_PAREN_SPECIFIERS = frozenset({
-    "_Atomic", "typeof", "__typeof", "__typeof__", "typeof_unqual",
+    "_Atomic", "typeof", "__typeof", "__typeof__", "__typeof_unqual",
     "__typeof_unqual__", "_Alignas", "_BitInt",
 })
 
@@ -5499,6 +5499,22 @@ def _declaration_specifiers(tokens, ends, start=0):
         elif word in _DECL_QUALIFIERS:
             words.append(word)
             pos += 1
+        elif word == "__extension__" and not (
+                pos + 1 < len(tokens) and tokens[pos + 1] == "("):
+            # Reserved marker without a group is transparent to the
+            # scan: it is never a type, name, or anchor. A following
+            # group keeps the function-name path (grouped recovery).
+            pos += 1
+        elif (word == "typeof" and pos + 1 < len(tokens)
+                and re.fullmatch(r"[A-Za-z_]\w*", tokens[pos + 1])):
+            # Bare GNU typeof applied to an identifier forms a type
+            # atom (never a declarator); a following group declares.
+            # Parenthesized typeof keeps the specifier-group path
+            # (claimed by the earlier branch).
+            words.append(word)
+            words.append(tokens[pos + 1])
+            pos += 2
+            has_type = True
         elif word in _DECL_BUILTINS:
             words.append(word)
             has_type = True
@@ -5856,6 +5872,7 @@ def _declaration_roles(unit, *, work_limit=None):
     role_parses = {}
     role_heads, structural_head_uses = {}, set()
     align_ends = {}
+    speculative_storage_heads = set()
 
     def bare_attribute(first):
         """Recognize one whole double-parenthesized structural attribute."""
@@ -5971,6 +5988,8 @@ def _declaration_roles(unit, *, work_limit=None):
             return role_heads[first]
         cursor, has_type, ordinary_type = first, False, False
         specifiers, finite_types, bare_attributes = [], [], []
+        speculative_word = None
+        leading_storage = False
         while cursor < len(tokens):
             charge()
             word = tokens[cursor]
@@ -5986,6 +6005,16 @@ def _declaration_roles(unit, *, work_limit=None):
                 bare_attributes.append((cursor, after))
                 cursor = after
             elif word in _DECL_STORAGE:
+                if speculative_word is not None and not leading_storage:
+                    # Trailing storage after a provisional-FIRST head
+                    # word: the head is speculative, so a following
+                    # bare group also reads as a grouped scalar (the
+                    # use site surfaces it). Storage-led heads and
+                    # builtin/GNU-typed heads (whose words take
+                    # earlier branches) never mark.
+                    speculative_storage_heads.add(first)
+                if speculative_word is None:
+                    leading_storage = True
                 cursor += 1
             elif word in _DECL_PAREN_SPECIFIERS and cursor + 1 in ends and tokens[cursor + 1] == '(':
                 after = ends[cursor + 1] + 1
@@ -5997,6 +6026,17 @@ def _declaration_roles(unit, *, work_limit=None):
                 ordinary_type |= word != '_Alignas'
             elif word in _DECL_QUALIFIERS:
                 cursor += 1
+            elif word == "__extension__" and not (
+                    cursor + 1 in ends and tokens[cursor + 1] == "("):
+                # Reserved marker without a group is transparent to
+                # the scan (mirrors _declaration_specifiers above).
+                cursor += 1
+            elif (word == "typeof" and cursor + 1 < len(tokens)
+                    and re.fullmatch(r"[A-Za-z_]\w*", tokens[cursor + 1])):
+                # Bare GNU typeof applied to an identifier forms a
+                # type atom (mirrors _declaration_specifiers above).
+                cursor += 2
+                has_type = ordinary_type = True
             elif word in _DECL_BUILTINS:
                 cursor += 1
                 has_type = ordinary_type = True
@@ -6013,6 +6053,7 @@ def _declaration_roles(unit, *, work_limit=None):
             elif not has_type and re.fullmatch(r'[A-Za-z_]\w*', word):
                 cursor += 1
                 has_type = ordinary_type = True
+                speculative_word = word
             else:
                 break
         boundary = cursor
@@ -6104,11 +6145,11 @@ def _declaration_roles(unit, *, work_limit=None):
         # head: replay a bounded head after the run so the true
         # declarator is analyzed while the markers stay collected.
         # The replayed owner keeps a prefix entry, so admission still
-        # refuses it; only the single-marker path is untouched.
-        if (head_start + 1 < len(tokens) and
-                tokens[head_start] == '__extension__' and
-                tokens[head_start + 1] == '__extension__'):
-            run_end = head_start + 2
+        # refuses it. Single-underscore spellings keep their ordinary
+        # roles; only the exact double-underscore marker replays.
+        if (head_start < len(tokens) and
+                tokens[head_start] == '__extension__'):
+            run_end = head_start + 1
             while run_end < len(tokens) and tokens[run_end] == '__extension__':
                 run_end += 1
             charge(run_end - head_start)
@@ -6207,6 +6248,33 @@ def _declaration_roles(unit, *, work_limit=None):
                  after, aliases, prefix_attributes, _) = grouped
             else:
                 parsed, decl_tokens, decl_indices, decl_ends, decl_first, after, aliases, prefix_attributes, _ = role_declarator(pos)
+            # Competing grouped-scalar reading under speculative
+            # heads: a bare-identifier group also reads as a grouped
+            # declarator naming its content (additive surfacing; the
+            # normal parse above is unchanged).
+            if (head_start in speculative_storage_heads
+                    and re.fullmatch(r"[A-Za-z_]\w*", tokens[pos])
+                    and pos + 1 < len(tokens) and tokens[pos + 1] == '('
+                    and pos + 1 in ends):
+                inner = tokens[pos + 2:ends[pos + 1]]
+                if (len(inner) == 1
+                        and re.fullmatch(r"[A-Za-z_]\w*", inner[0])):
+                    heads.add(inner[0])
+            # Competing grouped-scalar reading: a bare-identifier group
+            # after a provisionally-headed declarator keeps the scalar
+            # reading alongside parameters (fail-closed surfacing).
+            # Builtin heads, complex groups, and unprefixed owners
+            # keep their single reading.
+            if (pos == opened[0]
+                    and any(role == 'extension-prefix' for _, role in prefixes)
+                    and possible_head is not None
+                    and re.fullmatch(r"[A-Za-z_]\w*", tokens[pos])
+                    and pos + 1 < len(tokens) and tokens[pos + 1] == '('
+                    and pos + 1 in ends):
+                inner = tokens[pos + 2:ends[pos + 1]]
+                if (len(inner) == 1
+                        and re.fullmatch(r"[A-Za-z_]\w*", inner[0])):
+                    heads.add(inner[0])
             if aliases:
                 complete = False
                 charge(len(aliases))

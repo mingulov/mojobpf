@@ -12733,6 +12733,293 @@ def test_declaration_ownership_trailer_group_prototype_head_spellings():
         _f01_expect(header, u32_body, True)
 
 
+def test_declaration_ownership_trailer_group_prefix_suffix():
+    # R8: attribute prefixes annotate (never declare), declarators with
+    # array/function suffixes still bind, and C23-only typeof_unqual
+    # spellings stay ordinary identifiers in the pinned gnu11 dialect.
+    body = _membership_condition_body("in_set && TRUE")
+    # Leading attribute runs are skipped before the shape tests; their
+    # arguments are never collected. Oracle (-13, -13): null pointer.
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T(__attribute((unused)) *TRUE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "TRUE" in unknown, (bindings, unknown)
+    assert "unused" not in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+    # A typedef named typeof_unqual declares: the preceding-word skip
+    # only fires on genuine gnu11 argument words. Oracle (-13, -13):
+    # zero-initialized scalar reads false.
+    header = ("typedef bool typeof_unqual;\n__extension__ __extension__ "
+              "static typeof_unqual(TRUE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "TRUE" in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+    # The reserved __typeof_unqual__ spelling stays a keyword in gnu11:
+    # its argument group is skipped, never collected. Oracle (-13, 0).
+    header = ("static bool TRUE = true;\n__extension__ __extension__ static "
+              "__typeof_unqual__(TRUE) unrelated;")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "TRUE" not in unknown, (bindings, unknown)
+    assert any(binding[0] == "TRUE" for binding in bindings)
+    _compiled_membership_pair(header, body, (-13, 0))
+    _f01_expect(header, body, False)
+    # Declarator groups with array/function suffixes still bind their
+    # names; the suffix contents never do. Oracles (-13, -13): null
+    # pointers read false.
+    for decl in ("T((*TRUE)[1]);", "T((*TRUE)(void));"):
+        header = ("typedef bool T;\n__extension__ __extension__ static %s"
+                  % decl)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings and "TRUE" in unknown, (header, bindings, unknown)
+        _compiled_membership_pair(header, body, (-13, -13))
+        _f01_expect(header, body, True)
+    # A grouped array declarator binds its name; the bound is not an
+    # owner. Oracle (-13, -13): the array address is non-null, so the
+    # negated consult reads false in both runs.
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T(FALSE[1]);")
+    negated = _membership_condition_body("in_set && !FALSE")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "FALSE" in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, negated, (-13, -13))
+    _f01_expect(header, negated, True)
+
+
+def test_declaration_ownership_trailer_group_multi_suffix():
+    # R9: a grouped direct-name declarator keeps its name across a
+    # complete suffix sequence (every bound/parameter interior stays
+    # excluded), and the reserved __typeof_unqual spelling (no trailing
+    # underscores) skips its argument group like __typeof_unqual__.
+    negated = _membership_condition_body("in_set && !FALSE")
+    # Multi-dimensional grouped arrays bind. Oracle (-13, -13): the
+    # array address is non-null, so the negated consult reads false.
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T(FALSE[1][1]);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "FALSE" in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, negated, (-13, -13))
+    _f01_expect(header, negated, True)
+    # Grouped function declarators bind. Oracle (-13, -13): the
+    # function designator is non-null, so the negated consult reads
+    # false in both runs.
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T(FALSE(void));\nstatic T FALSE(void) { return false; }")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "FALSE" in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, negated, (-13, -13))
+    _f01_expect(header, negated, True)
+    # Attribute prefix + typedef head + multi-suffix composition binds.
+    # Oracle (-13, -13): non-null array address, negated consult false.
+    header = ("typedef bool typeof_unqual;\n"
+              "__extension__ __extension__ static typeof_unqual("
+              "__attribute((unused)) FALSE[1][1]);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "FALSE" in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, negated, (-13, -13))
+    _f01_expect(header, negated, True)
+    # The reserved __typeof_unqual spelling stays a keyword in gnu11:
+    # its argument group is skipped, never collected. Oracle (-13, 0).
+    body = _membership_condition_body("in_set && TRUE")
+    header = ("static bool TRUE = true;\n__extension__ __extension__ static "
+              "__typeof_unqual(TRUE) unrelated;")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "TRUE" not in unknown, (bindings, unknown)
+    assert any(binding[0] == "TRUE" for binding in bindings)
+    _compiled_membership_pair(header, body, (-13, 0))
+    _f01_expect(header, body, False)
+    # Comma remainder after a nested group keeps the non-collecting
+    # behavior (invalid C in both compilers: tool-behavior pin only,
+    # no oracle possible). This reaches the negative suffix-remainder
+    # arm.
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T((TRUE), x);")
+    _f01_expect(header, body, False)
+
+
+def test_declaration_ownership_trailer_group_specifier_closers():
+    # Twelfth round: a group following the closing parenthesis of a
+    # specifier argument (typeof, _Atomic and _Alignas spellings)
+    # declares its name; only a closer of a declarator group marks a
+    # parameter list. Oracle (-13, -13): the static object reads false.
+    body = _membership_condition_body("in_set && TRUE")
+    headers = [
+        "__extension__ __extension__ static typeof(bool) (TRUE);",
+        "__extension__ __extension__ static _Atomic(bool) (TRUE);",
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "typeof((T)0) (TRUE);"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__typeof_unqual((T)0) (TRUE);"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "T _Alignas(8) (TRUE);"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "typeof((T)0) __attribute((unused)) (TRUE);"),
+    ]
+    for header in headers:
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings and "TRUE" in unknown, (header, bindings, unknown)
+        _compiled_membership_pair(header, body, (-13, -13))
+        _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_trailer_group_outer_anchor_guards():
+    # Twelfth round: _Atomic after a pointer or a type is a qualifier,
+    # never a specifier, so the following group still declares; and
+    # declarator groups keep collecting across the prototype repair.
+    # Oracle (-13, -13): the static object reads false.
+    body = _membership_condition_body("in_set && TRUE")
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T * _Atomic (TRUE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "TRUE" in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+    # The plain qualifier spelling keeps refusing through its own
+    # path. Oracle (-13, -13).
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T * const (TRUE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "TRUE" in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+    # An empty suffix group after the head type still declares: the
+    # interior alone cannot tell (f()) from a parameter spelling, so
+    # only the outer context decides. Oracle (-13, -13): the function
+    # designator reads true.
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T (f());")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "f" in unknown, (bindings, unknown)
+    function_body = _membership_condition_body("in_set && !f")
+    _compiled_membership_pair(header, function_body, (-13, -13))
+    _f01_expect(header, function_body, True)
+    # A builtin head with an attribute between the type and its
+    # grouped declarator still declares. Oracle (-13, -13).
+    header = ("__extension__ __extension__ static int "
+              "__attribute((unused)) (x);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "x" in unknown, (bindings, unknown)
+    name_body = _membership_condition_body("in_set && x")
+    _compiled_membership_pair(header, name_body, (-13, -13))
+    _f01_expect(header, name_body, True)
+    # A struct head with a grouped object declarator still declares;
+    # the tag introducer carries no type context of its own.
+    # Oracle (-13, -13): the static member reads false.
+    header = ("struct S {int i;};\n__extension__ __extension__ static "
+              "struct S (x);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "x" in unknown, (bindings, unknown)
+    member_body = _membership_condition_body("in_set && x.i")
+    _compiled_membership_pair(header, member_body, (-13, -13))
+    _f01_expect(header, member_body, True)
+    # An extension word between storage and the head type keeps the
+    # fail-closed collection (invalid C in both compilers:
+    # tool-behavior pin only, no oracle possible).
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "__extension__ T (TRUE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "TRUE" in unknown, (bindings, unknown)
+    _f01_expect(header, body, True)
+    # A bare typeof word without its argument parens keeps the
+    # fail-closed collection (invalid C in both compilers:
+    # tool-behavior pin only, no oracle possible).
+    header = ("int y;\n__extension__ __extension__ static "
+              "typeof y (x);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "x" in unknown, (bindings, unknown)
+    _f01_expect(header, name_body, True)
+    # An attribute run after a complete declarator keeps the
+    # fail-closed verdict and exercises the attribute floor arm of
+    # the role anchor (invalid C in both compilers: tool-behavior
+    # pin only, no oracle possible). The name never collects, so the
+    # refusal carries the unrecognized-condition reason instead of
+    # the grammar reason the shared helper asserts.
+    header = "static int a __attribute((unused)) (x);"
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings and "a" in unknown, (bindings, unknown)
+    try:
+        _simulate_header(
+            "structural_filter", header, name_body, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}}, ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unrecognized condition" in str(exc), str(exc)
+    else:
+        raise AssertionError("attribute after declarator must stay refused")
+
+
+# Ported from the thirteenth-round inventory repair line (b39283a):
+# behavior, macro-provenance + oracle asserts kept verbatim; roles/model-shape asserts
+# (status vocabulary, alternative counts, certainty, candidate spans) dropped:
+# they pin the repair-line object model, which main's rewritten analyzer replaced.
+# Observable contract (bindings, unknown) verified identical on every ported header.
+def test_declaration_ownership_alternatives():
+    body = _membership_condition_body("in_set && TRUE")
+    # A1: the tentative grouped scalar shares every finite structural
+    # category with the provisional function head. Both readings stay.
+    header = ('typedef bool alias_837; __extension__ static alias_837(TRUE) '
+              'asm("renamed_scalar");')
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (bindings, unknown)
+    assert {"alias_837", "TRUE"} <= unknown, unknown
+    unit = next(unit for unit in uc._file_declaration_units(header)
+                if any(token == "TRUE" for token in unit.expanded_tokens))
+    assert unit.analysis_text[slice(*unit.raw_span)] == unit.raw_text
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+    # A2: trailer presence, modifier order and initializer existence do not
+    # decide retention; attribute arguments never become candidates.
+    for variant in (
+            "typedef bool alias_837; __extension__ static alias_837(TRUE);",
+            'typedef bool alias_837; static __const__ alias_837(TRUE) asm("r");',
+            'typedef bool alias_837; __const__ static alias_837(TRUE) asm("r");',
+            'typedef bool alias_837; static const alias_837(TRUE) asm("r");',
+            'typedef bool alias_837; __attribute((unused)) static alias_837(TRUE) asm("r");',
+    ):
+        bindings, unknown = uc._file_declaration_analysis(variant)
+        assert not bindings and {"alias_837", "TRUE"} <= unknown, variant
+        assert "unused" not in unknown and "r" not in unknown, variant
+        _f01_expect(variant, body, True)
+    # A3: the inner name of a type-first prototype is a possible grouped
+    # scalar under the competing restart; the function is not definite.
+    header = ('typedef bool return_837; typedef bool param_837; return_837 static __const__ '
+              'function_837(param_837) asm("renamed_function");')
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (bindings, unknown)
+    assert {"function_837", "param_837"} <= unknown, unknown
+    unit = next(unit for unit in uc._file_declaration_units(header)
+                if any(token == "function_837" for token in unit.expanded_tokens))
+    # A6: consistent renaming, non-Boolean consumed names, aliases and
+    # complete macro carriers keep the same classification and provenance.
+    renamed = (
+        ("alias_837", "TRUE", "in_set && TRUE", (-13, -13)),
+        ("beta_222", "FALSE", "in_set && FALSE", (-13, -13)),
+        ("gamma_333", "named_value_592", "in_set && named_value_592", (-13, -13)),
+    )
+    for type_word, scalar_word, condition, expected in renamed:
+        header = ('typedef bool %s; __extension__ static %s(%s) asm("renamed_scalar");'
+                  % (type_word, type_word, scalar_word))
+        scalar_body = _membership_condition_body(condition)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings and {type_word, scalar_word} <= unknown, header
+        _compiled_membership_pair(header, scalar_body, expected)
+        _f01_expect(header, scalar_body, True)
+    alias_header = ('typedef bool alias_837;\n#define ALIAS alias_837\n'
+                    '__extension__ static ALIAS(TRUE) asm("renamed_scalar");')
+    bindings, unknown = uc._file_declaration_analysis(alias_header)
+    assert not bindings and {"alias_837", "TRUE"} <= unknown, unknown
+    unit = next(unit for unit in uc._file_declaration_units(alias_header)
+                if any(token == "TRUE" for token in unit.expanded_tokens))
+    assert any(origin[0] == "macro" for origin in unit.origins)
+    carrier = ('typedef bool alias_837;\n#define DECL(n) __extension__ static alias_837(TRUE) asm("r");\n'
+               "DECL(0)")
+    bindings, unknown = uc._file_declaration_analysis(carrier)
+    assert not bindings and {"alias_837", "TRUE"} <= unknown, unknown
+    unit = next(unit for unit in uc._file_declaration_units(carrier)
+                if any(token == "TRUE" for token in unit.expanded_tokens))
+    assert any(origin[0] == "macro" for origin in unit.origins)
+    _f01_expect(carrier, body, True)
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
