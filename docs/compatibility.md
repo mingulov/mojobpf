@@ -99,7 +99,7 @@ registers 41 suites: the 28 release-matrix suites plus the 12
 `tests/unit/test_portability_locks.py::test_x86_matrix_shape_unchanged`).
 
 Five kernels are claimed for the 1.2.0 board tree
-(commit e98ea93): 6.6.0-060600-generic,
+(commit 335efbd, the qualified candidate): 6.6.0-060600-generic,
 6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic,
 and 7.4.0-070400rc1-generic. A kernel is claimed only when the
 full 41-suite matrix passes on its lane apart from the ruled
@@ -107,15 +107,14 @@ exclusions following this paragraph; the v1.0 matrix passes
 197/205 cells with 0 red and 0 unexplained (see
 [evidence-1.0.0.md](evidence-1.0.0.md)). The same board re-ran
 green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
-exclusions, 0 red; board commit e98ea93 via
+exclusions, 0 red; board commit 335efbd via
 `ci/run_vm_tests.py` per-lane runs plus `--merge`; tally,
 per-lane counts and merged-report sha256 attested in-repo
-via `git log --grep='1.2.0 board attestation'`). The
-tree has since added changes including admission hardening,
-a percpu case rename, merge checks, lock notes, CI workflow
-comments, and docs; kernel claims re-confirm on a fresh
-full-matrix board run on the release tip, which will replace
-this interim citation. Two ruled cell groups stay out of
+via `git log --grep='final board attestation'`). The
+attesting commit is docs-only past the board commit, and
+the doc-consistency suites re-run green on it, so the
+board stands without a fresh full-matrix rerun. Two ruled
+cell groups stay out of
 claim: the joint suite (needs libbpf-mojo inputs,
 labelled experimental) and 7.x task-struct layouts (1.x CO-RE
 work). These rulings are mechanized as `LANE_SUITE_EXCLUSIONS`
@@ -134,8 +133,8 @@ anchor board. Those observations stand as the alpha record;
 the v1.0 release matrix re-proved them (see
 [evidence-1.0.0.md](evidence-1.0.0.md)), and the Mojo 1.2.0
 board re-run repeated that proof on its board commit (197
-passed, 8 pinned exclusions, 0 red; e98ea93; tip
-re-confirmation pending, see above).
+passed, 8 pinned exclusions, 0 red; board commit 335efbd,
+the qualified candidate — see above).
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
@@ -235,8 +234,8 @@ at the toolchain gate (`MBPF102`) exactly as designed.
 
 The bounded-loop subset case `loop-sum` verifies and runs on
 all five matrix lanes (6.6.0, 6.12.0, 7.0.14, 7.2.0, and 7.4.0-rc1)
-on the 1.2.0 board commit (e98ea93; tip re-confirmation
-pending, see above):
+on the 1.2.0 board commit (335efbd, the qualified candidate;
+see above):
 test-run actions match the oracle on every lane. (Under the
 retired Mojo 1.1.0 frontend the 6.6 verifier rejected the shape
 at load with `back-edge from insn 18 to 19`; the pinned 1.2.0
@@ -661,7 +660,7 @@ host suites, selected-but-refused vectors).
   emulation; the release matrix proves the KVM lanes (197/205
   cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), re-run
   green under Mojo 1.2.0 (197 passed, 8 pinned exclusions,
-  0 red; board commit e98ea93; tip re-confirmation pending,
+  0 red; board commit 335efbd, the qualified candidate;
   see above).
 
 ## Audit boundaries
