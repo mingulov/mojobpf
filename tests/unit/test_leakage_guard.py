@@ -5,7 +5,9 @@ The shipped set is derived, never guessed: the union of the sdist
 member pin (``tests/packaging/sdist-members.json``) and the wheel
 payload pin (``PINNED_PAYLOAD``/``PINNED_SCHEMA_DATA`` in
 ``tests/packaging/test_wheel_contents.py``, mapped back to tree
-paths), intersected with ``git ls-files`` tracked files.
+paths), intersected with tracked files read from the git index
+directly (no subprocess: the lane guard refuses delegating
+launchers, and this module spawns nothing).
 Untracked pinned drops are allowlisted by
 ``PINNED_GENERATED_DROPPED``; anything else fails. Every
 text-decodable member is grepped for internal work-package IDs
@@ -18,10 +20,11 @@ Standard library only. Runnable directly
 """
 
 import ast
+import hashlib
 import json
 import os
 import re
-import subprocess
+import struct
 import sys
 import tempfile
 
@@ -357,15 +360,7 @@ def shipped_tracked_files():
         )
     if not isinstance(members, list) or not members:
         raise AssertionError("sdist member pin is empty: %s" % SDIST_PIN)
-    try:
-        raw = subprocess.check_output(
-            ["git", "ls-files"], cwd=REPO_ROOT, timeout=120
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise AssertionError(
-            "cannot derive tracked files (git ls-files failed): %s" % exc
-        )
-    tracked = set(raw.decode("utf-8").split())
+    tracked = _tracked_files_from_index(REPO_ROOT)
     pinned = set(members) | _wheel_tree_paths()
     dropped = pinned - tracked
     if dropped != set(PINNED_GENERATED_DROPPED):
@@ -403,6 +398,284 @@ def scan_shipped():
                     hits.append((name, number, label, line.strip()))
                     break
     return hits, scanned, skipped
+
+
+def _encode_git_index(entries, version=2, extensions=()):
+    # Minimal valid v2 index bytes for reader tests: fixed stat
+    # fields, exact path records, real trailing checksum.
+    parts = [b"DIRC", struct.pack(">II", version, len(entries))]
+    for path in entries:
+        parts.append(
+            struct.pack(
+                ">IIIIIIIIII20sH", 0, 0, 0, 0, 0, 0, 0o100644,
+                0, 0, 0, b"\x00" * 20, len(path) & 0xFFF,
+            )
+        )
+        parts.append(path + b"\x00")
+        pad = (8 - ((62 + len(path) + 1) % 8)) % 8
+        parts.append(b"\x00" * pad)
+    for sig, payload in extensions:
+        parts.append(sig + struct.pack(">I", len(payload)) + payload)
+    body = b"".join(parts)
+    return body + hashlib.sha1(body).digest()  # git index uses SHA-1
+
+
+def _expect_index_failure(raw, fragment):
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-index-"
+    ) as parent:
+        path = os.path.join(parent, "index")
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        try:
+            _read_git_index_file(path)
+        except AssertionError as exc:
+            assert fragment in str(exc), exc
+        else:
+            raise AssertionError(
+                "corrupt index accepted: %s" % fragment
+            )
+
+
+def test_git_index_reader_returns_live_tracked_set():
+    tracked = _tracked_files_from_index(REPO_ROOT)
+    assert isinstance(tracked, set), type(tracked)
+    assert tracked, "tracked set is empty"
+    for name in ("README.md", "pyproject.toml", "tests/unit/test_leakage_guard.py"):
+        assert name in tracked, name
+    missing = [
+        name for name in tracked
+        if not os.path.isfile(os.path.join(REPO_ROOT, name))
+    ]
+    assert not missing, missing[:5]
+
+
+def test_git_index_reader_parses_minimal_index():
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-index-"
+    ) as parent:
+        path = os.path.join(parent, "index")
+        with open(path, "wb") as handle:
+            handle.write(
+                _encode_git_index([b"a.py", b"sub/b.md"])
+            )
+        assert _read_git_index_file(path) == {
+            "a.py", "sub/b.md",
+        }
+
+
+def test_git_index_reader_rejects_bad_magic():
+    raw = _encode_git_index([b"a.py"])
+    _expect_index_failure(b"XXXX" + raw[4:], "bad magic")
+
+
+def test_git_index_reader_rejects_truncation():
+    raw = _encode_git_index([b"a.py", b"b.py"])
+    _expect_index_failure(raw[:20], "truncated index")
+    inflated = (
+        raw[:8] + struct.pack(">I", 9) + raw[12:-20]
+    )
+    inflated += hashlib.sha1(inflated).digest()
+    _expect_index_failure(inflated, "truncated entry")
+
+
+def test_git_index_reader_rejects_bad_version():
+    raw = _encode_git_index([b"a.py"], version=3)
+    _expect_index_failure(raw, "version 3")
+
+
+def test_git_index_reader_rejects_bad_checksum():
+    raw = bytearray(_encode_git_index([b"a.py"]))
+    raw[-1] ^= 0xFF
+    _expect_index_failure(bytes(raw), "checksum")
+
+
+def test_git_index_reader_rejects_split_link():
+    raw = _encode_git_index(
+        [], extensions=[(b"link", b"\x00" * 20)]
+    )
+    _expect_index_failure(raw, "split")
+
+
+def test_git_index_reader_rejects_missing_file():
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-index-"
+    ) as parent:
+        try:
+            _read_git_index_file(os.path.join(parent, "absent"))
+        except AssertionError as exc:
+            assert "cannot derive tracked files" in str(exc), exc
+        else:
+            raise AssertionError("missing index accepted")
+
+
+def test_git_index_reader_rejects_non_utf8_path():
+    raw = _encode_git_index([b"\xff\xfe.py"])
+    _expect_index_failure(raw, "utf-8")
+
+
+def test_git_index_reader_resolves_pointer_file():
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-gitdir-"
+    ) as parent:
+        target = os.path.join(parent, "real-git")
+        os.makedirs(target)
+        with open(os.path.join(target, "index"), "wb") as handle:
+            handle.write(_encode_git_index([b"a.py"]))
+        pointer = os.path.join(parent, "linked")
+        with open(pointer, "w", encoding="utf-8") as handle:
+            handle.write("gitdir: %s\n" % target)
+        assert _resolve_git_dir(pointer) == target
+        nested = os.path.join(parent, "sub", "linked")
+        os.makedirs(os.path.dirname(nested))
+        with open(nested, "w", encoding="utf-8") as handle:
+            handle.write("gitdir: ../real-git\n")
+        assert _resolve_git_dir(nested) == target
+
+
+def _resolve_git_dir(git_path):
+    # .git is a directory in plain checkouts and a pointer file
+    # (`gitdir: <path>`) in linked worktrees. Either form resolves
+    # to the directory holding the index; anything else fails.
+    # The layout comes from git itself, never repo content.
+    if os.path.isdir(git_path):
+        return os.path.normpath(git_path)
+    try:
+        with open(git_path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise AssertionError(
+            "cannot derive tracked files (unreadable git metadata: %s)"
+            % exc
+        )
+    if not text.startswith("gitdir: "):
+        raise AssertionError(
+            "cannot derive tracked files (not a git directory: %s)"
+            % git_path
+        )
+    target = text[len("gitdir: "):].splitlines()[0].strip()
+    if not target:
+        raise AssertionError(
+            "cannot derive tracked files (empty git pointer: %s)"
+            % git_path
+        )
+    if not os.path.isabs(target):
+        target = os.path.join(
+            os.path.dirname(os.path.abspath(git_path)), target
+        )
+    target = os.path.normpath(target)
+    if not os.path.isdir(target):
+        raise AssertionError(
+            "cannot derive tracked files (dangling git pointer: %s)"
+            % git_path
+        )
+    return target
+
+
+def _read_git_index_file(index_path):
+    # Tracked paths from a v2 git index, without spawning git
+    # (the lane guard refuses delegating launchers). Only the
+    # plain v2 layout is accepted: any other version, a bad
+    # checksum, truncated records, or a split-index link fails
+    # closed, exactly like an unreadable file.
+    try:
+        with open(index_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise AssertionError(
+            "cannot derive tracked files (unreadable index: %s)" % exc
+        )
+    if len(raw) < 12 or raw[:4] != b"DIRC":
+        raise AssertionError(
+            "cannot derive tracked files (bad magic in %s)"
+            % index_path
+        )
+    version, count = struct.unpack(">II", raw[4:12])
+    if version != 2:
+        raise AssertionError(
+            "cannot derive tracked files (unsupported index "
+            "version %d in %s)" % (version, index_path)
+        )
+    if len(raw) < 32:
+        raise AssertionError(
+            "cannot derive tracked files (truncated index %s)"
+            % index_path
+        )
+    body, want = raw[:-20], raw[-20:]
+    if hashlib.sha1(body).digest() != want:  # SHA-1 per index format
+        raise AssertionError(
+            "cannot derive tracked files (checksum mismatch in %s)"
+            % index_path
+        )
+    pos = 12
+    paths = set()
+    for _ in range(count):
+        start = pos
+        if start + 62 > len(body):
+            raise AssertionError(
+                "cannot derive tracked files (truncated entry in %s)"
+                % index_path
+            )
+        flags = struct.unpack(">H", body[start + 60:start + 62])[0]
+        pos = start + 62
+        try:
+            end = body.index(b"\x00", pos)
+        except ValueError:
+            raise AssertionError(
+                "cannot derive tracked files (unterminated path in %s)"
+                % index_path
+            )
+        path = body[pos:end]
+        if flags & 0xFFF != 0xFFF and flags & 0xFFF != len(path):
+            raise AssertionError(
+                "cannot derive tracked files (path length mismatch in %s)"
+                % index_path
+            )
+        try:
+            paths.add(path.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise AssertionError(
+                "cannot derive tracked files (non utf-8 path in %s: %s)"
+                % (index_path, exc)
+            )
+        total = 62 + len(path) + 1
+        pos = start + total + (8 - total % 8) % 8
+        if pos > len(body):
+            raise AssertionError(
+                "cannot derive tracked files (truncated entry in %s)"
+                % index_path
+            )
+    while pos < len(body):
+        if pos + 8 > len(body):
+            raise AssertionError(
+                "cannot derive tracked files (truncated extension in %s)"
+                % index_path
+            )
+        sig = body[pos:pos + 4]
+        (size,) = struct.unpack(">I", body[pos + 4:pos + 8])
+        if sig == b"link":
+            raise AssertionError(
+                "cannot derive tracked files (split-index link in %s)"
+                % index_path
+            )
+        pos += 8 + size
+        if pos > len(body):
+            raise AssertionError(
+                "cannot derive tracked files (truncated extension in %s)"
+                % index_path
+            )
+    if pos != len(body):
+        raise AssertionError(
+            "cannot derive tracked files (trailing bytes in %s)"
+            % index_path
+        )
+    return paths
+
+
+def _tracked_files_from_index(repo_root):
+    return _read_git_index_file(
+        os.path.join(_resolve_git_dir(os.path.join(repo_root, ".git")), "index")
+    )
 
 
 def test_shipped_set_covers_scrubbed_files():
@@ -784,16 +1057,14 @@ def test_tracked_sources_carry_spdx_headers():
     # header. Sweep all tracked .py/.mojo/.md (shipped and tests
     # alike); the marker must sit in the first five lines, so a
     # fixture string deep in a test body cannot satisfy the file.
-    try:
-        raw = subprocess.check_output(
-            ["git", "ls-files", "*.py", "*.mojo", "*.md"],
-            cwd=REPO_ROOT, timeout=120,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise AssertionError(
-            "cannot derive tracked files (git ls-files failed): %s" % exc
-        )
-    names = sorted(raw.decode("utf-8").split())
+    # Same set `git ls-files *.py *.mojo *.md` would list
+    # (slash-free patterns match basenames at any depth):
+    # tracked paths with those suffixes, without spawning git.
+    names = sorted(
+        name
+        for name in _tracked_files_from_index(REPO_ROOT)
+        if name.endswith((".py", ".mojo", ".md"))
+    )
     assert names, "tracked source set is empty"
     misses = []
     for name in names:

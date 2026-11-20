@@ -6,7 +6,9 @@ unit seams). Every behavior here was implemented in Tasks 2-12; any
 failure reopens the owning task.
 """
 
+import hashlib
 import os
+import sys
 import tempfile
 import threading
 
@@ -21,6 +23,7 @@ from test_build_commands import (
 )
 
 from mojobpf import cli as cli_module
+from mojobpf import execution as execution_module
 
 OBJECT_LIMIT = 16 * 1024 * 1024
 
@@ -63,25 +66,68 @@ def test_pack_fifo_object_refused_fast():
     assert "regular file" in err, err
 
 
-def test_pack_chatty_tool_bounded_with_verdict():
+def test_pack_chatty_tool_bounded_with_verdict(monkeypatch):
     # A version probe emitting 10 MiB of noise still reports its
     # verdict: the capture stays bounded and the version parses
-    # from the head.
+    # from the head. The fixture is a childless Python script
+    # (shell pipelines would need unadmitted nested tools under
+    # the lane guard); the noise volume is unchanged.
+    # The capture observer below witnesses through the public CLI
+    # run (pass-through, no behavior change): the CLI verdict
+    # alone would also pass if capture regressed to unbounded
+    # buffering, so the bound itself is pinned here.
     parent = tempfile.mkdtemp(prefix="pack-chatty-")
     bindir = write_tool_bindir(parent)
-    with open(os.path.join(bindir, "llc"), "w", encoding="utf-8") as handle:
-        handle.write(
-            "#!/bin/sh\n"
-            "echo 'LLC-CHATTY 0.0'\n"
-            "/usr/bin/yes 'noise-line' | /usr/bin/head -c 10485760\n"
-        )
-    os.chmod(os.path.join(bindir, "llc"), 0o755)
-    lockfile = write_lockfile(parent, bindir)
+    llc_path = os.path.join(bindir, "llc")
+    llc_text = (
+        "#!{python}\n"
+        "import sys\n"
+        "sys.stdout.write('LLC-CHATTY 0.0\\n')\n"
+        "sys.stdout.write(('n' * 65535 + '\\n') * 160)\n"
+    ).format(python=sys.executable)
+    with open(llc_path, "w", encoding="utf-8") as handle:
+        handle.write(llc_text)
+    os.chmod(llc_path, 0o755)
+    total_bytes = len('LLC-CHATTY 0.0\n') + 160 * 65536
+    llc_digest = hashlib.sha256(llc_text.encode("utf-8")).hexdigest()
+    lockfile = write_lockfile(
+        parent, bindir, pins={"llc": ("LLC-CHATTY 0.0", llc_digest)}
+    )
+    seen = []
+    real_output = execution_module._CappedCapture.output
+
+    def observing_output(self):
+        result = real_output(self)
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(
+        execution_module._CappedCapture, "output", observing_output
+    )
     code, out, err = run_cli(
         ["doctor", "--lockfile", lockfile], path=bindir
     )
     assert code == cli_module.EXIT_OK, out + err
     assert "tool llc: present LLC-CHATTY 0.0" in out, out
+    truncated = [result for result in seen if result.truncated]
+    assert len(truncated) == 1, seen
+    capture = truncated[0]
+    assert capture.stdout.startswith("LLC-CHATTY 0.0\n"), capture.stdout[:64]
+    assert capture.stderr == "", capture.stderr
+    head, note = capture.stdout.rsplit("...[capture truncated ", 1)
+    assert head.endswith("\n"), repr(head[-8:])
+    assert note.endswith("]...\n"), repr(note[-32:])
+    discarded, label, _rest = note[:-5].split(" ", 2)
+    assert label == "stdout", note
+    assert "1048576-byte head" in note, note
+    # The pump pads a non-newline head with one newline before the
+    # note; conservation counts stream bytes only.
+    pad = 0 if head[:-1].endswith("\n") else 1
+    kept = len(head.encode("utf-8")) - pad
+    assert kept + int(discarded) == total_bytes, (
+        kept, discarded, total_bytes,
+    )
+    assert kept <= 1048576 + 1, kept
 
 
 def test_pack_canary_secret_absent_from_bundle():
