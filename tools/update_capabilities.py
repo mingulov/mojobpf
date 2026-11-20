@@ -5472,7 +5472,7 @@ _DECL_BUILTINS = frozenset({"void", "_Bool", "char", "short", "int", "long",
                             "signed", "unsigned"})
 _DECL_PAREN_SPECIFIERS = frozenset({
     "_Atomic", "typeof", "__typeof", "__typeof__", "typeof_unqual",
-    "__typeof_unqual__", "_Alignas",
+    "__typeof_unqual__", "_Alignas", "_BitInt",
 })
 
 
@@ -5855,6 +5855,7 @@ def _declaration_roles(unit, *, work_limit=None):
 
     role_parses = {}
     role_heads, structural_head_uses = {}, set()
+    align_ends = {}
 
     def bare_attribute(first):
         """Recognize one whole double-parenthesized structural attribute."""
@@ -5989,6 +5990,8 @@ def _declaration_roles(unit, *, work_limit=None):
             elif word in _DECL_PAREN_SPECIFIERS and cursor + 1 in ends and tokens[cursor + 1] == '(':
                 after = ends[cursor + 1] + 1
                 charge(after - cursor)
+                if word == '_Alignas' and has_type:
+                    align_ends[first] = after
                 cursor = after
                 has_type |= word != '_Alignas'
                 ordinary_type |= word != '_Alignas'
@@ -6097,6 +6100,25 @@ def _declaration_roles(unit, *, work_limit=None):
             continue
         seen.add(state)
         charge()
+        # A leading run of reserved extension markers hides the real
+        # head: replay a bounded head after the run so the true
+        # declarator is analyzed while the markers stay collected.
+        # The replayed owner keeps a prefix entry, so admission still
+        # refuses it; only the single-marker path is untouched.
+        if (head_start + 1 < len(tokens) and
+                tokens[head_start] == '__extension__' and
+                tokens[head_start + 1] == '__extension__'):
+            run_end = head_start + 2
+            while run_end < len(tokens) and tokens[run_end] == '__extension__':
+                run_end += 1
+            charge(run_end - head_start)
+            replayed, _, _, replay_bounded, _ = role_head(run_end)
+            if (replayed is not None and replay_bounded and
+                    (origin_boundary is None or
+                     replayed[0] == origin_boundary)):
+                charge(len(prefixes) + 1)
+                pending.append((run_end, prefixes + ((head_start + 1, 'extension-prefix'),),
+                                origin_boundary))
         # Only a leading opaque invocation has a competing prefix role.
         # Known specifier groups already have their authoritative type role.
         prefix_after = None
@@ -6162,7 +6184,29 @@ def _declaration_roles(unit, *, work_limit=None):
         while pos < len(tokens):
             charge()
             first = pos
-            parsed, decl_tokens, decl_indices, decl_ends, decl_first, after, aliases, prefix_attributes, _ = role_declarator(pos)
+            # Grouped-declarator recovery: after an extension-prefix
+            # replay, a reserved marker or alignment-boundary name
+            # followed by a group parses the group as the declarator
+            # instead, surfacing its contents (fail-closed: the owner
+            # stays unsupported via the prefix entry).
+            grouped = None
+            if (pos == opened[0]
+                    and any(role == 'extension-prefix' for _, role in prefixes)
+                    and pos + 1 < len(tokens) and tokens[pos + 1] == '(' and pos + 1 in ends
+                    and (tokens[pos] == '__extension__'
+                         or (align_ends.get(head_start) == pos
+                             and re.fullmatch(r'[A-Za-z_]\w*', tokens[pos])
+                             and tokens[pos] not in recognized
+                             and _const_decl_type(tokens[pos]) is None))):
+                trial = role_declarator(pos + 1)
+                if trial[0] is not None and trial[5] == ends[pos + 1] + 1:
+                    grouped = trial
+                    heads.add(tokens[pos])
+            if grouped is not None:
+                (parsed, decl_tokens, decl_indices, decl_ends, decl_first,
+                 after, aliases, prefix_attributes, _) = grouped
+            else:
+                parsed, decl_tokens, decl_indices, decl_ends, decl_first, after, aliases, prefix_attributes, _ = role_declarator(pos)
             if aliases:
                 complete = False
                 charge(len(aliases))

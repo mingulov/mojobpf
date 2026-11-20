@@ -12639,6 +12639,100 @@ def test_declaration_ownership_declarator_standard_attributes():
         _f01_expect(header, body, True)
 
 
+def test_declaration_ownership_trailer_group_alignment_and_bitint():
+    # Ported from the thirteenth-round inventory repair
+    # (b39283a): an alignment specifier establishes no type
+    # context, while a bit-precise integer specifier closes like any
+    # other type argument group. Oracle (-13, -13): the static object
+    # reads false.
+    body = _membership_condition_body("in_set && TRUE")
+    headers = [
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "_Alignas(8) T(TRUE);"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "_Alignas(8) _Alignas(4) T(TRUE);"),
+        ("__extension__ __extension__ static "
+         "_BitInt(8) (TRUE);"),
+    ]
+    for header in headers:
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings and "TRUE" in unknown, (header, bindings, unknown)
+        _compiled_membership_pair(header, body, (-13, -13))
+        _f01_expect(header, body, True)
+    # An alignment between a type and a name keeps fail-closed
+    # collection (invalid C in both compilers: tool-behavior pin
+    # only, no oracle possible).
+    header = ("__extension__ __extension__ static int _Alignas(8) "
+              "fn(u32 (*)(void));")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "u32" in unknown, (bindings, unknown)
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    _f01_expect(header, u32_body, True)
+    # The GNU signed and complex builtins declare ordinary objects.
+    # Oracle (-13, -13): the static object reads false.
+    name_body = _membership_condition_body("in_set && x")
+    for word in ("__signed", "__complex"):
+        header = ("__extension__ __extension__ static %s x;" % word)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert "x" in unknown, (header, bindings, unknown)
+        _compiled_membership_pair(header, name_body, (-13, -13))
+        _f01_expect(header, name_body, True)
+
+
+def test_declaration_ownership_trailer_group_prototype_head_spellings():
+    # Ported from the thirteenth-round inventory repair
+    # (b39283a): alignment, signed, complex and aggregate
+    # heads never bind parameter type words, and a reserved-looking
+    # but ordinary name keeps its parameter role. Oracles (-13, 0).
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    headers = [
+        ("__extension__ __extension__ static\n"
+         "    _Alignas(8) _Atomic(u32) unrelated;"),
+        ("__extension__ __extension__ static "
+         "__signed fn(u32 (*)(void));"),
+        ("__extension__ __extension__ static "
+         "__complex fn(u32 (*)(void));"),
+        ("__extension__ __extension__ static struct {int i;} "
+         "fn(u32 (*)(void));"),
+        ("__extension__ __extension__ static struct {int x;} "
+         "fn(u32 (*)(void));"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "T __extension(u32 (*)(void));"),
+    ]
+    for header in headers:
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert "u32" not in unknown, (header, bindings, unknown)
+        _compiled_membership_pair(header, u32_body, (-13, 0))
+        _f01_expect(header, u32_body, False)
+    # A grouped first declarator keeps the comma-sibling parameter
+    # role. Oracle (-13, 0).
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T (a), b(u32 (*)(void));")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "u32" not in unknown, (bindings, unknown)
+    _compiled_membership_pair(header, u32_body, (-13, 0))
+    _f01_expect(header, u32_body, False)
+    # An alignment between a type and a qualifier keeps the
+    # specifier-argument reading (invalid C in both compilers:
+    # tool-behavior pin only, no oracle possible).
+    header = ("typedef bool T;\n__extension__ __extension__ static "
+              "T _Alignas(8) _Atomic (TRUE);")
+    _f01_expect(header, _membership_condition_body("in_set && TRUE"), False)
+    # The double-underscore extension marker and thread storage stay
+    # reserved: neither names a function (both compilers reject each
+    # spelling: tool-behavior pins only, no oracle possible).
+    for word in ("__extension__", "__thread"):
+        header = ("typedef bool T;\n__extension__ __extension__ static "
+                  "T %s(u32 (*)(void));" % word)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert "u32" in unknown, (header, bindings, unknown)
+        _f01_expect(header, u32_body, True)
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
