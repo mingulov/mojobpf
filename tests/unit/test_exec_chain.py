@@ -1081,17 +1081,108 @@ def test_hop_interpreter_symlink_repoint_refuses_spawn():
         assert not os.path.exists(marker), "repointed bytes executed"
 
 
-def test_hop_chain_without_swap_spawns_cleanly():
-    # Control: the same two-hop chain spawns cleanly when
-    # nothing drifts between admission and spawn.
+def test_hop_chain_without_swap_verifies_cleanly():
+    # Static half of the split control (owner ruling
+    # 2026-11-21): the shell spawn cannot execute under lane
+    # supervision (a successful exec escapes the guard's hooks
+    # by design, so no guarded shell-spawn reformulation
+    # exists). The same two-hop chain admits, captures both
+    # hops plus image and interpreter, and passes the real
+    # verify_spawn -- the exact pre-spawn check run_admitted
+    # runs. The runtime half below proves spawn mechanics
+    # through a Python entry; together they keep the
+    # swap-refusal tests non-vacuous.
     with tempfile.TemporaryDirectory(
         prefix="exec-chain-hop-clean-"
     ) as parent:
         request, pins, _interp = _hop_chain(parent)
         admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_EXEC_LAUNCHER
+        ), admitted
+        hop1 = os.path.join(parent, "hop1")
+        assert [hop.path for hop in admitted.hops] == [
+            request.argv0, hop1, admitted.image.path,
+        ], admitted.hops
+        assert admitted.image.sha256 == pins.exec_sha256, admitted
+        assert admitted.interpreter is not None, admitted
+        assert len(admitted.hop_interpreters) == len(
+            admitted.hops
+        ), admitted
+        execution_module.verify_spawn(admitted)
+        # Vacuity guard: the same verification refuses once a
+        # hop drifts, so the clean pass above is meaningful.
+        _write(hop1, "#!/bin/sh\nexec /bin/false\n")
+        try:
+            execution_module.verify_spawn(admitted)
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_SPAWN_REFUSED
+            ), exc
+            assert "drifted since admission" in exc.detail, exc
+        else:
+            raise AssertionError("drifted hop verified clean")
+
+
+def _python_hop_chain(parent):
+    # Two-hop Python chain: entry --execv--> hop1 --execv-->
+    # final, exiting 42. Owned fixtures under private scratch;
+    # os.execv lines are not exec spellings, so the entry
+    # admits as a console script and the guard injects its
+    # prelude at the entry spawn. Post-exec hops run
+    # test-owned bytes (the guard cannot supervise past an
+    # exec by design); chain integrity for shell launchers
+    # is covered by the static half above.
+    final = os.path.join(parent, "final_hop.py")
+    _write(final, "#!%s\nraise SystemExit(42)\n" % sys.executable)
+    hop1 = os.path.join(parent, "hop1.py")
+    _write(
+        hop1,
+        "#!%s\nimport os\nos.execv(%r, [%r])\n"
+        % (sys.executable, final, final),
+    )
+    entry = os.path.join(parent, "entry.py")
+    _write(
+        entry,
+        "#!%s\nimport os\nos.execv(%r, [%r])\n"
+        % (sys.executable, hop1, hop1),
+    )
+    request = execution_module.ExecutionRequest(
+        name="hop-py",
+        argv0=entry,
+        allow_path_lookup=False,
+        forms=(execution_module.FORM_CONSOLE_SCRIPT,),
+    )
+    pins = execution_module.ExecutionPins(
+        entry_sha256=execution_module.sha256_file(entry),
+        interpreter_sha256=execution_module.sha256_file(
+            sys.executable
+        ),
+        interpreter_pin_present=True,
+    )
+    return request, pins
+
+
+def test_python_hop_chain_without_swap_spawns_cleanly():
+    # Runtime half of the split control: a clean two-hop
+    # chain spawns through real os.execv transitions with
+    # its exit code propagated. Exit 42 (not 0) proves the
+    # exact final bytes ran to completion; a nonzero exit
+    # is a step failure, so the status is failed (the
+    # control proves transitions plus propagation).
+    with tempfile.TemporaryDirectory(
+        prefix="exec-chain-hop-py-"
+    ) as parent:
+        request, pins = _python_hop_chain(parent)
+        admitted = execution_module.admit_execution(request, pins)
+        assert admitted.form == (
+            execution_module.FORM_CONSOLE_SCRIPT
+        ), admitted
         record = execution_module.run_admitted(admitted, ())
-        assert record.status == "ok", record
-        assert record.exit_code == 0, record
+        assert record.status == (
+            execution_module.STATUS_FAILED
+        ), record
+        assert record.exit_code == 42, record
 
 
 def test_hop_with_env_interpreter_refuses_admission():
