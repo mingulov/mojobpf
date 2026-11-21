@@ -4128,6 +4128,13 @@ _SHADOWABLE_TYPEDEFS = frozenset((
     "size_t", "ssize_t",
 ))
 
+# Single-word C type spellings that can never be identifiers
+# (the cast-word set minus the shadowable typedef spellings).
+# A group after one of these keeps the grouped-scalar reading
+# unconditionally: the function reading would need the type
+# word itself as a declarator name, which is impossible.
+_CAST_KEYWORDS = _CAST_WORDS - _SHADOWABLE_TYPEDEFS
+
 
 def _cast_group_shadowed(content, bound):
     """Whether a cast-spelled group is shadowed by a local binding."""
@@ -5466,7 +5473,8 @@ def _is_fn_pointer_declarator(piece):
 
 
 _DECL_STORAGE = frozenset({"static", "extern", "register", "auto", "inline",
-                           "__inline", "__inline__", "__always_inline"})
+                           "__inline", "__inline__", "__always_inline",
+                           "_Noreturn"})
 _DECL_QUALIFIERS = frozenset({"const", "volatile", "restrict", "_Atomic"})
 _DECL_BUILTINS = frozenset({"void", "_Bool", "char", "short", "int", "long",
                             "signed", "unsigned"})
@@ -5498,12 +5506,6 @@ def _declaration_specifiers(tokens, ends, start=0):
             unmodeled = True
         elif word in _DECL_QUALIFIERS:
             words.append(word)
-            pos += 1
-        elif word == "__extension__" and not (
-                pos + 1 < len(tokens) and tokens[pos + 1] == "("):
-            # Reserved marker without a group is transparent to the
-            # scan: it is never a type, name, or anchor. A following
-            # group keeps the function-name path (grouped recovery).
             pos += 1
         elif (word == "typeof" and pos + 1 < len(tokens)
                 and re.fullmatch(r"[A-Za-z_]\w*", tokens[pos + 1])):
@@ -6026,11 +6028,6 @@ def _declaration_roles(unit, *, work_limit=None):
                 ordinary_type |= word != '_Alignas'
             elif word in _DECL_QUALIFIERS:
                 cursor += 1
-            elif word == "__extension__" and not (
-                    cursor + 1 in ends and tokens[cursor + 1] == "("):
-                # Reserved marker without a group is transparent to
-                # the scan (mirrors _declaration_specifiers above).
-                cursor += 1
             elif (word == "typeof" and cursor + 1 < len(tokens)
                     and re.fullmatch(r"[A-Za-z_]\w*", tokens[cursor + 1])):
                 # Bare GNU typeof applied to an identifier forms a
@@ -6133,6 +6130,159 @@ def _declaration_roles(unit, *, work_limit=None):
                   {'struct', 'union', 'enum', '__attribute'})
     paths, signatures, seen, pending = [], set(), set(), [(0, (), None)]
     unparsed_heads = set()
+
+    def _single_group_name(first):
+        """Unwrap redundant parens around a single-identifier group.
+
+        Returns (name, depth): the identifier and how many group
+        levels were descended (0 for a direct single token).
+        (None, 0) when the group does not contain exactly one
+        identifier modulo redundant parentheses. Balanced
+        `__attribute` groups skip transparently at every level
+        (a bare `__attribute` or `[[...]]` never skips: the
+        repair line reads those as non-grouped). Each descent
+        and each skipped span charges over input tokens;
+        groups are finite balanced spans, so the walk
+        terminates.
+        """
+        group, depth = first, 0
+        while True:
+            inner = group + 1
+            while (tokens[inner] == '__attribute' and inner + 1 in ends
+                    and tokens[inner + 1] == '('
+                    and ends[inner + 1] < ends[group]):
+                charge(ends[inner + 1] - inner)
+                inner = ends[inner + 1] + 1
+            if ends[group] - inner == 1 and re.fullmatch(r"[A-Za-z_]\w*", tokens[inner]):
+                return tokens[inner], depth
+            if (tokens[inner] == '(' and inner in ends
+                    and ends[inner] == ends[group] - 1):
+                charge()
+                group, depth = inner, depth + 1
+                continue
+            return None, 0
+
+    def _grouped_declarator_name(first):
+        """Name a grouped C declarator, else None.
+
+        Accepts interleaved stars and pointer qualifiers
+        (standard and GNU spellings alike), one identifier or
+        nested group, then balanced `(...)`/`[...]` suffix
+        groups in any order and number (bounds and parameters
+        uninterpreted -- the repair line keeps no
+        second-core rule); anything else (commas, trailers,
+        abstract positions) yields nothing. Leading
+        qualifiers
+        without a star spell an abstract qualified type, never
+        a declarator. Keywords never match the identifier
+        position (a keyword cannot own a declaration; abstract
+        `(void)`-style groups correctly yield nothing).
+        Attributes skip transparently in exactly the
+        positions the repair line accepts: a balanced
+        `__attribute` group anywhere in the core or past a
+        star in the suffix; a `[[...]]` group or a bare
+        `__attribute` only past a star in the core (a
+        leading one reads non-grouped); every `[[...]]`
+        suffix group reads as an uninterpreted balanced
+        span like any other suffix group.
+        Iterative over an explicit span stack (no Python
+        recursion, per codebase precedent); every consumed
+        token and level is charged, so adversarial nesting
+        trips the work budget instead of running away. Callers
+        apply their own head-state gates to the returned name.
+
+        Stack entries are (resume-cursor, resume-close,
+        outer-starred) triples for suffix continuation after
+        a nested group completes; the name propagates
+        outward exactly once. Star scope is per level: a
+        star inside a nested group neither satisfies an
+        outer qualifier rule nor admits an outer attribute.
+        """
+        blocked = _BLOCKED_DECLARATOR_NAMES
+        # Fast path: direct single non-keyword identifier (no extra charge).
+        if ends[first] - (first + 1) == 1:
+            word = tokens[first + 1]
+            if re.fullmatch(r"[A-Za-z_]\w*", word) and word not in blocked:
+                return word
+            return None
+        quals = _DECL_QUALIFIERS | _STRUCTURAL_POINTER_QUALIFIERS
+        stack = []
+        cursor, close = first + 1, ends[first]
+        name = None
+        in_core = True
+        saw_star = False
+        while True:
+            charge()
+            if in_core:
+                saw_qual = False
+                while cursor < close:
+                    if tokens[cursor] == '*':
+                        charge()
+                        saw_star = True
+                        cursor += 1
+                    elif tokens[cursor] in quals:
+                        charge()
+                        saw_qual = True
+                        cursor += 1
+                    elif (tokens[cursor] == '__attribute' and cursor + 1 in ends
+                            and tokens[cursor + 1] == '('
+                            and ends[cursor + 1] < close):
+                        charge(ends[cursor + 1] - cursor)
+                        cursor = ends[cursor + 1] + 1
+                    elif saw_star and (
+                            tokens[cursor] == '__attribute' or (
+                                tokens[cursor] == '[' and cursor in ends
+                                and cursor + 1 < len(tokens)
+                                and tokens[cursor + 1] == '['
+                                and ends[cursor] < close)):
+                        if tokens[cursor] == '[':
+                            charge(ends[cursor] - cursor)
+                            cursor = ends[cursor] + 1
+                        else:
+                            charge()
+                            cursor += 1
+                    else:
+                        break
+                if saw_qual and not saw_star:
+                    return None
+                if cursor < close and tokens[cursor] == '(' and cursor in ends and ends[cursor] < close:
+                    stack.append((ends[cursor] + 1, close, saw_star))
+                    close = ends[cursor]
+                    cursor += 1
+                    saw_star = False
+                    continue
+                if (cursor >= close or not re.fullmatch(r"[A-Za-z_]\w*", tokens[cursor])
+                        or tokens[cursor] in blocked):
+                    return None
+                charge()
+                name = tokens[cursor]
+                cursor += 1
+                in_core = False
+            while cursor < close:
+                if saw_star and tokens[cursor] == '__attribute':
+                    if (cursor + 1 in ends and tokens[cursor + 1] == '('
+                            and ends[cursor + 1] < close):
+                        charge(ends[cursor + 1] - cursor)
+                        cursor = ends[cursor + 1] + 1
+                    else:
+                        charge()
+                        cursor += 1
+                    continue
+                # Every balanced suffix group is uninterpreted, in
+                # any order and number (the repair line keeps no
+                # second-core rule); anything else fails closed.
+                if (tokens[cursor] in ('(', '[') and cursor in ends
+                        and ends[cursor] < close):
+                    charge(ends[cursor] - cursor)
+                    cursor = ends[cursor] + 1
+                    continue
+                break
+            if cursor != close:
+                return None
+            if not stack:
+                return name
+            cursor, close, saw_star = stack.pop()
+
     while pending:
         head_start, prefixes, origin_boundary = pending.pop()
         charge(len(prefixes) + 1)
@@ -6222,6 +6372,8 @@ def _declaration_roles(unit, *, work_limit=None):
             charge(len(head_specifiers))
             reasons.extend((indices[index], 'unsupported declaration specifier') for index in head_specifiers)
         discarded, viable, current_head_start = False, True, head_start
+        current_opened0 = opened[0]
+        prefix_base_len = len(prefixes)
         while pos < len(tokens):
             charge()
             first = pos
@@ -6256,25 +6408,71 @@ def _declaration_roles(unit, *, work_limit=None):
                     and re.fullmatch(r"[A-Za-z_]\w*", tokens[pos])
                     and pos + 1 < len(tokens) and tokens[pos + 1] == '('
                     and pos + 1 in ends):
-                inner = tokens[pos + 2:ends[pos + 1]]
-                if (len(inner) == 1
-                        and re.fullmatch(r"[A-Za-z_]\w*", inner[0])):
-                    heads.add(inner[0])
+                # Grouped declarator (redundant parens unwrapped,
+                # pointer stars and array suffixes read): no copy,
+                # one charged step per level. The competing reading
+                # needs a genuine provisional-FIRST-WORD head
+                # (trailing storage after it makes the function
+                # reading indefinite): a marker head never
+                # establishes that ambiguity (markers taint, never
+                # type). A reopened head never borrows the
+                # original head's speculative status, even when it
+                # carries a provisional word of its own.
+                named = _grouped_declarator_name(pos + 1)
+                if (named is not None
+                        and possible_head is not None
+                        and possible_head != "__extension__"
+                        and current_head_start == head_start):
+                    heads.add(named)
             # Competing grouped-scalar reading: a bare-identifier group
             # after a provisionally-headed declarator keeps the scalar
             # reading alongside parameters (fail-closed surfacing).
             # Builtin heads, complex groups, and unprefixed owners
-            # keep their single reading.
-            if (pos == opened[0]
+            # keep their single reading, as do established
+            # (consumed-type) heads except after a C type word
+            # (where the function reading is impossible even
+            # past a builtin-led head with no provisional word)
+            # and known-type tokens under an indefinite head.
+            # The opening tracks semicolon reopens past marker
+            # runs, so a reopened grouped declarator keeps its
+            # reading like a head-start one.
+            if (pos == current_opened0
                     and any(role == 'extension-prefix' for _, role in prefixes)
-                    and possible_head is not None
                     and re.fullmatch(r"[A-Za-z_]\w*", tokens[pos])
                     and pos + 1 < len(tokens) and tokens[pos + 1] == '('
                     and pos + 1 in ends):
-                inner = tokens[pos + 2:ends[pos + 1]]
-                if (len(inner) == 1
-                        and re.fullmatch(r"[A-Za-z_]\w*", inner[0])):
-                    heads.add(inner[0])
+                # Grouped declarator (redundant parens unwrapped,
+                # pointer stars and array suffixes read): no copy,
+                # one charged step per level. After an
+                # extension-prefix replay the scalar reading is
+                # genuine while the head itself is still
+                # indefinite (the provisional word is the marker,
+                # never a consumed type). Past an established
+                # head the name is declarator material and its
+                # group is a parameter list. A group after an
+                # unshadowable C type word keeps the scalar
+                # reading at any depth and token (the function
+                # reading would need the keyword as a name,
+                # which is impossible; even a known-type token
+                # then reads grouped). Other positions keep it
+                # only for a direct single token under an
+                # indefinite head (marker) -- any non-keyword
+                # token at any depth. (A former own-head leg
+                # for shadowable spellings proved unreachable
+                # -- zero firings across the battery plus
+                # targeted own-head/reopened/repeated-word
+                # probes -- so it and its typedef threading
+                # were removed rather than gated.)
+                if tokens[pos] in _CAST_KEYWORDS:
+                    named = _grouped_declarator_name(pos + 1)
+                    if named is not None:
+                        heads.add(named)
+                else:
+                    single, _depth = _single_group_name(pos + 1)
+                    if (single is not None
+                            and possible_head == "__extension__"
+                            and single not in _BLOCKED_DECLARATOR_NAMES):
+                        heads.add(single)
             if aliases:
                 complete = False
                 charge(len(aliases))
@@ -6374,9 +6572,33 @@ def _declaration_roles(unit, *, work_limit=None):
                 # retain their roles but never admit a partial publication.
                 complete = False
                 reasons.append((indices[pos - 1], 'multiple declarations in one owner'))
+                # A marker run after the separator is not a head: skip
+                # it (collecting the markers) so the real declarator
+                # still parses and surfaces, and extend the path's
+                # prefixes with the run's taint -- the same raw+replay
+                # duality head-start runs get, so a reopened grouped
+                # declarator keeps its scalar reading. Sound only
+                # here: the refusal rides on complete=False above,
+                # so no binding can be minted from a reopened head;
+                # a head-start run keeps its provisional taint. The
+                # entry mirrors the head-loop replay shape (marker
+                # position + 1); group mapping stays as established,
+                # so path signatures are unchanged. Each reopen
+                # replaces the previous reopen entry (latest wins;
+                # every use is boolean) so long marker-run
+                # sequences stay linear instead of quadratic.
+                run_start = pos
+                while pos < len(tokens) and tokens[pos] == '__extension__':
+                    charge()
+                    heads.add(tokens[pos])
+                    pos += 1
                 reopened, head_specifiers, head_attributes, _, type_boundary = role_head(pos)
                 if reopened is None:
                     break
+                if pos > run_start:
+                    charge(len(prefixes) + 1)
+                    prefixes = prefixes[:prefix_base_len] + ((run_start + 1, 'extension-prefix'),)
+                    current_opened0 = reopened[0]
                 established_boundary = type_boundary
                 current_head_start = pos
                 head_groups(groups, pos, reopened[0])
@@ -6442,7 +6664,9 @@ def _analyze_declaration_unit(unit):
     roles = _declaration_roles(unit)
     if roles.status == 'complete':
         return roles.bindings, frozenset()
-    unknown = roles.heads | frozenset(candidate.name for candidate in roles.candidates)
+    unknown = roles.heads | frozenset(
+        candidate.name for candidate in roles.candidates
+        if candidate.name not in _BLOCKED_DECLARATOR_NAMES)
     return (), unknown
 
 
@@ -6799,6 +7023,21 @@ _C_KEYWORDS = frozenset((
     "return", "goto", "sizeof", "typedef", "struct", "union",
     "enum", "const", "static",
 ))
+
+# ISO C keywords inside the declaration-specifier sets that can
+# never own a declaration, beyond _CAST_KEYWORDS/_C_KEYWORDS
+# (59-word repair-line matrix: b39283a surfaces every other
+# spelling there, including GNU spellings, typeof and _BitInt).
+_GROUPED_NAME_BLOCKED = frozenset((
+    "_Alignas", "_Complex", "_Noreturn", "_Thread_local",
+    "auto", "extern", "inline", "register",
+))
+
+# Every word that can never own a declaration: a keyword in
+# any of the three sets above never surfaces as a grouped
+# name or a recovered candidate.
+_BLOCKED_DECLARATOR_NAMES = (
+    _CAST_KEYWORDS | _C_KEYWORDS | _GROUPED_NAME_BLOCKED)
 
 
 def _split_depth0(text, sep):

@@ -12948,6 +12948,649 @@ def test_declaration_ownership_trailer_group_outer_anchor_guards():
         raise AssertionError("attribute after declarator must stay refused")
 
 
+def test_declaration_ownership_extension_marker_plain_head():
+    # A reserved marker before a plain, fully-recognized
+    # head must taint the declaration, never authorize a
+    # binding. Both pins match the b39283a repair line
+    # observably (bindings, unknown, verdict).
+    body = _membership_condition_body("in_set && TRUE")
+    # Leading marker on an otherwise modelable declaration: valid C
+    # under both compilers (no oracle possible: the tool refuses).
+    # The marker and the name surface in unknown; the consult
+    # rejects instead of admitting a constant.
+    header = "__extension__ static const int TRUE = 1;"
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (bindings, unknown)
+    assert {"TRUE", "__extension__"} <= unknown, (bindings, unknown)
+    _f01_expect(header, body, True)
+    # Marker between the type and the name: invalid C in both
+    # compilers (tool-behavior pin only, no oracle possible). No
+    # binding is minted (in particular no TRUE constant); the
+    # marker surfaces in unknown. The admission below is the C6
+    # bare-TRUE-literal fallback (no binding shadows it), not a
+    # marker authorization, exactly as the repair line pins it.
+    header = "static const int __extension__ TRUE = 1;"
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (bindings, unknown)
+    assert "__extension__" in unknown, (bindings, unknown)
+    assert not any(name == "TRUE" for name, _, _, _, _ in bindings), bindings
+    _f01_expect(header, body, False)
+
+
+def test_declaration_ownership_extension_marker_macro_owner():
+    # A marker run after a semicolon inside one macro
+    # owner must still surface the real declarator (the
+    # reopen parses through the run; the refusal rides on
+    # the multiple-declarations arm, never on the scan).
+    # Valid C under both compilers (no oracle: the tool
+    # refuses). Pins the b39283a verdict (refuse) and its
+    # unknown set exactly.
+    body = _membership_condition_body("in_set && TRUE")
+    for second in (
+            "__extension__ __extension__ static const int TRUE = 0;",
+            ("__extension__ __extension__ static _Bool * "
+             "[[gnu::unused]] (TRUE);"),
+    ):
+        header = ("#define DECL() static int unrelated; %s\n"
+                  "DECL()" % second)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert unknown == {"TRUE", "__extension__", "unrelated"}, (
+            header, bindings, unknown)
+        _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_prototype_param_type():
+    # A parameter type in a marker-led prototype is not
+    # a file-scope name. The single-identifier competing
+    # reading fires only for grouped scalars, never for
+    # function parameter lists. Oracle (-13, 0): the u32
+    # local reads true when present.
+    header = ("typedef bool T; __extension__ __extension__ "
+              "static T fn(u32);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (bindings, unknown)
+    assert "u32" not in unknown, (bindings, unknown)
+    assert {"T", "fn"} <= unknown, (bindings, unknown)
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    _compiled_membership_pair(header, u32_body, (-13, 0))
+    _f01_expect(header, u32_body, False)
+
+
+def test_declaration_ownership_extension_comma_prototype_param():
+    # A parameter type after a comma (or after a
+    # semicolon reopen) is not a file-scope name, even when
+    # the original head is speculative. The
+    # speculative-storage competing reading needs a genuine
+    # provisional-FIRST-WORD head; marker heads and reopened
+    # clean heads keep their single reading. Oracles (-13, 0):
+    # the u32 local reads true when present.
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    headers = [
+        ("typedef bool T; __extension__ static T (a), fn(u32);"),
+        ("#define D() __extension__ static T (a); "
+         "__extension__ __extension__ static int fn(u32);\n"
+         "typedef bool T;\nD()"),
+    ]
+    for header in headers:
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "u32" not in unknown, (header, bindings, unknown)
+        assert {"fn", "a"} <= unknown, (header, bindings, unknown)
+        _compiled_membership_pair(header, u32_body, (-13, 0))
+        _f01_expect(header, u32_body, False)
+
+
+def test_declaration_ownership_extension_prototype_local_typedef():
+    # After an extension-prefix replay past an
+    # established (consumed-type) head, the declarator
+    # name's group is its parameter list, so the competing
+    # scalar reading stays off -- even for tokens the fixed
+    # type table does not know (file-local typedefs like P
+    # are parameter types here, never names). Oracle
+    # (-13, 0): the u32 local reads true when present.
+    header = ("typedef _Bool T;\ntypedef unsigned P;\n"
+              "__extension__ __extension__ static T fn(P);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (bindings, unknown)
+    assert "P" not in unknown, (bindings, unknown)
+    assert {"T", "fn"} <= unknown, (bindings, unknown)
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    _compiled_membership_pair(header, u32_body, (-13, 0))
+    _f01_expect(header, u32_body, False)
+
+
+def test_declaration_ownership_extension_reopened_head_no_borrow():
+    # After a semicolon reopen, the fresh head must not
+    # borrow the ORIGINAL head's speculative status. The
+    # storage-led second declaration below has a provisional
+    # word of its own, but its group is its own parameter
+    # list. Oracle (-13, 0): the u32 local reads true when
+    # present.
+    header = ("typedef bool T;\n#define D() __extension__ static "
+              "T (a); static T fn(u32);\nD()")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "u32" not in unknown, (header, bindings, unknown)
+    assert {"fn", "a"} <= unknown, (header, bindings, unknown)
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    _compiled_membership_pair(header, u32_body, (-13, 0))
+    _f01_expect(header, u32_body, False)
+
+
+def test_declaration_ownership_extension_grouped_builtin_head():
+    # A group after a builtin type word keeps the
+    # grouped-scalar reading -- a reserved type word can
+    # never be a declarator name, so the function reading
+    # is impossible and the scalar one is definite. Valid C
+    # under both compilers (no oracle: the tool refuses the
+    # zero-initialized object consult). Oracle pair for the
+    # record: (-13, -13).
+    header = ("__extension__ __extension__ static _Complex "
+              "double (TRUE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "TRUE" in unknown, (header, bindings, unknown)
+    body = _membership_condition_body("in_set && TRUE")
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_noreturn_specifier():
+    # `_Noreturn` is a function specifier (like `inline`),
+    # never a type word, so the name after it is the
+    # provisional head and its group reads grouped, as the
+    # repair line pins it. Invalid C in both compilers
+    # (implicit int plus untyped parameter: tool-behavior
+    # pin only, no oracle possible).
+    header = ("__extension__ __extension__ static _Noreturn "
+              "fn(FALSE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "FALSE" in unknown, (header, bindings, unknown)
+    body = _membership_condition_body("in_set && !FALSE")
+    _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_shadowable_pos_type():
+    # A shadowable typedef spelling in declarator
+    # position is a NAME (`u8` here names the function,
+    # shadowing the typedef), so its group is a parameter
+    # list and a known-type token in it stays out of
+    # unknown. Only unshadowable C type words force the
+    # grouped reading. Oracle (-13, 0): the u32 local reads
+    # true when present.
+    header = ("__extension__ __extension__ static __signed "
+              "u8(u32);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "u32" not in unknown, (header, bindings, unknown)
+    assert "u8" in unknown, (header, bindings, unknown)
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    _compiled_membership_pair(header, u32_body, (-13, 0))
+    _f01_expect(header, u32_body, False)
+
+
+def test_declaration_ownership_extension_reopened_marker_replay():
+    # A marker run after a semicolon gets the same
+    # raw+replay duality as a head-start run, so the
+    # reopened grouped declarator keeps its scalar reading.
+    # Oracle (-13, -13): the zero-initialized object reads
+    # false (the tool refuses the consult).
+    header = ("typedef bool T;\n#define D() T static (a); "
+              "__extension__ __extension__ static _Complex "
+              "double (TRUE);\nD()")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "TRUE" in unknown, (header, bindings, unknown)
+    body = _membership_condition_body("in_set && TRUE")
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_nested_grouped_scalar():
+    # Redundant parentheses around a grouped scalar do
+    # not change the reading; the competing branch unwraps
+    # single-token groups. Oracle (-13, -13):
+    # zero-initialized.
+    header = ("__extension__ __extension__ static _Complex "
+              "double ((TRUE));")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "TRUE" in unknown, (header, bindings, unknown)
+    body = _membership_condition_body("in_set && TRUE")
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_builtin_led_grouped():
+    # Past a consumed builtin-led head (`long`), the
+    # group after the scan-stop type word still reads
+    # grouped -- the type-word leg needs no provisional
+    # word. Oracle (-13, -13): zero-initialized.
+    header = ("__extension__ __extension__ static long "
+              "double (TRUE);")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "TRUE" in unknown, (header, bindings, unknown)
+    body = _membership_condition_body("in_set && TRUE")
+    _compiled_membership_pair(header, body, (-13, -13))
+    _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_local_typedef_token():
+    # Past a definite head (consumed builtin) or an
+    # established GNU type spelling (`__signed`), the
+    # shadowable word is declarator material, so the token
+    # in its group is definitively a parameter type, never
+    # a grouped scalar -- however the alias is spelled
+    # (plain, parenthesized, function-pointer,
+    # function-prototype), or whether it is declared at
+    # all. No competing reading exists there at all.
+    # Oracle (-13, 0): the gate reads true when present
+    # (the undeclared-P cell is invalid C: tool-behavior
+    # pin, no oracle).
+    for typedef in (
+            "typedef unsigned P;",
+            "typedef unsigned (P);",
+            "typedef unsigned (* const P)(void);",
+            "typedef unsigned P(unsigned (*value)(void));",
+    ):
+        for prototype in (
+                "__extension__ __extension__ static int u8(P);",
+                "__extension__ __extension__ static __signed u8(P);",
+        ):
+            header = (typedef + "\n" + prototype + "\n"
+                      "static bool gate(const struct bpf_prog *P) {\n"
+                      "    return P->aux->attach_st_ops_member_off & 1;\n"
+                      "}\n")
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert not bindings, (header, bindings, unknown)
+            assert "P" not in unknown, (header, bindings, unknown)
+            assert "u8" in unknown, (header, bindings, unknown)
+            body = _membership_condition_body("in_set && gate(prog)")
+            _compiled_membership_pair(header, body, (-13, 0))
+            for present in (False, True):
+                verdict = _simulate_header(
+                    "structural_filter", header, body, ("probe_fn",),
+                    {"probe_ids": {"probe_fn"} if present else set()},
+                    ("BPF_PROG_TYPE_TRACING",))
+                assert verdict["probe_fn"]["types"] == (
+                    {"BPF_PROG_TYPE_TRACING"} if present else set()), verdict
+                assert verdict["probe_fn"]["notes"] == ([
+                    "additionally restricted by structural_filter "
+                    "((P->aux->attach_st_ops_member_off & 1))"]
+                    if present else []), verdict
+    for prototype in (
+            "__extension__ __extension__ static int u8(P);",
+            "__extension__ __extension__ static __signed u8(P);",
+    ):
+        header = (prototype + "\n"
+                  "static bool gate(const struct bpf_prog *P) {\n"
+                  "    return P->aux->attach_st_ops_member_off & 1;\n"
+                  "}\n")
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "P" not in unknown, (header, bindings, unknown)
+        assert "u8" in unknown, (header, bindings, unknown)
+        body = _membership_condition_body("in_set && gate(prog)")
+        for present in (False, True):
+            verdict = _simulate_header(
+                "structural_filter", header, body, ("probe_fn",),
+                {"probe_ids": {"probe_fn"} if present else set()},
+                ("BPF_PROG_TYPE_TRACING",))
+            assert verdict["probe_fn"]["types"] == (
+                {"BPF_PROG_TYPE_TRACING"} if present else set()), verdict
+            assert verdict["probe_fn"]["notes"] == ([
+                "additionally restricted by structural_filter "
+                "((P->aux->attach_st_ops_member_off & 1))"]
+                if present else []), verdict
+
+
+def test_declaration_ownership_extension_marker_typedef_token():
+    # A marker-headed group surfaces any non-keyword
+    # token -- even a file-scope typedef alias, even one
+    # smuggled in by a macro-emitted function body (the
+    # repair line has no typedef suppression on this path
+    # at all). The mid-marker shape is invalid C in both
+    # compilers: tool-behavior pins only, no oracle
+    # possible.
+    body = _membership_condition_body("in_set && TRUE")
+    headers = [
+        ("typedef bool T;\ntypedef unsigned TRUE;\n"
+         "__extension__ __extension__ static __extension__ T (TRUE);"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__extension__ T (TRUE);\n"
+         "#define HELPER() static void helper(void) "
+         "{ typedef unsigned TRUE; };\nHELPER()"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__extension__ T ((TRUE));"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__extension__ T (((TRUE)));"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__extension__ T (__attribute((u)) TRUE);"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__extension__ T (__attribute((u)) (TRUE));"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__extension__ T ((__attribute((u)) TRUE));"),
+        ("typedef bool T;\n__extension__ __extension__ static "
+         "__extension__ T "
+         "(__attribute((u)) __attribute((v)) TRUE);"),
+    ]
+    for header in headers:
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "TRUE" in unknown, (header, bindings, unknown)
+        _f01_expect(header, body, True)
+    # Known-type tokens fire too (the repair line refuses
+    # these consults); keywords never own a group. The
+    # keyword bodies cannot name their token in C, so the
+    # blocks are analysis pins plus an unrelated admitted
+    # consult (both lines admit it).
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    for token in ("u32", "bool", "u64", "P"):
+        header = ("typedef bool T;\ntypedef unsigned P;\n"
+                  "__extension__ __extension__ static __extension__ T "
+                  "(%s);" % token)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert token in unknown, (header, bindings, unknown)
+        token_body = _membership_condition_body("in_set && " + token)
+        _f01_expect(header, token_body, True)
+    for token in ("int", "void", "unsigned", "return", "if",
+                  "struct", "for", "else", "inline", "_Noreturn"):
+        header = ("typedef bool T;\n"
+                  "__extension__ __extension__ static __extension__ T "
+                  "(%s);" % token)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert token not in unknown, (header, bindings, unknown)
+        _f01_expect(header, u32_body, False)
+
+
+def test_declaration_ownership_extension_grouped_ptr_array():
+    # After an unshadowable type word the grouped
+    # reading covers pointer stars (bare and qualified),
+    # nested groups, and array suffixes, not just plain
+    # identifiers. Oracles: null pointers read false
+    # (-13, -13); array addresses are non-null, so the
+    # negated consult reads false in both runs (-13, -13).
+    for header, condition in (
+            ("__extension__ __extension__ static _Complex "
+             "double (*TRUE);", "in_set && TRUE"),
+            ("__extension__ __extension__ static _Complex "
+             "double (FALSE[1]);", "in_set && !FALSE"),
+            ("__extension__ __extension__ static _Complex "
+             "double (* const TRUE);", "in_set && TRUE"),
+            ("__extension__ __extension__ static _Complex "
+             "double ((FALSE)[1]);", "in_set && !FALSE"),
+            ("__extension__ __extension__ static _Complex "
+             "double (* volatile * const (TRUE));",
+             "in_set && TRUE"),
+            ("__extension__ __extension__ static _Complex "
+             "double (* __const__ TRUE);", "in_set && TRUE"),
+    ):
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert ("TRUE" if "TRUE" in header else "FALSE") in unknown, (
+            header, bindings, unknown)
+        body = _membership_condition_body(condition)
+        _compiled_membership_pair(header, body, (-13, -13))
+        _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_grouped_ptr_attr():
+    # Attributes inside a grouped pointer are
+    # transparent in exactly the positions the repair
+    # line accepts. A grouped
+    # `__attribute` skips anywhere (leading, after a
+    # star, between stars, before a nested group); a
+    # `[[...]]` group or a bare `__attribute` only past a
+    # star; a suffixed `__attribute` only on a starred
+    # owner. Oracles (-13, -13): null pointers read
+    # false. Cells invalid in both compilers (bare or
+    # single-paren spellings, suffixed positions) are
+    # tool-behavior pins, no oracle possible.
+    oracle_cells = (
+        "* [[gnu::unused]] TRUE",
+        "* __attribute((unused)) TRUE",
+        "__attribute((unused)) TRUE",
+        "* [[gnu::unused]] * TRUE",
+        "__attribute((unused)) * TRUE",
+        "* __attribute((u)) (TRUE)",
+        # A trailing attribute past a parameter list
+        # hides nothing.
+        "(*TRUE)(void) [[gnu::unused]]",
+    )
+    for core in oracle_cells:
+        header = ("__extension__ __extension__ static _Complex "
+                  "double (%s);" % core)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "TRUE" in unknown, (header, bindings, unknown)
+        body = _membership_condition_body("in_set && TRUE")
+        _compiled_membership_pair(header, body, (-13, -13))
+        _f01_expect(header, body, True)
+    pin_cells = (
+        "* TRUE __attribute((unused))",
+        "* __attribute TRUE",
+        "(*(TRUE) __attribute((u)))",
+        "* TRUE [1] __attribute((u)) [2]",
+        "* __attribute(unused) TRUE",
+        # The repair line has no second-core rule --
+        # every balanced suffix group is uninterpreted, so
+        # multi-core shapes still surface their name (all
+        # invalid C: pins only).
+        "(*TRUE)(void)(x)",
+        "(TRUE)(x)(y)(z)",
+        "(TRUE)(x, y)",
+        "(*TRUE)(void)(void)",
+        "(*TRUE)(void) [[gnu::unused]] (x)",
+    )
+    for core in pin_cells:
+        header = ("__extension__ __extension__ static _Complex "
+                  "double (%s);" % core)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "TRUE" in unknown, (header, bindings, unknown)
+        body = _membership_condition_body("in_set && TRUE")
+        _f01_expect(header, body, True)
+    # Negative positions: a leading `[[...]]` never
+    # reads grouped, and a suffixed or bare attribute
+    # needs its star. Non-group trailers (literals,
+    # operators, commas, stray names) also read
+    # non-grouped, as does a starless `__attribute`
+    # between suffix groups. The repair line admits
+    # these consults; the tool must not over-fire.
+    for core in ("[[gnu::unused]] TRUE",
+                 "[[gnu::unused]] * TRUE",
+                 "TRUE __attribute((unused))",
+                 "const __attribute((u)) TRUE",
+                 "(TRUE) 42",
+                 "(TRUE) + x",
+                 "(TRUE) , x",
+                 "(TRUE) f",
+                 "(TRUE) (x) __attribute((u)) (y)"):
+        header = ("__extension__ __extension__ static _Complex "
+                  "double (%s);" % core)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "TRUE" not in unknown, (header, bindings, unknown)
+        body = _membership_condition_body("in_set && TRUE")
+        _f01_expect(header, body, False)
+    # Suffixed `[[...]]` groups already surface through
+    # the normal declarator path on both lines; pin the
+    # behavior so the attribute work stays out of it.
+    for core in ("* TRUE [[gnu::unused]]",
+                 "* TRUE [1] [[gnu::unused]]"):
+        header = ("__extension__ __extension__ static _Complex "
+                  "double (%s);" % core)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "TRUE" in unknown, (header, bindings, unknown)
+        body = _membership_condition_body("in_set && TRUE")
+        _f01_expect(header, body, True)
+
+
+def test_declaration_ownership_extension_grouped_name_keyword():
+    # Keywords can never own a grouped declarator,
+    # under a type head, a marker head, or a shadowable
+    # own head -- but GNU spellings, typeof, _BitInt and
+    # typedef spellings fire exactly as the repair line
+    # pins them. Keyword tokens cannot be named by a C
+    # body, so the blocks are analysis pins plus an
+    # unrelated admitted consult.
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    for core in ("struct", "return", "for", "inline",
+                 "int", "* struct", "* return", "* inline"):
+        header = ("__extension__ __extension__ static _Complex "
+                  "double (%s);" % core)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        token = core.split()[-1]
+        assert token not in unknown, (header, bindings, unknown)
+        _f01_expect(header, u32_body, False)
+    for token in ("return", "struct", "inline", "for"):
+        header = ("__extension__ __extension__ static u8(%s);" % token)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert token not in unknown, (header, bindings, unknown)
+        _f01_expect(header, u32_body, False)
+    # Firing spellings: GNU `__attribute`/`__signed`,
+    # typeof, and typedef spellings own their groups.
+    fire_cells = (
+        ("__extension__ __extension__ static _Complex "
+         "double (__attribute);", "__attribute"),
+        ("__extension__ __extension__ static _Complex "
+         "double (__signed);", "__signed"),
+        ("__extension__ __extension__ static _Complex "
+         "double (typeof);", "typeof"),
+        ("__extension__ __extension__ static _Complex "
+         "double (u32);", "u32"),
+        ("__extension__ __extension__ static u8(__attribute);",
+         "__attribute"),
+    )
+    for header, token in fire_cells:
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert token in unknown, (header, bindings, unknown)
+    # A bare `__attribute` past a star with no declarator
+    # name leaves nothing to surface here; the repair line
+    # surfaces the attribute word itself via its scan, but
+    # no consult distinguishes the two (the name, set-only
+    # and attribute consults agree on both lines), so the
+    # word difference is accepted scan noise, pinned by
+    # verdict.
+    for core in ("* __attribute", "* __attribute [1]"):
+        header = ("__extension__ __extension__ static _Complex "
+                  "double (%s);" % core)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        name_body = _membership_condition_body("in_set && TRUE")
+        _f01_expect(header, name_body, False)
+        set_body = _membership_condition_body("in_set")
+        _f01_expect(header, set_body, False)
+
+
+def test_declaration_ownership_extension_grouped_function():
+    # A paren group holding a function declarator
+    # still owns its name (`FALSE` takes void here); the
+    # repair line keeps no second-core rule, so every
+    # balanced suffix group is uninterpreted. The u32-body
+    # idiom applies: a bare
+    # function declaration provides no linkage for a
+    # consulting body, so the oracle uses a self-contained
+    # body ((-13, 0)) while the unknown-set pin carries the
+    # surfacing claim.
+    header = ("__extension__ __extension__ static _Complex "
+              "double (FALSE(void));")
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "FALSE" in unknown, (header, bindings, unknown)
+    u32_body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "const u32 one = 1;\nif (in_set && one) return 0;\n"
+                "return -EACCES;\n")
+    _compiled_membership_pair(header, u32_body, (-13, 0))
+    _f01_expect(header, u32_body, False)
+
+
+def test_declaration_ownership_extension_restart_ptr_array():
+    # A3-family parity for pointer/array groups under the
+    # speculative-restart reading: the repair line surfaces
+    # the name there too. Invalid C in both compilers
+    # (untyped parameters in a declaration: tool-behavior
+    # pins only, no oracle possible).
+    for header in (
+            "typedef bool return_837; return_837 static "
+            "__const__ function_837((*x));",
+            "typedef bool return_837; return_837 static "
+            "__const__ function_837(x[1]);",
+    ):
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert not bindings, (header, bindings, unknown)
+        assert "x" in unknown, (header, bindings, unknown)
+
+
+def _deep_group_name(name):
+    """Wrap ``name`` in 230 redundant parenthesis pairs."""
+    for _ in range(230):
+        name = "(" + name + ")"
+    return name
+
+
+def test_declaration_ownership_extension_deep_group_budget():
+    # ONE macro owner containing `static int head;`
+    # plus five marker-led `_Complex double` declarations
+    # with 230-pair nesting each completes within the work
+    # budget -- per-token/level charges stay linear where
+    # a per-span charge went quadratic and exhausted it.
+    # Five separate owners would each get a fresh budget
+    # and miss the regression (proven by reinstating the
+    # span charge: separate owners stay green, this shape
+    # exhausts). Oracle (-13, 0): the membership-only
+    # filter admits.
+    decls = "static int head;\n" + "".join(
+        "__extension__ __extension__ static _Complex double "
+        "%s;\n" % _deep_group_name("v%d" % index)
+        for index in range(5))
+    header = "#define M() " + decls.replace("\n", " ") + "\nM()"
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header[:80], bindings, unknown)
+    assert {"v%d" % index for index in range(5)} <= unknown, (
+        header[:80], bindings, unknown)
+    body = _membership_condition_body("in_set")
+    _compiled_membership_pair(header, body, (-13, 0))
+    _f01_expect(header, body, False)
+
+
+def test_declaration_ownership_extension_long_marker_sequence():
+    # 725 marker-led declarations in one macro owner
+    # complete within the work budget (reopen taint
+    # replaces instead of accumulating) and accept a
+    # membership-only filter.
+    decls = "static int head;\n" + "".join(
+        "__extension__ static int d%d;\n" % index
+        for index in range(725))
+    header = "#define M() " + decls.replace("\n", " ") + "\nM()"
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert not bindings, (header, bindings, unknown)
+    assert "d0" in unknown and "d724" in unknown, (
+        header, sorted(unknown)[:5])
+    body = _membership_condition_body("in_set")
+    _f01_expect(header, body, False)
+
+
 # Ported from the thirteenth-round inventory repair line (b39283a):
 # behavior, macro-provenance + oracle asserts kept verbatim; roles/model-shape asserts
 # (status vocabulary, alternative counts, certainty, candidate spans) dropped:

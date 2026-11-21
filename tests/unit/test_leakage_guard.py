@@ -497,6 +497,38 @@ def test_git_index_reader_rejects_split_link():
     _expect_index_failure(raw, "split")
 
 
+def test_git_index_reader_rejects_unknown_required_extension():
+    # Git refuses an index carrying an unknown extension
+    # whose signature does not start with A-Z ("index uses
+    # abcd extension, which we do not understand", exit 128
+    # on git 2.56.0); the gate must refuse it too instead
+    # of certifying paths from metadata git will not
+    # interpret. Verified against real git on crafted,
+    # checksummed v2 indexes.
+    raw = _encode_git_index(
+        [b"a.py"], extensions=[(b"abcd", b"")]
+    )
+    _expect_index_failure(raw, "required extension")
+
+
+def test_git_index_reader_skips_unknown_optional_extension():
+    # The matching git-compatible pin: an unknown extension with
+    # an A-Z signature is ignored by git ("ignoring ABCD
+    # extension", exit 0), so the reader skips it and still
+    # returns the entry paths.
+    with tempfile.TemporaryDirectory(
+        prefix="leakage-index-"
+    ) as parent:
+        path = os.path.join(parent, "index")
+        with open(path, "wb") as handle:
+            handle.write(
+                _encode_git_index(
+                    [b"a.py"], extensions=[(b"ABCD", b"")]
+                )
+            )
+        assert _read_git_index_file(path) == {"a.py"}
+
+
 def test_git_index_reader_rejects_missing_file():
     with tempfile.TemporaryDirectory(
         prefix="leakage-index-"
@@ -576,8 +608,10 @@ def _read_git_index_file(index_path):
     # Tracked paths from a v2 git index, without spawning git
     # (the lane guard refuses delegating launchers). Only the
     # plain v2 layout is accepted: any other version, a bad
-    # checksum, truncated records, or a split-index link fails
-    # closed, exactly like an unreadable file.
+    # checksum, truncated records, a split-index link, or an
+    # unknown required (non-A-Z) extension fails closed,
+    # exactly like an unreadable file. Unknown A-Z extensions
+    # are optional: git ignores them, so the reader skips them.
     try:
         with open(index_path, "rb") as handle:
             raw = handle.read()
@@ -657,6 +691,17 @@ def _read_git_index_file(index_path):
             raise AssertionError(
                 "cannot derive tracked files (split-index link in %s)"
                 % index_path
+            )
+        if not b"A"[0] <= sig[0] <= b"Z"[0]:
+            # A non-A-Z signature is a required extension: git
+            # refuses an index carrying one it does not know, so
+            # the gate refuses too instead of certifying paths
+            # from metadata git will not interpret. A-Z
+            # signatures are optional (git ignores unknowns).
+            raise AssertionError(
+                "cannot derive tracked files (unrecognized "
+                "required extension %r in %s)"
+                % (sig, index_path)
             )
         pos += 8 + size
         if pos > len(body):
