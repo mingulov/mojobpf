@@ -40,6 +40,7 @@ mojobpf = [
     "schemas/artifact.schema.json",
     "schemas/capability.schema.json",
     "schemas/cost.schema.json",
+    "schemas/coverage-ledger.schema.json",
     "schemas/diagnostics.schema.json",
     "schemas/evidence.schema.json",
     "schemas/fixture.schema.json",

@@ -822,6 +822,7 @@ _SHIPPED_SCHEMA_NAMES = (
     "artifact.schema.json",
     "capability.schema.json",
     "cost.schema.json",
+    "coverage-ledger.schema.json",
     "diagnostics.schema.json",
     "evidence.schema.json",
     "fixture.schema.json",

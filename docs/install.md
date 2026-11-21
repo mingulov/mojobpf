@@ -171,7 +171,7 @@ packaging suites prove this from a clean virtual environment
 The wheel carries the tool modules, the eight Mojo SDK sources,
 the three adapter scripts (byte-identical to the checkout's
 `compiler/` sources) plus the admission descriptor and target
-proof table, the eleven
+proof table, the twelve
 contract schemas as installed data files
 (`share/mojobpf/schemas/*.schema.json`), and the license texts;
 its exact contents are pinned

@@ -1,0 +1,43 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "description": "Target availability for the capability coverage ledger: profiles lists targets with provisioned execution; absent lists required targets with no execution and the excuse the ledger attaches to their cells. A BLOCKED_* entry keeps cells OPEN as outstanding work; a NOT_APPLICABLE entry excludes them and must cite source_refs. A required target in neither list fails materialization. evidence_profiles maps each profile to the library-row evidence profiles accepted as qualification for that target, and runtime_profiles maps each profile to the row profiles accepted for the target_runtime layer; every layer of a qualifying row must name an accepted profile from its gate.",
+  "profiles": [
+    "linux-x86-64"
+  ],
+  "evidence_profiles": {
+    "linux-x86-64": ["source-contract-linux-x86_64-lp64-le"]
+  },
+  "runtime_profiles": {
+    "linux-x86-64": []
+  },
+  "absent": [
+    {
+      "target": "linux-aarch64-physical",
+      "status": "BLOCKED_HARDWARE",
+      "detail": "no ARM guest provisioned; all physical-ARM cells stay OPEN until one exists",
+      "next_action": "provision a dedicated ARM hardware guest and add linux-aarch64-physical to profiles",
+      "source_refs": [
+        ".github/workflows/vm-matrix.yml (x86_64 and Ubuntu runners only; no ARM runners)"
+      ]
+    },
+    {
+      "target": "linux-x86-64-device",
+      "status": "BLOCKED_HARDWARE",
+      "detail": "no device-backed x86 guest provisioned; device-bound cells stay OPEN until one exists",
+      "next_action": "provision a device-backed x86 guest and add linux-x86-64-device to profiles",
+      "source_refs": [
+        ".github/workflows/vm-matrix.yml (no device-backed runners)"
+      ]
+    },
+    {
+      "target": "linux-bpfeb",
+      "status": "BLOCKED_HARDWARE",
+      "detail": "no big-endian test target provisioned; big-endian cells stay OPEN until one exists",
+      "next_action": "provision a big-endian guest or admit a TCG spot, then add linux-bpfeb to profiles",
+      "source_refs": [
+        ".github/workflows/vm-matrix.yml (no big-endian runners)"
+      ]
+    }
+  ]
+}

@@ -1187,12 +1187,12 @@ def _synthetic_manifest(project):
 def test_all_shipped_schemas_carry_license_markers():
     # licensing.md: every JSON document carries a top-level
     # license field or an SPDX $comment marker. The wheel suite
-    # pins the 11 names; this pins the marker on each of them.
+    # pins the 12 names; this pins the marker on each of them.
     names = sorted(
         name for name in os.listdir(SCHEMA_DIR)
         if name.endswith(".schema.json")
     )
-    assert len(names) == 11, names
+    assert len(names) == 12, names
     for name in names:
         schema = _load_schema(name)
         marked = (

@@ -9,7 +9,7 @@ content) and pins its contract:
   package modules, the eight Mojo SDK sources, and the three
   adapter scripts plus the admission descriptor and target
   proof table (byte-identical
-  to the tree), with the eleven contract schemas shipped as
+  to the tree), with the twelve contract schemas shipped as
   versioned wheel data files;
 * the console script, license texts, and metadata (name, version,
   Python floor, SPDX grant) are present and agree with the tree;
@@ -101,6 +101,7 @@ PINNED_SCHEMA_DATA = (
     ("artifact.schema.json", "artifact.schema.json"),
     ("capability.schema.json", "capability.schema.json"),
     ("cost.schema.json", "cost.schema.json"),
+    ("coverage-ledger.schema.json", "coverage-ledger.schema.json"),
     ("diagnostics.schema.json", "diagnostics.schema.json"),
     ("evidence.schema.json", "evidence.schema.json"),
     ("fixture.schema.json", "fixture.schema.json"),

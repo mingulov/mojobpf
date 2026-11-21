@@ -452,6 +452,66 @@ def test_cost_conforms():
     _assert_union_covered(schema, [good, nullish], "cost")
 
 
+def test_coverage_ledger_conforms():
+    schema = _load_schema("coverage-ledger")
+    spec = importlib.util.spec_from_file_location(
+        "materialize_coverage_conformance",
+        os.path.join(
+            ROOT, "tools", "validation", "materialize_coverage.py"
+        ),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    ledger = module.materialize_coverage(
+        {
+            "packages": [
+                {
+                    "id": "X-HELPERS",
+                    "title": "Complete typed helper coverage",
+                }
+            ],
+            "blockers": [],
+            "records": [
+                {
+                    "id": "helper:conform",
+                    "family": "helpers",
+                    "owner_task": "X-HELPERS",
+                    "implementation_state": "IMPLEMENTED",
+                    "evidence_level": "tested",
+                    "evidence_refs": [],
+                    "scope_required": True,
+                    "targets_required": ["linux-x86-64"],
+                    "userspace_api_surface": "not-applicable",
+                    "applicability_predicate": "conform",
+                    "upstream_source_refs": ["test:ref"],
+                    "blocker": None,
+                    "positive_tests": ["T-01"],
+                    "negative_tests": [],
+                    "interaction_tests": [],
+                    "cost_cases": [],
+                }
+            ]
+        },
+        {
+            "profiles": ["linux-x86-64"],
+            "evidence_profiles": {"linux-x86-64": []},
+            "runtime_profiles": {"linux-x86-64": []},
+        },
+        {
+            "rows": [],
+            "schema_version": 1,
+            "api_provenance": {
+                "repo": "https://github.com/mingulov/libbpf-mojo",
+                "rev": "ab" * 20,
+                "path": "docs/api-coverage.json",
+                "artifact_sha256": "c" * 64,
+            },
+        },
+    )
+    _assert_conforms(schema, ledger, "coverage-ledger")
+    _assert_union_covered(schema, [ledger], "coverage-ledger")
+
+
 def test_result_conforms():
     schema = _load_schema("result")
     target = _make_target()

@@ -5,6 +5,9 @@
   "PKG-INFO",
   "README.md",
   "THIRD_PARTY_NOTICES.md",
+  "capabilities/api-rows.json",
+  "capabilities/coverage-ledger.json",
+  "capabilities/target-matrix.json",
   "ci/kernels.arm64.lock.json",
   "ci/kernels.lock.json",
   "ci/targets/controller-result-v2.schema.json",
@@ -65,6 +68,7 @@
   "docs/compatibility.md",
   "docs/compiler-target-model.md",
   "docs/cost-measurement.md",
+  "docs/coverage-ledger.md",
   "docs/diagnostics.md",
   "docs/evidence-0.1.0.md",
   "docs/evidence-0.2.0.md",
@@ -200,6 +204,7 @@
   "schemas/artifact.schema.json",
   "schemas/capability.schema.json",
   "schemas/cost.schema.json",
+  "schemas/coverage-ledger.schema.json",
   "schemas/diagnostics.schema.json",
   "schemas/evidence.schema.json",
   "schemas/fixture.schema.json",
@@ -282,5 +287,7 @@
   "tests/unit/test_native_adapter.py",
   "toolchains.lock.json",
   "tools/generate_adapter_resources.py",
-  "tools/lock_refresh.py"
+  "tools/lock_refresh.py",
+  "tools/validation/extract_api_rows.py",
+  "tools/validation/materialize_coverage.py"
 ]

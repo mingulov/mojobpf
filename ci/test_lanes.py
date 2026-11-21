@@ -32,6 +32,7 @@ OWNERS = {
         'tests/unit/test_artifact_publication.py',
         'tests/unit/test_ci_workflow_contract.py',
         'tests/unit/test_cleanup_guest_filter.py',
+        'tests/unit/test_coverage_ledger.py',
         'tests/unit/test_event_decoder.py',
         'tests/unit/test_exec_chain.py',
         'tests/unit/test_helpers.py',
