@@ -203,6 +203,27 @@ def test_rel_call_resolves_function_and_section_symbols(symbol_info, symbol_valu
     assert report["reachable"]["call_edges"][0]["target"] == [2, 24]
 
 
+@pytest.mark.parametrize("source", [0, 1, 2])
+def test_plain_map_data_relocation_is_not_an_executable_root(source):
+    # Real compilers reference static .maps data with a plain
+    # LD_IMM64 (src 0) plus R_BPF_64_64; MAP_FD/MAP_VALUE use
+    # src 1/2. All three are data loads against non-executable
+    # object symbols: fallthrough, never an executable root.
+    wide = bytes([0x18, 0x01 | (source << 4), 0, 0, 0, 0, 0, 0,
+                  0, 0, 0, 0, 0, 0, 0, 0])
+    image = control(wide + EXIT,
+                    extra=[(".maps", 1, 3, bytes(32))],
+                    symbols=[("main", 0x12, 1, 0, 24),
+                             ("map0", 0x11, 2, 0, 32)],
+                    relocations=[(".relxdp", 9, 1, 0,
+                                  struct.pack("<QQ", 0, (2 << 32) | 1), 16)])
+    report = collect(image)
+    assert report["complete"]
+    assert values(report)["reachable_slots"] == 3
+    assert values(report)["reachable_bytes"] == 24
+    assert report["reachable"]["instruction_offsets"] == [[1, 0], [1, 8], [1, 16]]
+
+
 def test_symbol_table_ordinals_are_local():
     image = control(bytes.fromhex("85 10 00 00 ff ff ff ff") + EXIT,
                     extra=[(".text", 1, 6, MOV + EXIT + WIDE + EXIT)],

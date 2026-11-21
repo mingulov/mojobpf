@@ -531,8 +531,13 @@ def _walk(elf, decoded, relocations, selection):
             continue
         if relocation is not None:
             symbol = relocation["symbol"]
-            # Ordinary map/data references never introduce executable roots.
-            if opcode != 0x18 or relocation["form"] != 9 or relocation["kind"] != 1 or symbol.shndx in decoded or registers >> 4 not in (1, 2):
+            # Ordinary map/data references never introduce executable roots:
+            # a wide load with an R_BPF_64_64 relocation against a
+            # non-executable object/section symbol always falls through.
+            # Pseudo sources 0 (plain/static address), 1 (map fd) and 2
+            # (map value) all load data; higher sources (function/BTF
+            # addresses) stay unsupported, matching the opcode check.
+            if opcode != 0x18 or relocation["form"] != 9 or relocation["kind"] != 1 or symbol.shndx in decoded or registers >> 4 not in (0, 1, 2):
                 _unreachable("unsupported-relocation", "unresolved reachable code reference or unsupported data relocation")
             if not 0 < symbol.shndx < len(elf.sections) or symbol.type not in (1, 3):
                 _unreachable("unresolved-data-reference", "map/data relocation has no defined object/section symbol")
