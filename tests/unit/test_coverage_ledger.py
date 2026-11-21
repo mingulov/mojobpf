@@ -2,12 +2,10 @@
 """Capability coverage ledger materializer tests.
 
 Every test here runs the materializer against synthetic inline
-inputs, except the drift test, which checks the committed ledger
-against the in-repo registry and matrix only. The live API input
-lives in the sibling libbpf-mojo repository, which this suite
-must not depend on; full byte-regeneration is an executor
-receipt step. Negative tests pin each fail-closed rule with a
-minimal violating input.
+inputs, except the drift tests, which regenerate the committed
+ledger byte-identically from the in-repo registry, matrix, and
+pinned API extract (no sibling checkout needed). Negative tests
+pin each fail-closed rule with a minimal violating input.
 """
 
 import hashlib
@@ -643,6 +641,118 @@ def test_producer_without_evidence_refs_stays_open():
     ledger = _materialize(registry, matrix, api)
     by_id = {cell["id"]: cell for cell in ledger["cells"]}
     assert by_id["helper:a@linux-x86-64#producer"]["status"] == "OPEN"
+
+
+def test_qualified_state_counts_as_implemented():
+    registry, matrix, api = _inputs(
+        [
+            _record(
+                id="helper:a",
+                implementation_state="QUALIFIED",
+                evidence_level="tested",
+                evidence_refs=["host:test"],
+            )
+        ]
+    )
+    ledger = _materialize(registry, matrix, api)
+    by_id = {cell["id"]: cell for cell in ledger["cells"]}
+    assert by_id["helper:a@linux-x86-64#producer"]["status"] == (
+        "QUALIFIED"
+    )
+    Draft202012Validator(_schema()).validate(ledger)
+    registry, matrix, api = _inputs(
+        [
+            _record(
+                id="helper:a",
+                implementation_state="QUALIFIED",
+                evidence_level="tested",
+                evidence_refs=[],
+            )
+        ]
+    )
+    ledger = _materialize(registry, matrix, api)
+    by_id = {cell["id"]: cell for cell in ledger["cells"]}
+    assert by_id["helper:a@linux-x86-64#producer"]["status"] == "OPEN"
+
+
+def test_combined_rationale_labels_family():
+    registry, matrix, api = _inputs(
+        [
+            _record(
+                id="helper:a",
+                family="net-afxdp",
+                blocker={
+                    "status": "PLANNED",
+                    "detail": "record wait",
+                    "next_action": "x",
+                },
+            )
+        ]
+    )
+    registry["blockers"] = [
+        {
+            "id": "net-afxdp-userspace",
+            "family": "net-afxdp",
+            "status": "BLOCKED_UPSTREAM",
+            "detail": "family wait",
+            "source_refs": ["libbpf:libbpf.map@1.7.0"],
+            "next_action": "y",
+        }
+    ]
+    ledger = _materialize(registry, matrix, api)
+    by_id = {cell["id"]: cell for cell in ledger["cells"]}
+    detail = by_id["helper:a@linux-x86-64#producer"]["rationale"][
+        "detail"
+    ]
+    assert detail == "record wait; family: family wait"
+
+
+def test_duplicate_family_blocker_fails():
+    registry, matrix, api = _inputs([_record(id="helper:a")])
+    registry["blockers"] = [
+        {
+            "id": "first",
+            "family": "net-afxdp",
+            "status": "PLANNED",
+            "detail": "one",
+            "source_refs": ["plan:doc"],
+            "next_action": "x",
+        },
+        {
+            "id": "second",
+            "family": "net-afxdp",
+            "status": "PLANNED",
+            "detail": "two",
+            "source_refs": ["plan:doc"],
+            "next_action": "x",
+        },
+    ]
+    with pytest.raises(CoverageError, match="duplicate family"):
+        _materialize(registry, matrix, api)
+
+
+def test_record_id_separators_rejected():
+    for bad in ("helper:a@b", "helper:a#b"):
+        registry, matrix, api = _inputs([_record(id=bad)])
+        with pytest.raises(CoverageError, match="separator"):
+            _materialize(registry, matrix, api)
+
+
+def test_record_targets_follow_registry_pattern():
+    registry, matrix, api = _inputs(
+        [_record(targets_required=["Linux-X86-64"])]
+    )
+    with pytest.raises(CoverageError, match="targets_required"):
+        _materialize(registry, matrix, api)
+    with open(
+        os.path.join(ROOT, "schemas", "capability.schema.json"),
+        encoding="utf-8",
+    ) as handle:
+        schema = json.load(handle)
+    pattern = schema["properties"]["records"]["items"]["properties"][
+        "targets_required"
+    ]["items"]["pattern"]
+    assert _TOOL.TARGET_PATTERN.pattern == pattern.strip("^$")
 
 
 def test_blocked_producer_stays_open_with_rationale():
@@ -1942,6 +2052,39 @@ def _sibling_run(tmp_path, sibling_text):
         ]
     )
     return code, out_path.exists()
+
+
+def test_cli_schema_failures_exit_cleanly(tmp_path):
+    bad_schema = tmp_path / "bad.schema.json"
+    bad_schema.write_text("[]", encoding="utf-8")
+
+    def _run(schema_path, leaf):
+        out_path = tmp_path / leaf
+        code = _TOOL.main(
+            [
+                "--registry",
+                REGISTRY_PATH,
+                "--matrix",
+                MATRIX_PATH,
+                "--api-coverage",
+                EXTRACT_PATH,
+                "--schema",
+                str(schema_path),
+                "--output",
+                str(out_path),
+            ]
+        )
+        return code, out_path.exists()
+
+    code, produced = _run(bad_schema, "out.json")
+    assert code == 1
+    assert not produced
+    code, produced = _run(
+        os.path.join(ROOT, "schemas", "capability.schema.json"),
+        "out2.json",
+    )
+    assert code == 1
+    assert not produced
 
 
 def test_cli_rejects_broken_capability_sibling(tmp_path):

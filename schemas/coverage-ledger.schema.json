@@ -357,7 +357,7 @@
               "properties": {
                 "implementation": {
                   "properties": {
-                    "state": {"const": "IMPLEMENTED"},
+                    "state": {"enum": ["IMPLEMENTED", "QUALIFIED"]},
                     "evidence_level": {"const": "tested"}
                   }
                 },

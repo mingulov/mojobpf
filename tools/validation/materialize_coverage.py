@@ -83,6 +83,8 @@ KNOWN_EVIDENCE_LEVELS = frozenset(
     {"none", "reported", "audited", "tested"}
 )
 
+TARGET_PATTERN = re.compile(r"[a-z][a-z0-9-]*")
+
 RECORD_BLOCKER_STATUSES = frozenset(
     {
         "BLOCKED_UPSTREAM",
@@ -329,12 +331,13 @@ def _rationale_of(excuse):
     return rationale
 
 
-def _combined_rationale(primary, secondary):
+def _combined_rationale(primary, secondary, secondary_label="record"):
     rationale = _rationale_of(primary)
     detail = secondary.get("detail", "")
     if detail:
-        rationale["detail"] = "%s; record: %s" % (
+        rationale["detail"] = "%s; %s: %s" % (
             rationale["detail"],
+            secondary_label,
             detail,
         )
     return rationale
@@ -375,7 +378,13 @@ def _producer_qualified(record, family_blocked):
         return False
     if family_blocked:
         return False
-    if record.get("implementation_state") != "IMPLEMENTED":
+    # QUALIFIED counts as implemented for the state gate: the
+    # owner attests completion, while the evidence, reference,
+    # and blocker gates below still apply unchanged.
+    if record.get("implementation_state") not in (
+        "IMPLEMENTED",
+        "QUALIFIED",
+    ):
         return False
     if record.get("evidence_level") != "tested":
         return False
@@ -415,6 +424,15 @@ def _consumer_qualified(producer_ok, row, contract_ok, runtime_ok):
 
 
 def _cell(record, target, path, status, package_title, rationale=None, row=None):
+    # A cell is a narrow join projection, not a record copy: it
+    # carries the coverage identity (record, target, path),
+    # status, rationale, implementation/qualification join keys,
+    # obligations, applicability evidence, legal context, and
+    # path verdicts. Registry-side compiler/registration detail
+    # (compiler_surface, btf_requirements, elf_sections,
+    # kernel_registration_refs, required_flags) stays in the
+    # registry, reachable via the record key, and next_action
+    # is workflow state, not coverage.
     obligations = {"lifecycle": []}
     cost_cases = record.get("cost_cases", [])
     if cost_cases:
@@ -479,6 +497,10 @@ def _check_records(records, packages):
         if not isinstance(ident, str) or not ident.strip():
             raise CoverageError(
                 "registry record id must be a non-blank string"
+            )
+        if "@" in ident or "#" in ident:
+            raise CoverageError(
+                f"record id {ident!r} contains a cell-id separator"
             )
         if ident in seen:
             raise CoverageError(f"duplicate record id: {ident}")
@@ -556,11 +578,11 @@ def _check_records(records, packages):
             )
         targets = record.get("targets_required", [])
         if not _string_list(targets) or any(
-            not _clean_target(target) for target in targets
+            not TARGET_PATTERN.fullmatch(target) for target in targets
         ):
             raise CoverageError(
                 f"record {ident} has malformed targets_required "
-                "(must be non-blank targets without line breaks)"
+                "(must match ^[a-z][a-z0-9-]*$)"
             )
         if len(set(targets)) != len(targets):
             raise CoverageError(
@@ -1025,6 +1047,10 @@ def materialize_coverage(registry, matrix, api_coverage):
                 f"family blocker {ident} has a non-string family"
             )
         if isinstance(family, str) and family:
+            if family in family_blockers:
+                raise CoverageError(
+                    f"duplicate family blocker for {family}"
+                )
             family_blockers[family] = blocker
     matched_blockers = {family: 0 for family in family_blockers}
 
@@ -1075,7 +1101,9 @@ def materialize_coverage(registry, matrix, api_coverage):
                 rationale = None
                 if record.get("blocker") and family_blocker:
                     rationale = _combined_rationale(
-                        record["blocker"], family_blocker
+                        record["blocker"],
+                        family_blocker,
+                        secondary_label="family",
                     )
                 elif record.get("blocker"):
                     rationale = _rationale_of(record["blocker"])
@@ -1273,14 +1301,21 @@ def main(argv=None):
 
     try:
         from jsonschema import Draft202012Validator
-        from jsonschema.exceptions import SchemaError
+        from jsonschema.exceptions import SchemaError, ValidationError
     except ImportError:
         print(
             "error: jsonschema is required to validate the ledger",
             file=sys.stderr,
         )
         return 2
-    Draft202012Validator.check_schema(schema)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        print(
+            f"error: ledger schema is invalid: {exc.message}",
+            file=sys.stderr,
+        )
+        return 1
     sidecar_path = os.path.join(
         os.path.dirname(os.path.abspath(args.schema)),
         "capability.schema.json",
@@ -1343,7 +1378,14 @@ def main(argv=None):
     except CoverageError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    Draft202012Validator(schema).validate(ledger)
+    try:
+        Draft202012Validator(schema).validate(ledger)
+    except ValidationError as exc:
+        print(
+            "error: generated ledger fails schema: %s" % exc.message,
+            file=sys.stderr,
+        )
+        return 1
     # Serialize before opening the destination: a failure must
     # never truncate an existing output.
     try:
