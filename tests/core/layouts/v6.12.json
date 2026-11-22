@@ -1,4 +1,7 @@
 {
+  "blocked_on_present": false,
+  "futex_present": false,
+  "ipi_mask_present": false,
   "kernel_deb_sha256": "3f156eab453866391b1939652829c67f4e4e9a9c18917d76751f41a26da4a330",
   "kernel_release": "6.12.0-061200-generic",
   "kernel_version": "6.12.0-061200.202411220723",

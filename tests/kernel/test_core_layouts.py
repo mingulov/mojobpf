@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """In-kernel proof for the minimal CO-RE vertical slice: one relocated
-field read plus one existence check, proven on two kernel layouts.
+field read plus one existence check, proven on five kernel layouts.
 
 Builds ``tests/core/core_read.mojo`` through the genuine pipeline
 (``mojo build --emit llvm`` -> the Lane-A adapter, or the parsed
@@ -11,6 +11,9 @@ that lane's kernel BTF. Run once per lane directly::
 
     MOJOBPF_VNG_RELEASE=v6.12 python3 tests/kernel/test_core_layouts.py
     MOJOBPF_VNG_RELEASE=v6.6 python3 tests/kernel/test_core_layouts.py
+    MOJOBPF_VNG_RELEASE=v7.0.14 python3 tests/kernel/test_core_layouts.py
+    MOJOBPF_VNG_RELEASE=v7.2 python3 tests/kernel/test_core_layouts.py
+    MOJOBPF_VNG_RELEASE=v7.4-rc1 python3 tests/kernel/test_core_layouts.py
 
 Route-equivalence runs rebuild the probe parsed::
 
@@ -19,8 +22,8 @@ Route-equivalence runs rebuild the probe parsed::
     MOJOBPF_GUEST_ROUTE=parsed MOJOBPF_VNG_RELEASE=v6.6 \\
         python3 tests/kernel/test_core_layouts.py
 
-The two direct runs share nothing but the committed source; the
-two-lane identical-bytes board is assembled from their digests.
+The direct runs share nothing but the committed source; the
+five-lane identical-bytes board is assembled from their digests.
 
 The probe performs one relocated u32 read at
 ``map_value + CO-RE(task_struct.pid)`` plus one
@@ -28,12 +31,19 @@ The probe performs one relocated u32 read at
 return arms (the exists arm folds ``0x10000`` into the masked
 read, the missing arm returns the masked read alone), and
 returns the packed observation word ``(v & 0xffff) | (ex <<
-16)``. Each lane executes a different guard arm. The guest prefills
-the 4096-byte map value with lane-agnostic markers (M66 at byte
-2456, M612 at byte 2752; zeros elsewhere, including the phony
-local offset 32), so the only way to observe the lane's marker is
-a genuine loader relocation to the lane's offset. The existence
-bit is 1 on v6.12 (scx present) and 0 on v6.6 (scx absent).
+16)``. The guest prefills the 4096-byte map value with
+lane-agnostic markers (M66 at byte 2456, M612 at byte 2752,
+M70 at byte 2800, M72 at byte 2872, M74 at byte 2936; zeros
+elsewhere, including the phony local offset 32), so the only
+way to observe the lane's marker is a genuine loader
+relocation to the lane's offset. The existence bit is 1 on
+every lane but v6.6 (scx present) and 0 on v6.6 (scx
+absent); the low 16 bits carry the lane's distinct marker,
+so every lane's observed word is unique. Lane-to-lane
+member differences beyond scx (blocked_on, futex,
+ipi_mask) are proven at the BTF-reflection layer: the
+guest oracle reports per-member presence flags that must
+match the recorded fixture exactly.
 
 Loader negatives are post-adapter textual mutations of the
 pinned-good adapted IR, asserting the loader's explicit
@@ -107,8 +117,20 @@ GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
 GUEST_MODEL_ID = "mojo-1.2.0-x86_64-bpfel-v3-minimal-v1"
 
 # Lane-agnostic prefill markers (u32, little-endian in the map value).
+# Low 16 bits are distinct per lane so every observed word is unique.
 MARKER_66 = 0xCAFE0660
 MARKER_612 = 0xCAFE0612
+MARKER_70 = 0xCAFE0700
+MARKER_72 = 0xCAFE0702
+MARKER_74 = 0xCAFE0704
+LANE_MARKERS = {
+    "v6.6": MARKER_66,
+    "v6.12": MARKER_612,
+    "v7.0.14": MARKER_70,
+    "v7.2": MARKER_72,
+    "v7.4-rc1": MARKER_74,
+}
+LANES = ("v6.6", "v6.12", "v7.0.14", "v7.2", "v7.4-rc1")
 
 # Mutant provenance: (tag, [(old, new, expected_count)], pinned log text).
 # Counts are asserted so silent IR drift fails the build loudly.
@@ -166,10 +188,10 @@ def _run_guest(argv, stage, timeout):
 
 def lane_key():
     key = VNG_RELEASE if VNG_RELEASE.startswith("v") else "v" + VNG_RELEASE
-    if key not in ("v6.6", "v6.12"):
+    if key not in LANES:
         raise EnvironmentFailure(
             "unsupported lane %r: no recorded task_struct layout "
-            "(lanes with evidence: v6.6, v6.12)" % VNG_RELEASE
+            "(lanes with evidence: %s)" % (VNG_RELEASE, ", ".join(LANES))
         )
     return key
 
@@ -210,11 +232,15 @@ def _check_layout_fixture(data, lane):
             "%s.json pid_byte_offset %r disagrees with the table"
             % (lane, data.get("pid_byte_offset"))
         )
-    if data.get("scx_present") != ("scx" in members):
-        raise EnvironmentFailure(
-            "%s.json scx_present %r disagrees with the table"
-            % (lane, data.get("scx_present"))
-        )
+    for member, field in (("scx", "scx_present"),
+                            ("blocked_on", "blocked_on_present"),
+                            ("futex", "futex_present"),
+                            ("ipi_mask", "ipi_mask_present")):
+        if data.get(field) != (member in members):
+            raise EnvironmentFailure(
+                "%s.json %s %r disagrees with the table"
+                % (lane, field, data.get(field))
+            )
     if "kernel_image_sha256" in data:
         raise EnvironmentFailure(
             "%s.json still carries the renamed kernel_image_sha256 key"
@@ -250,7 +276,7 @@ def _check_layout_fixture(data, lane):
 def load_lane_facts():
     """pid byte offset, scx presence, and member count per lane."""
     facts = {}
-    for lane in ("v6.6", "v6.12"):
+    for lane in LANES:
         path = os.path.join(LAYOUTS_DIR, lane + ".json")
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing layout file: %s" % path)
@@ -260,13 +286,16 @@ def load_lane_facts():
         facts[lane] = {
             "pid_off": members["pid"]["bits_offset"] // 8,
             "scx": "scx" in members,
+            "blocked_on": "blocked_on" in members,
+            "futex": "futex" in members,
+            "ipi_mask": "ipi_mask" in members,
             "count": data["member_count"],
         }
     return facts
 
 
 def expected_retval(lane, facts):
-    marker = MARKER_66 if lane == "v6.6" else MARKER_612
+    marker = LANE_MARKERS[lane]
     exists = 1 if facts[lane]["scx"] else 0
     return (marker & 0xFFFF) | (exists << 16)
 
@@ -412,8 +441,14 @@ STAGE="{stage}"
 EXPECTED_DIGEST="{digest}"
 OFF66={off66}
 OFF612={off612}
+OFF70={off70}
+OFF72={off72}
+OFF74={off74}
 M66={m66}
 M612={m612}
+M70={m70}
+M72={m72}
+M74={m74}
 cd "$STAGE" || exit 3
 echo "guest-kernel: $(uname -r)"
 echo "guest-stage: $STAGE"
@@ -431,12 +466,15 @@ sha256sum core.bpf.o mutant_field.bpf.o mutant_member.bpf.o mutant_type.bpf.o pk
 echo "=== case layout-oracle ==="
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > /tmp/kbtf.c 2>/tmp/kbtf.err
 dump_exit=$?
-oracle=$(python3 -c "import re; t=open('/tmp/kbtf.c').read(); i=t.find('struct task_struct {{'); b=t[i:t.find('}};',i)] if i>=0 else ''; print('ts=%d pid=%d scx=%d' % (1 if i>=0 else 0, 1 if re.search('[^_a-z]pid;', b) else 0, 1 if re.search('[^_a-z]scx;', b) else 0))")
+oracle=$(python3 -c "import re; t=open('/tmp/kbtf.c').read(); i=t.find('struct task_struct {{'); b=t[i:t.find('}};',i)] if i>=0 else ''; print('ts=%d pid=%d scx=%d blocked_on=%d futex=%d ipi_mask=%d' % (1 if i>=0 else 0, 1 if re.search('[^_a-z]pid;', b) else 0, 1 if re.search('[^_a-z]scx;', b) else 0, 1 if re.search('[^_a-z]blocked_on;', b) else 0, 1 if re.search('[^_a-z]futex;', b) else 0, 1 if re.search('[^_a-z]ipi_mask;', b) else 0))")
 ts=$(echo "$oracle" | grep -oE 'ts=[01]' | cut -d= -f2)
 pid=$(echo "$oracle" | grep -oE 'pid=[01]' | cut -d= -f2)
 scx=$(echo "$oracle" | grep -oE 'scx=[01]' | cut -d= -f2)
+blocked_on=$(echo "$oracle" | grep -oE 'blocked_on=[01]' | cut -d= -f2)
+futex=$(echo "$oracle" | grep -oE 'futex=[01]' | cut -d= -f2)
+ipi_mask=$(echo "$oracle" | grep -oE 'ipi_mask=[01]' | cut -d= -f2)
 btf_sha=$(sha256sum /sys/kernel/btf/vmlinux 2>/dev/null | cut -d' ' -f1)
-emit layout-oracle "$(printf '{{"dump_exit": %d, "task_struct": %d, "pid": %d, "scx": %d, "btf_sha256": "%s"}}' "$dump_exit" "$ts" "$pid" "$scx" "$btf_sha")"
+emit layout-oracle "$(printf '{{"dump_exit": %d, "task_struct": %d, "pid": %d, "scx": %d, "blocked_on": %d, "futex": %d, "ipi_mask": %d, "btf_sha256": "%s"}}' "$dump_exit" "$ts" "$pid" "$scx" "$blocked_on" "$futex" "$ipi_mask" "$btf_sha")"
 
 echo "=== case load ==="
 guest_digest=$(sha256sum core.bpf.o | cut -d' ' -f1)
@@ -453,12 +491,12 @@ if [ -e /sys/fs/bpf/p51_map0 ]; then map_pinned=1; else map_pinned=0; fi
 emit load "$(printf '{{"load_exit": %d, "digest_ok": %d, "prog_pinned": %d, "map_pinned": %d}}' "$load_exit" "$digest_ok" "$prog_pinned" "$map_pinned")"
 
 echo "=== case prefill ==="
-hexbytes=$(python3 -c "import struct; b=bytearray(4096); struct.pack_into('<I',b,$OFF66,$M66); struct.pack_into('<I',b,$OFF612,$M612); print(' '.join('%02x' % x for x in b))")
+hexbytes=$(python3 -c "import struct; b=bytearray(4096); struct.pack_into('<I',b,$OFF66,$M66); struct.pack_into('<I',b,$OFF612,$M612); struct.pack_into('<I',b,$OFF70,$M70); struct.pack_into('<I',b,$OFF72,$M72); struct.pack_into('<I',b,$OFF74,$M74); print(' '.join('%02x' % x for x in b))")
 bpftool map update pinned /sys/fs/bpf/p51_map0 key hex 00 00 00 00 value hex $hexbytes > /tmp/prefill.log 2>&1
 update_exit=$?
 cat /tmp/prefill.log
 bpftool map dump pinned /sys/fs/bpf/p51_map0 > /tmp/mapdump.txt 2>&1
-if tr -d '\n' < /tmp/mapdump.txt | grep -q '60 06 fe ca' && tr -d '\n' < /tmp/mapdump.txt | grep -q '12 06 fe ca'; then marker_seen=1; else marker_seen=0; fi
+if tr -d '\n' < /tmp/mapdump.txt | grep -q '60 06 fe ca' && tr -d '\n' < /tmp/mapdump.txt | grep -q '12 06 fe ca' && tr -d '\n' < /tmp/mapdump.txt | grep -q '00 07 fe ca' && tr -d '\n' < /tmp/mapdump.txt | grep -q '02 07 fe ca' && tr -d '\n' < /tmp/mapdump.txt | grep -q '04 07 fe ca'; then marker_seen=1; else marker_seen=0; fi
 emit prefill "$(printf '{{"update_exit": %d, "marker_seen": %d}}' "$update_exit" "$marker_seen")"
 
 echo "=== case run ==="
@@ -583,8 +621,14 @@ def guest_run():
         digest=digest,
         off66=facts["v6.6"]["pid_off"],
         off612=facts["v6.12"]["pid_off"],
+        off70=facts["v7.0.14"]["pid_off"],
+        off72=facts["v7.2"]["pid_off"],
+        off74=facts["v7.4-rc1"]["pid_off"],
         m66=MARKER_66,
         m612=MARKER_612,
+        m70=MARKER_70,
+        m72=MARKER_72,
+        m74=MARKER_74,
         pat_field=patterns["field"],
         pat_member=patterns["member"],
         pat_type=patterns["type"],
@@ -686,10 +730,34 @@ def test_lane_layout_facts():
     facts = executed()["facts"]
     assert facts["v6.6"]["pid_off"] == 2456, "v6.6 pid offset must be 2456"
     assert facts["v6.12"]["pid_off"] == 2752, "v6.12 pid offset must be 2752"
+    assert facts["v7.0.14"]["pid_off"] == 2800, "v7.0.14 pid offset must be 2800"
+    assert facts["v7.2"]["pid_off"] == 2872, "v7.2 pid offset must be 2872"
+    assert facts["v7.4-rc1"]["pid_off"] == 2936, "v7.4-rc1 pid offset must be 2936"
     assert facts["v6.6"]["scx"] is False, "v6.6 must lack task_struct.scx"
     assert facts["v6.12"]["scx"] is True, "v6.12 must have task_struct.scx"
+    assert facts["v7.0.14"]["scx"] is True, "v7.0.14 must have task_struct.scx"
+    assert facts["v7.2"]["scx"] is True, "v7.2 must have task_struct.scx"
+    assert facts["v7.4-rc1"]["scx"] is True, "v7.4-rc1 must have task_struct.scx"
+    assert facts["v6.6"]["blocked_on"] is False, "v6.6 must lack blocked_on"
+    assert facts["v6.12"]["blocked_on"] is False, "v6.12 must lack blocked_on"
+    assert facts["v7.0.14"]["blocked_on"] is True, "v7.0.14 must have blocked_on"
+    assert facts["v7.2"]["blocked_on"] is True, "v7.2 must have blocked_on"
+    assert facts["v7.4-rc1"]["blocked_on"] is True, "v7.4-rc1 must have blocked_on"
+    assert facts["v6.6"]["futex"] is False, "v6.6 must lack futex"
+    assert facts["v6.12"]["futex"] is False, "v6.12 must lack futex"
+    assert facts["v7.0.14"]["futex"] is False, "v7.0.14 must lack futex"
+    assert facts["v7.2"]["futex"] is True, "v7.2 must have futex"
+    assert facts["v7.4-rc1"]["futex"] is True, "v7.4-rc1 must have futex"
+    assert facts["v6.6"]["ipi_mask"] is False, "v6.6 must lack ipi_mask"
+    assert facts["v6.12"]["ipi_mask"] is False, "v6.12 must lack ipi_mask"
+    assert facts["v7.0.14"]["ipi_mask"] is False, "v7.0.14 must lack ipi_mask"
+    assert facts["v7.2"]["ipi_mask"] is False, "v7.2 must lack ipi_mask"
+    assert facts["v7.4-rc1"]["ipi_mask"] is True, "v7.4-rc1 must have ipi_mask"
     assert facts["v6.6"]["count"] == 260, "v6.6 member count must be 260"
     assert facts["v6.12"]["count"] == 270, "v6.12 member count must be 270"
+    assert facts["v7.0.14"]["count"] == 272, "v7.0.14 member count must be 272"
+    assert facts["v7.2"]["count"] == 273, "v7.2 member count must be 273"
+    assert facts["v7.4-rc1"]["count"] == 276, "v7.4-rc1 member count must be 276"
 
 
 def test_reader_relocations():
@@ -753,10 +821,12 @@ def test_layout_oracle_matches_lane():
     assert record["dump_exit"] == 0, "guest BTF dump must succeed"
     assert record["task_struct"] == 1, "target must define task_struct"
     assert record["pid"] == 1, "target task_struct must define pid"
-    lane_scx = 1 if run["facts"][run["lane"]]["scx"] else 0
-    assert record["scx"] == lane_scx, (
-        "%s: target scx presence must be %d" % (run["lane"], lane_scx)
-    )
+    for member in ("scx", "blocked_on", "futex", "ipi_mask"):
+        lane_flag = 1 if run["facts"][run["lane"]][member] else 0
+        assert record[member] == lane_flag, (
+            "%s: target %s presence must be %d"
+            % (run["lane"], member, lane_flag)
+        )
     assert re.fullmatch(r"[0-9a-f]{64}", record["btf_sha256"]), (
         "guest must retain the runtime target-BTF hash, got %r"
         % (record.get("btf_sha256"),)
@@ -781,7 +851,7 @@ def test_load_pins_program_and_map():
 def test_prefill_markers_present():
     record = executed()["results"]["prefill"]
     assert record["update_exit"] == 0, "prefill map update must succeed"
-    assert record["marker_seen"] == 1, "both markers must be visible in map"
+    assert record["marker_seen"] == 1, "all five markers must be visible in map"
 
 
 def test_relocated_read_matches_lane_marker():
@@ -789,7 +859,7 @@ def test_relocated_read_matches_lane_marker():
     record = run["results"]["run"]
     assert record["run_exit"] == 0, "test-run must succeed"
     lane = run["lane"]
-    marker = MARKER_66 if lane == "v6.6" else MARKER_612
+    marker = LANE_MARKERS[lane]
     observed = record["retval"] & 0xFFFF
     assert observed == (marker & 0xFFFF), (
         "%s: relocated read must observe marker 0x%04x, got 0x%04x "
@@ -915,7 +985,7 @@ def _load_fixture(lane):
 
 
 def test_layout_fixtures_self_consistent():
-    for lane in ("v6.6", "v6.12"):
+    for lane in LANES:
         members = _check_layout_fixture(_load_fixture(lane), lane)
         assert members["pid"]["bits_offset"] % 8 == 0, lane
 
@@ -928,12 +998,16 @@ def test_layout_fixture_gates_refuse_drift():
         ("pid_bits_offset", 8, "pid_bits_offset"),
         ("pid_byte_offset", 999, "pid_byte_offset"),
         ("scx_present", None, "scx_present"),
+        ("blocked_on_present", None, "blocked_on_present"),
+        ("futex_present", None, "futex_present"),
+        ("ipi_mask_present", None, "ipi_mask_present"),
         ("kernel_release", "6.12.0-061200-generic-64k", "kernel_release"),
         ("kernel_deb_sha256", "0" * 64, "kernel_deb_sha256"),
     ]
     for field, bad, label in cases:
-        if field == "scx_present":
-            bad = not _load_fixture("v6.12")["scx_present"]
+        if field in ("scx_present", "blocked_on_present",
+                     "futex_present", "ipi_mask_present"):
+            bad = not _load_fixture("v6.12")[field]
         data = _load_fixture("v6.12")
         data[field] = bad
         try:
@@ -981,7 +1055,7 @@ CASE_DENIALS = {}
 
 def _layouts():
     return [os.path.join(LAYOUTS_DIR, lane + ".json")
-            for lane in ("v6.6", "v6.12")]
+            for lane in LANES]
 
 
 # Durable inputs per case: absolute repo paths plus ("stage",

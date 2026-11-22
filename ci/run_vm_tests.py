@@ -170,14 +170,14 @@ SUITES = (
 # cannot provision (separate product, no provenance pin); the
 # suite runs per-suite with the env and rejoins when CI
 # provisions it. kernel-core-layouts needs recorded
-# task_struct layouts, which exist only for v6.6/v6.12; it
-# rejoins the 7.x lanes when their layouts are recorded.
+# task_struct layouts, which now exist for all five
+# KVM lanes (v6.6/v6.12/v7.0.14/v7.2/v7.4-rc1).
 LANE_SUITE_EXCLUSIONS = {
     "v6.12-kvm": ("kernel-joint",),
     "v6.6-kvm": ("kernel-joint",),
-    "v7.0.14-kvm": ("kernel-joint", "kernel-core-layouts"),
-    "v7.2-kvm": ("kernel-joint", "kernel-core-layouts"),
-    "v7.4-rc1-kvm": ("kernel-joint", "kernel-core-layouts"),
+    "v7.0.14-kvm": ("kernel-joint",),
+    "v7.2-kvm": ("kernel-joint",),
+    "v7.4-rc1-kvm": ("kernel-joint",),
     "v6.12-tcg": ("kernel-joint",),
 }
 

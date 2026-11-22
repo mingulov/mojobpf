@@ -1,0 +1,1109 @@
+{
+  "blocked_on_present": true,
+  "futex_present": true,
+  "ipi_mask_present": false,
+  "kernel_deb_sha256": "bd94fb85bfa402307040d4cd6745f7b04d467ddce1ccc312253e50f975cc38a2",
+  "kernel_release": "7.2.0-070200-generic",
+  "kernel_version": "7.2.0-070200.202608162350",
+  "lane": "v7.2",
+  "layout": "task_struct",
+  "member_count": 273,
+  "members": {
+    "__mce_reserved": {
+      "bits_offset": 77250,
+      "type_id": 91155
+    },
+    "__pad": {
+      "bits_offset": 440,
+      "type_id": 165610
+    },
+    "__state": {
+      "bits_offset": 192,
+      "type_id": 166510
+    },
+    "acct_rss_mem1": {
+      "bits_offset": 31232,
+      "type_id": 165606
+    },
+    "acct_timexpd": {
+      "bits_offset": 31360,
+      "type_id": 165606
+    },
+    "acct_vm_mem1": {
+      "bits_offset": 31296,
+      "type_id": 165606
+    },
+    "active_memcg": {
+      "bits_offset": 75776,
+      "type_id": 358
+    },
+    "active_mm": {
+      "bits_offset": 22016,
+      "type_id": 146
+    },
+    "alloc_lock": {
+      "bits_offset": 29504,
+      "type_id": 157201
+    },
+    "atomic_flags": {
+      "bits_offset": 22464,
+      "type_id": 133202
+    },
+    "audit_context": {
+      "bits_offset": 28864,
+      "type_id": 340
+    },
+    "bio_list": {
+      "bits_offset": 30272,
+      "type_id": 342
+    },
+    "blocked": {
+      "bits_offset": 28224,
+      "type_id": 155548
+    },
+    "blocked_donor": {
+      "bits_offset": 30016,
+      "type_id": 40
+    },
+    "blocked_lock": {
+      "bits_offset": 29952,
+      "type_id": 147648
+    },
+    "blocked_on": {
+      "bits_offset": 29888,
+      "type_id": 291
+    },
+    "blocker": {
+      "bits_offset": 30080,
+      "type_id": 133202
+    },
+    "bpf_ctx": {
+      "bits_offset": 76928,
+      "type_id": 364
+    },
+    "bpf_net_context": {
+      "bits_offset": 76992,
+      "type_id": 365
+    },
+    "bpf_storage": {
+      "bits_offset": 76864,
+      "type_id": 363
+    },
+    "btrace_seq": {
+      "bits_offset": 11328,
+      "type_id": 166510
+    },
+    "cache_work": {
+      "bits_offset": 34944,
+      "type_id": 103807
+    },
+    "cached_requested_key": {
+      "bits_offset": 27200,
+      "type_id": 331
+    },
+    "capture_control": {
+      "bits_offset": 30528,
+      "type_id": 346
+    },
+    "cg_list": {
+      "bits_offset": 32576,
+      "type_id": 132889
+    },
+    "cgroups": {
+      "bits_offset": 32512,
+      "type_id": 348
+    },
+    "children": {
+      "bits_offset": 23232,
+      "type_id": 132889
+    },
+    "clear_child_tid": {
+      "bits_offset": 24640,
+      "type_id": 328
+    },
+    "closid": {
+      "bits_offset": 32704,
+      "type_id": 165601
+    },
+    "comm": {
+      "bits_offset": 27264,
+      "type_id": 190
+    },
+    "core_cookie": {
+      "bits_offset": 8320,
+      "type_id": 133202
+    },
+    "core_node": {
+      "bits_offset": 8128,
+      "type_id": 147710
+    },
+    "core_occupation": {
+      "bits_offset": 8384,
+      "type_id": 166510
+    },
+    "cpus_mask": {
+      "bits_offset": 11648,
+      "type_id": 107122
+    },
+    "cpus_ptr": {
+      "bits_offset": 11520,
+      "type_id": 320
+    },
+    "cpuset_mem_spread_rotor": {
+      "bits_offset": 32480,
+      "type_id": 127162
+    },
+    "cred": {
+      "bits_offset": 27136,
+      "type_id": 330
+    },
+    "curr_ret_depth": {
+      "bits_offset": 75360,
+      "type_id": 127162
+    },
+    "curr_ret_stack": {
+      "bits_offset": 75328,
+      "type_id": 127162
+    },
+    "default_timer_slack_ns": {
+      "bits_offset": 75264,
+      "type_id": 165606
+    },
+    "delays": {
+      "bits_offset": 44224,
+      "type_id": 356
+    },
+    "dirty_paused_when": {
+      "bits_offset": 44352,
+      "type_id": 133202
+    },
+    "dl": {
+      "bits_offset": 3968,
+      "type_id": 151609
+    },
+    "dl_server": {
+      "bits_offset": 6144,
+      "type_id": 311
+    },
+    "exec_state": {
+      "bits_offset": 22080,
+      "type_id": 324
+    },
+    "exit_code": {
+      "bits_offset": 22176,
+      "type_id": 127162
+    },
+    "exit_signal": {
+      "bits_offset": 22208,
+      "type_id": 127162
+    },
+    "exit_state": {
+      "bits_offset": 22144,
+      "type_id": 127162
+    },
+    "files": {
+      "bits_offset": 27840,
+      "type_id": 334
+    },
+    "flags": {
+      "bits_offset": 352,
+      "type_id": 166510
+    },
+    "frozen": {
+      "bits_offset": 22407,
+      "type_id": 166510
+    },
+    "fs": {
+      "bits_offset": 27776,
+      "type_id": 333
+    },
+    "ftrace_sleeptime": {
+      "bits_offset": 75520,
+      "type_id": 133201
+    },
+    "ftrace_timestamp": {
+      "bits_offset": 75456,
+      "type_id": 133201
+    },
+    "futex": {
+      "bits_offset": 32768,
+      "type_id": 121962
+    },
+    "group_leader": {
+      "bits_offset": 23488,
+      "type_id": 40
+    },
+    "gtime": {
+      "bits_offset": 24896,
+      "type_id": 165606
+    },
+    "il_prev": {
+      "bits_offset": 33920,
+      "type_id": 155125
+    },
+    "il_weight": {
+      "bits_offset": 33936,
+      "type_id": 165610
+    },
+    "in_eventfd": {
+      "bits_offset": 22410,
+      "type_id": 166510
+    },
+    "in_execve": {
+      "bits_offset": 22402,
+      "type_id": 166510
+    },
+    "in_iowait": {
+      "bits_offset": 22403,
+      "type_id": 166510
+    },
+    "in_lru_fault": {
+      "bits_offset": 22405,
+      "type_id": 166510
+    },
+    "in_memstall": {
+      "bits_offset": 22409,
+      "type_id": 166510
+    },
+    "in_nf_duplicate": {
+      "bits_offset": 22414,
+      "type_id": 166510
+    },
+    "in_thrashing": {
+      "bits_offset": 22413,
+      "type_id": 166510
+    },
+    "in_ubsan": {
+      "bits_offset": 30144,
+      "type_id": 166510
+    },
+    "io_context": {
+      "bits_offset": 30464,
+      "type_id": 345
+    },
+    "io_uring": {
+      "bits_offset": 27904,
+      "type_id": 335
+    },
+    "io_uring_restrict": {
+      "bits_offset": 27968,
+      "type_id": 336
+    },
+    "ioac": {
+      "bits_offset": 30720,
+      "type_id": 158913
+    },
+    "is_blocked": {
+      "bits_offset": 432,
+      "type_id": 165610
+    },
+    "jobctl": {
+      "bits_offset": 22272,
+      "type_id": 133202
+    },
+    "journal_info": {
+      "bits_offset": 30208,
+      "type_id": 35
+    },
+    "kmap_ctrl": {
+      "bits_offset": 76096,
+      "type_id": 131788
+    },
+    "kretprobe_instances": {
+      "bits_offset": 77504,
+      "type_id": 132998
+    },
+    "l1d_flush_kill": {
+      "bits_offset": 77632,
+      "type_id": 103807
+    },
+    "last_siginfo": {
+      "bits_offset": 30656,
+      "type_id": 347
+    },
+    "last_sum_exec_runtime": {
+      "bits_offset": 34304,
+      "type_id": 165606
+    },
+    "last_switch_count": {
+      "bits_offset": 27648,
+      "type_id": 133202
+    },
+    "last_switch_time": {
+      "bits_offset": 27712,
+      "type_id": 133202
+    },
+    "last_task_numa_placement": {
+      "bits_offset": 34240,
+      "type_id": 165606
+    },
+    "last_wakee": {
+      "bits_offset": 704,
+      "type_id": 40
+    },
+    "latency_record": {
+      "bits_offset": 44480,
+      "type_id": 357
+    },
+    "latency_record_count": {
+      "bits_offset": 44416,
+      "type_id": 127162
+    },
+    "lazy_mmu_state": {
+      "bits_offset": 44160,
+      "type_id": 132552
+    },
+    "loginuid": {
+      "bits_offset": 28928,
+      "type_id": 132215
+    },
+    "maj_flt": {
+      "bits_offset": 25920,
+      "type_id": 133202
+    },
+    "max_allowed_capacity": {
+      "bits_offset": 11392,
+      "type_id": 133202
+    },
+    "mce_addr": {
+      "bits_offset": 77184,
+      "type_id": 165606
+    },
+    "mce_count": {
+      "bits_offset": 77440,
+      "type_id": 127162
+    },
+    "mce_kflags": {
+      "bits_offset": 77120,
+      "type_id": 91155
+    },
+    "mce_kill_me": {
+      "bits_offset": 77312,
+      "type_id": 103807
+    },
+    "mce_ripv": {
+      "bits_offset": 77248,
+      "type_id": 91155
+    },
+    "mce_vaddr": {
+      "bits_offset": 77056,
+      "type_id": 35
+    },
+    "mce_whole_page": {
+      "bits_offset": 77249,
+      "type_id": 91155
+    },
+    "memcg_nr_pages_over_high": {
+      "bits_offset": 75712,
+      "type_id": 166510
+    },
+    "mempolicy": {
+      "bits_offset": 33856,
+      "type_id": 352
+    },
+    "mems_allowed": {
+      "bits_offset": 31424,
+      "type_id": 139202
+    },
+    "mems_allowed_seq": {
+      "bits_offset": 32448,
+      "type_id": 153853
+    },
+    "migration_disabled": {
+      "bits_offset": 19904,
+      "type_id": 155126
+    },
+    "migration_flags": {
+      "bits_offset": 19920,
+      "type_id": 155126
+    },
+    "migration_pending": {
+      "bits_offset": 19840,
+      "type_id": 35
+    },
+    "min_flt": {
+      "bits_offset": 25856,
+      "type_id": 133202
+    },
+    "mm": {
+      "bits_offset": 21952,
+      "type_id": 146
+    },
+    "mm_cid": {
+      "bits_offset": 35456,
+      "type_id": 151712
+    },
+    "nameidata": {
+      "bits_offset": 27392,
+      "type_id": 332
+    },
+    "nivcsw": {
+      "bits_offset": 25664,
+      "type_id": 133202
+    },
+    "no_cgroup_migration": {
+      "bits_offset": 22406,
+      "type_id": 166510
+    },
+    "node_stamp": {
+      "bits_offset": 34176,
+      "type_id": 165606
+    },
+    "normal_prio": {
+      "bits_offset": 896,
+      "type_id": 127162
+    },
+    "nr_cpus_allowed": {
+      "bits_offset": 11456,
+      "type_id": 127162
+    },
+    "nr_dirtied": {
+      "bits_offset": 44288,
+      "type_id": 127162
+    },
+    "nr_dirtied_pause": {
+      "bits_offset": 44320,
+      "type_id": 127162
+    },
+    "nsproxy": {
+      "bits_offset": 28032,
+      "type_id": 337
+    },
+    "numa_faults": {
+      "bits_offset": 34560,
+      "type_id": 75
+    },
+    "numa_faults_locality": {
+      "bits_offset": 34688,
+      "type_id": 354
+    },
+    "numa_group": {
+      "bits_offset": 34496,
+      "type_id": 353
+    },
+    "numa_migrate_retry": {
+      "bits_offset": 34112,
+      "type_id": 133202
+    },
+    "numa_pages_migrated": {
+      "bits_offset": 34880,
+      "type_id": 133202
+    },
+    "numa_preferred_nid": {
+      "bits_offset": 34080,
+      "type_id": 127162
+    },
+    "numa_scan_period": {
+      "bits_offset": 34016,
+      "type_id": 166510
+    },
+    "numa_scan_period_max": {
+      "bits_offset": 34048,
+      "type_id": 166510
+    },
+    "numa_scan_seq": {
+      "bits_offset": 33984,
+      "type_id": 127162
+    },
+    "numa_work": {
+      "bits_offset": 34368,
+      "type_id": 103807
+    },
+    "nvcsw": {
+      "bits_offset": 25600,
+      "type_id": 133202
+    },
+    "objcg": {
+      "bits_offset": 75840,
+      "type_id": 359
+    },
+    "on_cpu": {
+      "bits_offset": 416,
+      "type_id": 165610
+    },
+    "on_rq": {
+      "bits_offset": 424,
+      "type_id": 165610
+    },
+    "oom_reaper_list": {
+      "bits_offset": 76288,
+      "type_id": 40
+    },
+    "oom_reaper_timer": {
+      "bits_offset": 76352,
+      "type_id": 160458
+    },
+    "pagefault_disabled": {
+      "bits_offset": 76256,
+      "type_id": 127162
+    },
+    "parent": {
+      "bits_offset": 23168,
+      "type_id": 40
+    },
+    "parent_exec_id": {
+      "bits_offset": 29376,
+      "type_id": 165606
+    },
+    "pasid_activated": {
+      "bits_offset": 22411,
+      "type_id": 166510
+    },
+    "patch_state": {
+      "bits_offset": 76768,
+      "type_id": 127162
+    },
+    "pdeath_signal": {
+      "bits_offset": 22240,
+      "type_id": 127162
+    },
+    "pending": {
+      "bits_offset": 28416,
+      "type_id": 155544
+    },
+    "perf_ctx_data": {
+      "bits_offset": 33792,
+      "type_id": 351
+    },
+    "perf_event_ctxp": {
+      "bits_offset": 33408,
+      "type_id": 350
+    },
+    "perf_event_list": {
+      "bits_offset": 33664,
+      "type_id": 132889
+    },
+    "perf_event_mutex": {
+      "bits_offset": 33472,
+      "type_id": 137154
+    },
+    "perf_recursion": {
+      "bits_offset": 33344,
+      "type_id": 349
+    },
+    "personality": {
+      "bits_offset": 22336,
+      "type_id": 166510
+    },
+    "pi_blocked_on": {
+      "bits_offset": 29824,
+      "type_id": 341
+    },
+    "pi_lock": {
+      "bits_offset": 29536,
+      "type_id": 147648
+    },
+    "pi_top_task": {
+      "bits_offset": 29760,
+      "type_id": 40
+    },
+    "pi_waiters": {
+      "bits_offset": 29632,
+      "type_id": 147718
+    },
+    "pid": {
+      "bits_offset": 22976,
+      "type_id": 143914
+    },
+    "pid_links": {
+      "bits_offset": 23872,
+      "type_id": 326
+    },
+    "plug": {
+      "bits_offset": 30336,
+      "type_id": 343
+    },
+    "policy": {
+      "bits_offset": 11360,
+      "type_id": 166510
+    },
+    "posix_cputimers": {
+      "bits_offset": 25984,
+      "type_id": 145054
+    },
+    "posix_cputimers_work": {
+      "bits_offset": 26624,
+      "type_id": 145057
+    },
+    "preempt_notifiers": {
+      "bits_offset": 11264,
+      "type_id": 123942
+    },
+    "pref_llc_queued": {
+      "bits_offset": 35104,
+      "type_id": 127162
+    },
+    "pref_node_fork": {
+      "bits_offset": 33952,
+      "type_id": 155125
+    },
+    "preferred_llc": {
+      "bits_offset": 35072,
+      "type_id": 127162
+    },
+    "prev_cputime": {
+      "bits_offset": 24960,
+      "type_id": 145494
+    },
+    "prio": {
+      "bits_offset": 832,
+      "type_id": 127162
+    },
+    "psi_flags": {
+      "bits_offset": 31168,
+      "type_id": 166510
+    },
+    "ptrace": {
+      "bits_offset": 384,
+      "type_id": 166510
+    },
+    "ptrace_entry": {
+      "bits_offset": 23680,
+      "type_id": 132889
+    },
+    "ptrace_message": {
+      "bits_offset": 30592,
+      "type_id": 133202
+    },
+    "ptraced": {
+      "bits_offset": 23552,
+      "type_id": 132889
+    },
+    "ptracer_cred": {
+      "bits_offset": 27008,
+      "type_id": 330
+    },
+    "pushable_dl_tasks": {
+      "bits_offset": 21760,
+      "type_id": 147710
+    },
+    "pushable_tasks": {
+      "bits_offset": 21440,
+      "type_id": 144437
+    },
+    "rcu": {
+      "bits_offset": 76096,
+      "type_id": 103807
+    },
+    "rcu_blocked_node": {
+      "bits_offset": 20160,
+      "type_id": 322
+    },
+    "rcu_node_entry": {
+      "bits_offset": 20032,
+      "type_id": 132889
+    },
+    "rcu_read_lock_nesting": {
+      "bits_offset": 19936,
+      "type_id": 127162
+    },
+    "rcu_read_unlock_special": {
+      "bits_offset": 19968,
+      "type_id": 147934
+    },
+    "rcu_tasks_exit_cpu": {
+      "bits_offset": 20480,
+      "type_id": 127162
+    },
+    "rcu_tasks_exit_list": {
+      "bits_offset": 20544,
+      "type_id": 132889
+    },
+    "rcu_tasks_holdout": {
+      "bits_offset": 20288,
+      "type_id": 165610
+    },
+    "rcu_tasks_holdout_list": {
+      "bits_offset": 20352,
+      "type_id": 132889
+    },
+    "rcu_tasks_idle_cpu": {
+      "bits_offset": 20320,
+      "type_id": 127162
+    },
+    "rcu_tasks_idx": {
+      "bits_offset": 20296,
+      "type_id": 165610
+    },
+    "rcu_tasks_nvcsw": {
+      "bits_offset": 20224,
+      "type_id": 133202
+    },
+    "rcu_users": {
+      "bits_offset": 76224,
+      "type_id": 148381
+    },
+    "real_blocked": {
+      "bits_offset": 28288,
+      "type_id": 155548
+    },
+    "real_cred": {
+      "bits_offset": 27072,
+      "type_id": 330
+    },
+    "real_parent": {
+      "bits_offset": 23104,
+      "type_id": 40
+    },
+    "recent_used_cpu": {
+      "bits_offset": 768,
+      "type_id": 127162
+    },
+    "reclaim_state": {
+      "bits_offset": 30400,
+      "type_id": 344
+    },
+    "reported_split_lock": {
+      "bits_offset": 22412,
+      "type_id": 166510
+    },
+    "restart_block": {
+      "bits_offset": 22528,
+      "type_id": 149552
+    },
+    "restore_sigmask": {
+      "bits_offset": 22404,
+      "type_id": 166510
+    },
+    "ret_stack": {
+      "bits_offset": 75392,
+      "type_id": 75
+    },
+    "rethooks": {
+      "bits_offset": 77568,
+      "type_id": 132998
+    },
+    "rmid": {
+      "bits_offset": 32736,
+      "type_id": 165601
+    },
+    "rseq": {
+      "bits_offset": 35136,
+      "type_id": 150390
+    },
+    "rt": {
+      "bits_offset": 3584,
+      "type_id": 151736
+    },
+    "rt_priority": {
+      "bits_offset": 928,
+      "type_id": 166510
+    },
+    "rv": {
+      "bits_offset": 77760,
+      "type_id": 366
+    },
+    "sas_ss_flags": {
+      "bits_offset": 28736,
+      "type_id": 166510
+    },
+    "sas_ss_size": {
+      "bits_offset": 28672,
+      "type_id": 155715
+    },
+    "sas_ss_sp": {
+      "bits_offset": 28608,
+      "type_id": 133202
+    },
+    "saved_sigmask": {
+      "bits_offset": 28352,
+      "type_id": 155548
+    },
+    "saved_state": {
+      "bits_offset": 224,
+      "type_id": 166510
+    },
+    "sched_class": {
+      "bits_offset": 8064,
+      "type_id": 317
+    },
+    "sched_contributes_to_load": {
+      "bits_offset": 22369,
+      "type_id": 166510
+    },
+    "sched_info": {
+      "bits_offset": 20800,
+      "type_id": 151702
+    },
+    "sched_migrated": {
+      "bits_offset": 22370,
+      "type_id": 166510
+    },
+    "sched_remote_wakeup": {
+      "bits_offset": 22400,
+      "type_id": 166510
+    },
+    "sched_reset_on_fork": {
+      "bits_offset": 22368,
+      "type_id": 166510
+    },
+    "sched_rt_mutex": {
+      "bits_offset": 22401,
+      "type_id": 166510
+    },
+    "sched_task_group": {
+      "bits_offset": 8448,
+      "type_id": 318
+    },
+    "sched_task_hot": {
+      "bits_offset": 22371,
+      "type_id": 166510
+    },
+    "sched_throttle_work": {
+      "bits_offset": 8512,
+      "type_id": 103807
+    },
+    "scx": {
+      "bits_offset": 6208,
+      "type_id": 151635
+    },
+    "se": {
+      "bits_offset": 1024,
+      "type_id": 151632
+    },
+    "seccomp": {
+      "bits_offset": 28992,
+      "type_id": 152796
+    },
+    "security": {
+      "bits_offset": 76800,
+      "type_id": 35
+    },
+    "self_exec_id": {
+      "bits_offset": 29440,
+      "type_id": 165606
+    },
+    "sequential_io": {
+      "bits_offset": 76032,
+      "type_id": 166510
+    },
+    "sequential_io_avg": {
+      "bits_offset": 76064,
+      "type_id": 166510
+    },
+    "sessionid": {
+      "bits_offset": 28960,
+      "type_id": 166510
+    },
+    "set_child_tid": {
+      "bits_offset": 24576,
+      "type_id": 328
+    },
+    "sibling": {
+      "bits_offset": 23360,
+      "type_id": 132889
+    },
+    "sighand": {
+      "bits_offset": 28160,
+      "type_id": 339
+    },
+    "signal": {
+      "bits_offset": 28096,
+      "type_id": 338
+    },
+    "splice_pipe": {
+      "bits_offset": 43968,
+      "type_id": 355
+    },
+    "stack": {
+      "bits_offset": 256,
+      "type_id": 35
+    },
+    "stack_canary": {
+      "bits_offset": 23040,
+      "type_id": 133202
+    },
+    "stack_refcount": {
+      "bits_offset": 76736,
+      "type_id": 148381
+    },
+    "stack_vm_area": {
+      "bits_offset": 76672,
+      "type_id": 362
+    },
+    "start_boottime": {
+      "bits_offset": 25792,
+      "type_id": 165606
+    },
+    "start_time": {
+      "bits_offset": 25728,
+      "type_id": 165606
+    },
+    "static_prio": {
+      "bits_offset": 864,
+      "type_id": 127162
+    },
+    "stats": {
+      "bits_offset": 9216,
+      "type_id": 151763
+    },
+    "stime": {
+      "bits_offset": 24832,
+      "type_id": 165606
+    },
+    "syscall_dispatch": {
+      "bits_offset": 29120,
+      "type_id": 158553
+    },
+    "sysvsem": {
+      "bits_offset": 27456,
+      "type_id": 158779
+    },
+    "sysvshm": {
+      "bits_offset": 27520,
+      "type_id": 158780
+    },
+    "task_frag": {
+      "bits_offset": 44032,
+      "type_id": 140278
+    },
+    "task_works": {
+      "bits_offset": 28800,
+      "type_id": 32
+    },
+    "tasks": {
+      "bits_offset": 21312,
+      "type_id": 132889
+    },
+    "tgid": {
+      "bits_offset": 23008,
+      "type_id": 143914
+    },
+    "thread": {
+      "bits_offset": 79680,
+      "type_id": 160220
+    },
+    "thread_info": {
+      "bits_offset": 0,
+      "type_id": 160214
+    },
+    "thread_node": {
+      "bits_offset": 24384,
+      "type_id": 132889
+    },
+    "thread_pid": {
+      "bits_offset": 23808,
+      "type_id": 325
+    },
+    "throttle_disk": {
+      "bits_offset": 75904,
+      "type_id": 360
+    },
+    "throttle_node": {
+      "bits_offset": 8640,
+      "type_id": 132889
+    },
+    "throttled": {
+      "bits_offset": 8768,
+      "type_id": 99132
+    },
+    "tick_dep_mask": {
+      "bits_offset": 25536,
+      "type_id": 97431
+    },
+    "timer_slack_ns": {
+      "bits_offset": 75200,
+      "type_id": 165606
+    },
+    "tlb_ubc": {
+      "bits_offset": 35648,
+      "type_id": 160580
+    },
+    "total_numa_faults": {
+      "bits_offset": 34624,
+      "type_id": 133202
+    },
+    "trace_overrun": {
+      "bits_offset": 75584,
+      "type_id": 97431
+    },
+    "trace_recursion": {
+      "bits_offset": 75648,
+      "type_id": 133202
+    },
+    "tracing_graph_pause": {
+      "bits_offset": 75616,
+      "type_id": 97431
+    },
+    "trc_reader_nesting": {
+      "bits_offset": 20672,
+      "type_id": 127162
+    },
+    "trc_reader_scp": {
+      "bits_offset": 20736,
+      "type_id": 323
+    },
+    "uclamp": {
+      "bits_offset": 8864,
+      "type_id": 319
+    },
+    "uclamp_req": {
+      "bits_offset": 8800,
+      "type_id": 319
+    },
+    "unwind_info": {
+      "bits_offset": 79360,
+      "type_id": 166539
+    },
+    "usage": {
+      "bits_offset": 320,
+      "type_id": 148381
+    },
+    "use_memdelay": {
+      "bits_offset": 22408,
+      "type_id": 166510
+    },
+    "user_cpus_ptr": {
+      "bits_offset": 11584,
+      "type_id": 321
+    },
+    "user_event_mm": {
+      "bits_offset": 79296,
+      "type_id": 367
+    },
+    "utask": {
+      "bits_offset": 75968,
+      "type_id": 361
+    },
+    "utime": {
+      "bits_offset": 24768,
+      "type_id": 165606
+    },
+    "vfork_done": {
+      "bits_offset": 24512,
+      "type_id": 327
+    },
+    "vtime": {
+      "bits_offset": 25152,
+      "type_id": 169411
+    },
+    "wake_cpu": {
+      "bits_offset": 800,
+      "type_id": 127162
+    },
+    "wake_entry": {
+      "bits_offset": 448,
+      "type_id": 85546
+    },
+    "wake_q": {
+      "bits_offset": 29568,
+      "type_id": 169505
+    },
+    "wakee_flip_decay_ts": {
+      "bits_offset": 640,
+      "type_id": 133202
+    },
+    "wakee_flips": {
+      "bits_offset": 576,
+      "type_id": 166510
+    },
+    "worker_private": {
+      "bits_offset": 24704,
+      "type_id": 35
+    }
+  },
+  "pid_bits_offset": 22976,
+  "pid_byte_offset": 2872,
+  "provenance": "Member table extracted from /sys/kernel/btf/vmlinux inside a disposable virtme-ng guest running the pinned kernel deb (see ci/kernels.lock.json), via `bpftool btf dump file /sys/kernel/btf/vmlinux format raw` on 2026-11-21. Offsets are facts about that build, recorded here for the CO-RE oracle; they are not kernel source.",
+  "scx_present": true
+}
