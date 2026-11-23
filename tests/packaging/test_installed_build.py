@@ -45,6 +45,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 
 REPO_ROOT = os.path.dirname(
@@ -411,27 +412,66 @@ def test_installed_doctor_reports_venv_paths():
     # The venv reuses its base interpreter's standard library, so
     # when the driving interpreter itself lives under the checkout
     # (a project-local .venv or .pixi environment) those stdlib
-    # entries legitimately contain the repo root. Only the base's
-    # own directories are excused; any other repo-rooted entry is
-    # a source leak and still fails. The '' entry resolves against
-    # the child's working directory (the fixture-owned work dir).
-    base_roots = {
-        os.path.realpath(sys.prefix),
-        os.path.realpath(sys.exec_prefix),
+    # entries legitimately contain the repo root. Exactly the
+    # base's stdlib search paths are excused -- never the whole
+    # prefix (which could harbor copied sources) and never base
+    # site-packages (absent from a clean venv). Any other
+    # repo-rooted entry (including the root itself) is a source
+    # leak and still fails. Every relative entry resolves against
+    # the child's working directory (the fixture-owned work dir),
+    # never the runner's.
+    # A clean consumer venv inherits its base interpreter's
+    # search paths: the stdlib archive, both stdlib roots, and
+    # the extension-modules directory (observed
+    # '<platstdlib>/lib-dynload' on Linux; the stdlib-root twin
+    # covers split layouts). The base prefix is used, never the
+    # driver's own: under a venv driver plain sysconfig names a
+    # venv-local platstdlib the interpreter never searches, and
+    # inherited PYTHONPATH reaches the driver's sys.path, so a
+    # sys.path-liveness filter would trust contamination --
+    # neither source is used. Across every default install
+    # scheme stdlib/platstdlib derive purely from base/platbase
+    # plus the version, so the override is portable. Membership
+    # stays exact -- no prefix subtree, no base site-packages.
+    _base_vars = {
+        "base": sys.base_prefix,
+        "platbase": sys.base_exec_prefix,
+    }
+    _stdlib = sysconfig.get_path("stdlib", vars=_base_vars)
+    _platstdlib = sysconfig.get_path("platstdlib", vars=_base_vars)
+    _candidates = [
+        _stdlib,
+        _platstdlib,
+        os.path.join(
+            os.path.dirname(_stdlib),
+            "python%d%d.zip" % sys.version_info[:2],
+        ),
+        os.path.join(_platstdlib, "lib-dynload"),
+        os.path.join(_stdlib, "lib-dynload"),
+    ]
+    # A candidate that is itself a symlink (a planted
+    # 'python311.zip -> REPO_ROOT' would otherwise smuggle the
+    # checkout into the exemption via realpath) is dropped
+    # outright; the refusal fails closed.
+    allowed = {
+        os.path.realpath(path)
+        for path in _candidates
+        if not os.path.islink(path)
     }
     repo_root = os.path.realpath(REPO_ROOT)
     leaked = []
     for entry in ast.literal_eval(proc.stdout.strip()):
-        candidate = entry or fix["work"]
-        real = os.path.realpath(candidate)
+        if os.path.isabs(entry):
+            real = os.path.realpath(entry)
+        else:
+            real = os.path.realpath(
+                os.path.join(fix["work"], entry)
+            )
         if real != repo_root and not real.startswith(
             repo_root + os.sep
         ):
             continue
-        if any(
-            real == root or real.startswith(root + os.sep)
-            for root in base_roots
-        ):
+        if real in allowed:
             continue
         leaked.append(entry)
     assert not leaked, (leaked, proc.stdout)

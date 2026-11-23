@@ -76,6 +76,7 @@ checks report required-unavailable loudly, never a silent
 skip and never a pass.
 """
 
+import ast
 import atexit
 import hashlib
 import json
@@ -85,6 +86,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 
 REPO_ROOT = os.path.dirname(
@@ -97,6 +99,7 @@ sys.path.insert(
     0, os.path.join(REPO_ROOT, "src")
 )
 from mojobpf import execution  # noqa: E402
+from mojobpf.toolchain import DISCOVERY_ARGV  # noqa: E402
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
 import tool_admission  # noqa: E402
@@ -427,6 +430,15 @@ def _probe_tool(name, env):
                 allow_path_lookup=False,
                 forms=execution.DEFAULT_FORMS,
                 probe_version=True,
+                # Toolchain tools are measured with their
+                # admission spelling (a tool reporting
+                # different strings per spelling would
+                # otherwise pin one and refuse the other);
+                # auxiliary tools such as vng keep the
+                # default probe the rig always used.
+                version_argv=tuple(
+                    DISCOVERY_ARGV.get(name, (name, "--version"))[1:]
+                ),
                 trust_root="bootstrap",
             ),
             execution.ExecutionPins(
@@ -509,6 +521,9 @@ def _admit_tool(name, path, expected, env, timeout=120):
                 allow_path_lookup=False,
                 forms=execution.DEFAULT_FORMS,
                 probe_version=True,
+                version_argv=tuple(
+                    DISCOVERY_ARGV.get(name, (name, "--version"))[1:]
+                ),
                 trust_root="independent-pins",
             ),
             execution.ExecutionPins(
@@ -644,14 +659,19 @@ def _installed_adapter_dir(venv):
     )
 
 
-def _write_consumer_lockfile(project, mojo, llc, trust,
+def _write_consumer_lockfile(project, mojo, llc, bpftool, trust,
                              adapter_pins=None):
     """Pin the consumer's toolchain plus its trust origin.
 
     ``trust`` is ``{"status": "admitted"|"bootstrap", ...}``:
     admitted pins were checked against the independently recorded
     compiler pins before execution; bootstrap pins are PATH
-    self-pins and never qualify as independently trusted.
+    self-pins and never qualify as independently trusted. The
+    trust status covers the compilers (which shape the
+    artifact); the bpftool pin is measured from PATH in both
+    modes as a same-machine consistency record (builds validate
+    it but never spawn it), while guest-side bpftool keeps its
+    own reviewed pins.
     """
     admitted = trust.get("status") == "admitted"
     document = {
@@ -665,6 +685,11 @@ def _write_consumer_lockfile(project, mojo, llc, trust,
         "status": trust["status"],
         "trust": dict(trust),
         "tools": {
+            "bpftool": {
+                "exec_sha256": bpftool["exec_sha256"],
+                "sha256": bpftool["sha256"],
+                "version": bpftool["version"],
+            },
             "llc": {
                 "exec_sha256": llc["exec_sha256"],
                 "sha256": llc["sha256"],
@@ -718,7 +743,7 @@ def fixture():
         return _FIXTURE
     independent = _load_independent_pins()
     if independent is None:
-        for tool in ("mojo", "llc"):
+        for tool in ("mojo", "llc", "bpftool"):
             if shutil.which(tool) is None:
                 raise EnvironmentFailure(
                     "%s not found on PATH" % tool
@@ -828,8 +853,12 @@ def fixture():
     mojo["home"] = home
     if home is not None:
         env["MODULAR_HOME"] = home
+    # Builds validate (never spawn) bpftool, so the consumer
+    # lockfile pins the PATH-resolved tool in both modes; see
+    # _write_consumer_lockfile for the trust boundary.
+    bpftool = _probe_tool("bpftool", env)
     lockfile_path = _write_consumer_lockfile(
-        project, mojo, llc, trust, adapter_pins
+        project, mojo, llc, bpftool, trust, adapter_pins
     )
     manifest_path = os.path.join(project, "mojobpf.toml")
     out_dir = os.path.join(work, "out")
@@ -936,7 +965,71 @@ def test_consumer_toolchain_resolved_path_only():
         60,
     )
     assert proc.returncode == 0, proc.stderr
-    assert REPO_ROOT not in proc.stdout, proc.stdout
+    # The consumer venv reuses its base interpreter's standard
+    # library, so when the driving interpreter itself lives under
+    # the checkout those stdlib entries legitimately contain the
+    # repo root. Exactly the base's stdlib search paths are
+    # excused -- never the whole prefix (which could harbor
+    # copied sources) and never base site-packages (absent from
+    # a clean venv). Any other repo-rooted entry (including the
+    # root itself) is a source leak and still fails. Every
+    # relative entry resolves against the child's working
+    # directory (the fixture-owned project), never the runner's.
+    # A clean consumer venv inherits its base interpreter's
+    # search paths: the stdlib archive, both stdlib roots, and
+    # the extension-modules directory (observed
+    # '<platstdlib>/lib-dynload' on Linux; the stdlib-root twin
+    # covers split layouts). The base prefix is used, never the
+    # driver's own: under a venv driver plain sysconfig names a
+    # venv-local platstdlib the interpreter never searches, and
+    # inherited PYTHONPATH reaches the driver's sys.path, so a
+    # sys.path-liveness filter would trust contamination --
+    # neither source is used. Across every default install
+    # scheme stdlib/platstdlib derive purely from base/platbase
+    # plus the version, so the override is portable. Membership
+    # stays exact -- no prefix subtree, no base site-packages.
+    _base_vars = {
+        "base": sys.base_prefix,
+        "platbase": sys.base_exec_prefix,
+    }
+    _stdlib = sysconfig.get_path("stdlib", vars=_base_vars)
+    _platstdlib = sysconfig.get_path("platstdlib", vars=_base_vars)
+    _candidates = [
+        _stdlib,
+        _platstdlib,
+        os.path.join(
+            os.path.dirname(_stdlib),
+            "python%d%d.zip" % sys.version_info[:2],
+        ),
+        os.path.join(_platstdlib, "lib-dynload"),
+        os.path.join(_stdlib, "lib-dynload"),
+    ]
+    # A candidate that is itself a symlink (a planted
+    # 'python311.zip -> REPO_ROOT' would otherwise smuggle the
+    # checkout into the exemption via realpath) is dropped
+    # outright; the refusal fails closed.
+    allowed = {
+        os.path.realpath(path)
+        for path in _candidates
+        if not os.path.islink(path)
+    }
+    repo_root = os.path.realpath(REPO_ROOT)
+    leaked = []
+    for entry in ast.literal_eval(proc.stdout.strip()):
+        if os.path.isabs(entry):
+            real = os.path.realpath(entry)
+        else:
+            real = os.path.realpath(
+                os.path.join(fix["project"], entry)
+            )
+        if real != repo_root and not real.startswith(
+            repo_root + os.sep
+        ):
+            continue
+        if real in allowed:
+            continue
+        leaked.append(entry)
+    assert not leaked, (leaked, proc.stdout)
     proc = _run(
         [fix["venv_mojobpf"], "doctor", "--json"],
         fix["project"],
@@ -2833,8 +2926,13 @@ def test_consumer_admits_independent_prefix():
             "prefix": independent["prefix"],
             "status": "admitted",
         }
+        bpftool = {
+            "exec_sha256": None,
+            "sha256": "6" * 64,
+            "version": "bpftool v0.0-fake",
+        }
         lockfile_path = _write_consumer_lockfile(
-            project, mojo, llc, trust
+            project, mojo, llc, bpftool, trust
         )
         with open(lockfile_path, encoding="utf-8") as handle:
             document = json.load(handle)
@@ -3109,8 +3207,13 @@ def test_consumer_bootstrap_without_independent_pins():
             "sha256": _sha256_file(prefix["llc"]),
             "version": prefix["llc_version"],
         }
+        bpftool = {
+            "exec_sha256": None,
+            "sha256": "6" * 64,
+            "version": "bpftool v0.0-fake",
+        }
         lockfile_path = _write_consumer_lockfile(
-            project, mojo, llc, _bootstrap_trust()
+            project, mojo, llc, bpftool, _bootstrap_trust()
         )
         with open(lockfile_path, encoding="utf-8") as handle:
             document = json.load(handle)
@@ -3139,8 +3242,13 @@ def test_consumer_self_pin_is_not_a_trust_root():
             "sha256": _sha256_file(prefix["llc"]),
             "version": prefix["llc_version"],
         }
+        bpftool = {
+            "exec_sha256": None,
+            "sha256": "6" * 64,
+            "version": "bpftool v0.0-fake",
+        }
         self_pin = _write_consumer_lockfile(
-            project, mojo, llc, _bootstrap_trust()
+            project, mojo, llc, bpftool, _bootstrap_trust()
         )
         os.environ[CONSUMER_PREFIX_ENV] = prefix["bin"]
         os.environ[CONSUMER_PINS_ENV] = self_pin
@@ -3182,21 +3290,27 @@ def test_consumer_lockfile_schema_for_build():
             "sha256": _sha256_file(prefix["llc"]),
             "version": prefix["llc_version"],
         }
+        bpftool = {
+            "exec_sha256": None,
+            "sha256": "6" * 64,
+            "version": "bpftool v0.0-fake",
+        }
         lockfile_path = _write_consumer_lockfile(
-            project, mojo, llc, _bootstrap_trust()
+            project, mojo, llc, bpftool, _bootstrap_trust()
         )
         with open(lockfile_path, "rb") as handle:
             raw = handle.read()
         assert REPO_ROOT.encode() not in raw
         document = json.loads(raw.decode("utf-8"))
         assert document["schema_version"] == 1
-        assert set(document["tools"]) == {"llc", "mojo"}
-        for name in ("llc", "mojo"):
+        assert set(document["tools"]) == {"bpftool", "llc", "mojo"}
+        for name in ("bpftool", "llc", "mojo"):
             entry = document["tools"][name]
             assert isinstance(entry["version"], str), entry
             assert isinstance(entry["sha256"], str), entry
             assert "exec_sha256" in entry, entry
         assert document["tools"]["llc"]["exec_sha256"] is None
+        assert document["tools"]["bpftool"]["exec_sha256"] is None
     finally:
         _restore_consumer_env(saved)
         shutil.rmtree(workdir, ignore_errors=True)
