@@ -4330,7 +4330,157 @@ def test_merge_shards_combines_lanes_and_results():
         ]
         assert len(merged["results"]) == 2 * len(runner.SUITES)
         assert merged["merged_from"] == [first, second]
+        assert merged["scope"] is None
         print("PASS merge combines shards")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _scoped_outcomes():
+    return (
+        ("kernel-xdp", "pass"),
+        ("kernel-map", "pass"),
+        ("kernel-isa-cpu", "pass"),
+    )
+
+
+def test_merge_scoped_accepts_exact_scope():
+    # A scoped merge accepts lanes covering exactly the
+    # declared set and labels the board with its scope, so a
+    # partial board is never mistaken for a full one. Real
+    # lane ids (which carry map exclusions) prove the tally
+    # counts the scope only: unscoped tally code would print
+    # the map exclusions here.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report("v6.6-kvm", outcomes=_scoped_outcomes()),
+        )
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report("v6.12-kvm", outcomes=_scoped_outcomes()),
+        )
+        out = os.path.join(workdir, "merged")
+        import io
+        from contextlib import redirect_stdout
+
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            assert runner.main(
+                ["--merge", first, second, "--out-dir", out,
+                 "--expect-suites",
+                 "kernel-xdp,kernel-map,kernel-isa-cpu"]
+            ) == 0
+        stdout = printed.getvalue()
+        assert "matrix scope (3 suites)" in stdout, stdout
+        assert "(0 excluded)" in stdout, stdout
+        with open(
+            os.path.join(out, "matrix-report.json"), encoding="utf-8"
+        ) as handle:
+            merged = json.load(handle)
+        assert merged["scope"] == [
+            "kernel-isa-cpu", "kernel-map", "kernel-xdp",
+        ], merged
+        assert len(merged["results"]) == 6, merged
+        print("PASS scoped merge accepts exact scope")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_scoped_refuses_missing_cell():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "lane-a",
+                outcomes=(
+                    ("kernel-xdp", "pass"),
+                    ("kernel-map", "pass"),
+                ),
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--merge", first, "--out-dir", out,
+             "--expect-suites",
+             "kernel-xdp,kernel-map,kernel-isa-cpu"],
+            out,
+        )
+        assert "scoped merges require exactly" in message, message
+        print("PASS scoped merge refuses missing cell")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_scoped_refuses_unknown_suite():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report("lane-a", outcomes=_scoped_outcomes()),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--merge", first, "--out-dir", out,
+             "--expect-suites", "kernel-xdp,bogus-suite"],
+            out,
+        )
+        assert "unknown suite" in message, message
+        print("PASS scoped merge refuses unknown suite")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_scoped_refuses_excluded_suite():
+    # A scope naming a suite the lane bars refuses instead of
+    # boarding an excluded cell.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report(
+                "v6.12-kvm",
+                outcomes=(("kernel-percpu-hash", "pass"),),
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--merge", first, "--out-dir", out,
+             "--expect-suites", "kernel-percpu-hash"],
+            out,
+        )
+        assert "excluded on lane" in message, message
+        print("PASS scoped merge refuses excluded suite")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_scoped_refuses_empty_scope():
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_report(
+            workdir, "a.json",
+            _shard_report("lane-a", outcomes=_scoped_outcomes()),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--merge", first, "--out-dir", out,
+             "--expect-suites", ""],
+            out,
+        )
+        assert "empty suite scope" in message, message
+        print("PASS scoped merge refuses empty scope")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -6841,6 +6991,24 @@ def test_main_refuses_expect_lanes_without_merge():
         )
         assert "--expect-lanes needs --merge" in message, message
         print("PASS main refuses expect-lanes without merge")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_main_refuses_expect_suites_without_merge():
+    # --expect-suites without --merge refuses (exit 2,
+    # single prefixed line) with no side effects.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner,
+            ["--expect-suites", "kernel-xdp", "--out-dir", out],
+            out,
+        )
+        assert "--expect-suites needs --merge" in message, message
+        print("PASS main refuses expect-suites without merge")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

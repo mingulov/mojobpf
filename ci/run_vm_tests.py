@@ -1069,7 +1069,7 @@ def _merged_depth(value) -> int:
     return deepest
 
 
-def merge_reports(paths, out_dir, expect_lanes=None):
+def merge_reports(paths, out_dir, expect_lanes=None, expect_suites=None):
     """Merge per-shard boards into one; return the process exit code.
 
     Every shard must test the same commit under the same runner,
@@ -1095,6 +1095,13 @@ def merge_reports(paths, out_dir, expect_lanes=None):
     nesting is bounded explicitly (``_MAX_MERGED_DEPTH``) before
     serialization, so a corrupt deep shard refuses with
     ``cannot write report`` instead of crashing a re-load.
+    When ``expect_suites`` names a scope, every merged lane
+    must cover exactly that set instead (same exactness, scoped
+    verdict: missing or extra cells refuse), and the board
+    records the scope so a scoped board is never mistaken for
+    a full one. Scopes list runnable suites: naming a suite the
+    lane's exclusion map bars refuses, and tallies count the
+    scope only.
     """
     if not paths:
         raise SetupFailure("merge needs at least one shard report")
@@ -1201,27 +1208,54 @@ def merge_reports(paths, out_dir, expect_lanes=None):
             "exclusion map names unknown suite(s) %s"
             % (sorted(unknown),)
         )
+    scope = None
+    if expect_suites is not None:
+        scope = set(expect_suites)
+        if not scope:
+            raise SetupFailure(
+                "empty suite scope merges nothing; refusing"
+            )
+        unknown = scope - want_suites
+        if unknown:
+            raise SetupFailure(
+                "suite scope names unknown suite(s) %s"
+                % (sorted(unknown),)
+            )
     covered: dict[str, set[str]] = {}
     for item in results:
         covered.setdefault(item.get("lane"), set()).add(
             item.get("suite")
         )
     for lane_id in sorted(seen_lanes):
-        want = want_suites - set(
-            LANE_SUITE_EXCLUSIONS.get(lane_id, ())
-        )
+        if scope is not None:
+            want = set(scope)
+            excuse = "scoped merges require exactly the declared set"
+            barred = want & set(
+                LANE_SUITE_EXCLUSIONS.get(lane_id, ())
+            )
+            if barred:
+                raise SetupFailure(
+                    "suite scope names suite(s) %s excluded on "
+                    "lane %r; scopes list runnable suites"
+                    % (sorted(barred), lane_id)
+                )
+        else:
+            want = want_suites - set(
+                LANE_SUITE_EXCLUSIONS.get(lane_id, ())
+            )
+            excuse = "only pinned exclusions excuse absent cells"
         got = covered.get(lane_id, set())
         if got != want:
             raise SetupFailure(
                 "lane %r covers %d of %d suites (missing %s, "
-                "extra %s); only pinned exclusions excuse "
-                "absent cells"
+                "extra %s); %s"
                 % (
                     lane_id,
                     len(got & want),
                     len(want),
                     sorted(want - got),
                     sorted(got - want),
+                    excuse,
                 )
             )
     total_elapsed = sum(
@@ -1252,6 +1286,9 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         "results": results,
         "merged_from": [str(entry) for entry in paths],
         "elapsed_secs": round(total_elapsed, 1),
+        # A scoped board labels its scope so it is never
+        # mistaken for a full one; full merges record null.
+        "scope": sorted(scope) if scope is not None else None,
     }
     report_path = os.path.join(out_dir, "matrix-report.json")
     depth = _merged_depth(merged)
@@ -1274,13 +1311,22 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         )
     print("matrix board (commit %s, merged %d shards):"
           % (merged["commit"], len(shards)))
+    if scope is not None:
+        print("matrix scope (%d suites): %s"
+              % (len(scope), " ".join(sorted(scope))))
     excluded_cells = 0
     for lane in lanes:
         row = []
-        skipped = sorted(
-            set(LANE_SUITE_EXCLUSIONS.get(lane.get("id"), ()))
-            & want_suites
-        )
+        if scope is not None:
+            # Scoped boards count their scope only: map
+            # exclusions outside it are not this board's cells
+            # (a scope naming one refuses above).
+            skipped = []
+        else:
+            skipped = sorted(
+                set(LANE_SUITE_EXCLUSIONS.get(lane.get("id"), ()))
+                & want_suites
+            )
         excluded_cells += len(skipped)
         for item in results:
             if item.get("lane") == lane.get("id"):
@@ -2971,6 +3017,14 @@ def build_parser():
         help="comma-separated lane ids the merge must cover exactly "
         "(a missing shard refuses instead of merging silently)",
     )
+    parser.add_argument(
+        "--expect-suites",
+        default=None,
+        metavar="SUITES",
+        help="comma-separated suite ids every merged lane must cover "
+        "exactly (a scoped board; without it every lane must cover "
+        "the registry minus its pinned exclusions)",
+    )
     return parser
 
 
@@ -3013,8 +3067,20 @@ def main(argv=None):
                 for lane in args.expect_lanes.split(",")
                 if lane.strip()
             ]
+        scope = None
+        if args.expect_suites is not None:
+            # Unlike lanes (grandfathered leniency), an empty
+            # scope refuses: --expect-suites "" almost surely
+            # means an unexpanded variable, never "merge all".
+            scope = [
+                suite.strip()
+                for suite in args.expect_suites.split(",")
+                if suite.strip()
+            ]
         try:
-            return merge_reports(args.merge, out_dir, expect)
+            return merge_reports(
+                args.merge, out_dir, expect, scope
+            )
         except SetupFailure as exc:
             if created_default:
                 try:
@@ -3031,6 +3097,11 @@ def main(argv=None):
     if args.expect_lanes:
         sys.stderr.write(
             "run_vm_tests: --expect-lanes needs --merge\n"
+        )
+        return EXIT_SETUP
+    if args.expect_suites is not None:
+        sys.stderr.write(
+            "run_vm_tests: --expect-suites needs --merge\n"
         )
         return EXIT_SETUP
     try:
