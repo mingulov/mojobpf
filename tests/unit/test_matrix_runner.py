@@ -6129,10 +6129,11 @@ def test_merge_refuses_partial_suite_coverage():
 
 def test_merge_accepts_pinned_exclusions():
     # A lane missing exactly its pinned exclusions merges: the
-    # exclusion map (not silence) explains the absent cells. Since
-    # recorded 7.x task_struct layouts landed, every KVM lane
-    # excludes exactly kernel-joint (kernel-core-layouts runs
-    # everywhere).
+    # exclusion map (not silence) explains the absent cells.
+    # Every lane currently excludes kernel-joint (unprovisionable
+    # interop) and kernel-percpu-hash (unadmitted kind);
+    # kernel-core-layouts runs everywhere since recorded 7.x
+    # layouts landed.
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
@@ -6141,7 +6142,8 @@ def test_merge_accepts_pinned_exclusions():
             _shard_report(
                 "v6.12-kvm",
                 outcomes=_full_outcomes(
-                    runner, skip=("kernel-joint",)
+                    runner,
+                    skip=("kernel-joint", "kernel-percpu-hash"),
                 ),
             ),
         )
@@ -6150,7 +6152,8 @@ def test_merge_accepts_pinned_exclusions():
             _shard_report(
                 "v7.2-kvm",
                 outcomes=_full_outcomes(
-                    runner, skip=("kernel-joint",)
+                    runner,
+                    skip=("kernel-joint", "kernel-percpu-hash"),
                 ),
             ),
         )
@@ -6167,6 +6170,9 @@ def test_merge_accepts_pinned_exclusions():
 def test_merge_refuses_beyond_pinned_exclusions():
     # A lane missing more than its pinned exclusions refuses:
     # the map excuses exactly its cells, never a wider hole.
+    # The fixture omits exactly one runnable suite on top of
+    # every pinned exclusion, so the refusal isolates the
+    # missing-cell check (an extras-only matcher would merge).
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
@@ -6176,7 +6182,11 @@ def test_merge_refuses_beyond_pinned_exclusions():
                 "v6.12-kvm",
                 outcomes=_full_outcomes(
                     runner,
-                    skip=("kernel-joint", "kernel-xdp"),
+                    skip=(
+                        "kernel-joint",
+                        "kernel-percpu-hash",
+                        "kernel-xdp",
+                    ),
                 ),
             ),
         )

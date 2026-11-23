@@ -105,8 +105,9 @@ def test_arch_portability_stays_out_of_the_matrix(lanes):
 
 def test_matrix_exclusions_are_pinned_and_valid():
     # The matrix's honest gaps: kernel-joint (CI cannot
-    # provision the libbpf-mojo checkout plus .so) on all six
-    # lanes. Layouts are recorded for every KVM lane, so
+    # provision the libbpf-mojo checkout plus .so) and
+    # kernel-percpu-hash (no profile admits the kind) on all
+    # six lanes. Layouts are recorded for every KVM lane, so
     # kernel-core-layouts runs everywhere. Exact contents pinned:
     # widening an exclusion silently shrinks the gate, and an
     # exclusion for a lane or suite that does not exist is a
@@ -117,12 +118,12 @@ def test_matrix_exclusions_are_pinned_and_valid():
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
     assert runner.LANE_SUITE_EXCLUSIONS == {
-        'v6.12-kvm': ('kernel-joint',),
-        'v6.6-kvm': ('kernel-joint',),
-        'v7.0.14-kvm': ('kernel-joint',),
-        'v7.2-kvm': ('kernel-joint',),
-        'v7.4-rc1-kvm': ('kernel-joint',),
-        'v6.12-tcg': ('kernel-joint',),
+        'v6.12-kvm': ('kernel-joint', 'kernel-percpu-hash'),
+        'v6.6-kvm': ('kernel-joint', 'kernel-percpu-hash'),
+        'v7.0.14-kvm': ('kernel-joint', 'kernel-percpu-hash'),
+        'v7.2-kvm': ('kernel-joint', 'kernel-percpu-hash'),
+        'v7.4-rc1-kvm': ('kernel-joint', 'kernel-percpu-hash'),
+        'v6.12-tcg': ('kernel-joint', 'kernel-percpu-hash'),
     }
     lock = json.loads(
         (ROOT / 'ci' / 'kernels.lock.json').read_text(encoding='utf-8')

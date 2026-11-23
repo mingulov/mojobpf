@@ -172,13 +172,18 @@ SUITES = (
 # provisions it. kernel-core-layouts needs recorded
 # task_struct layouts, which now exist for all five
 # KVM lanes (v6.6/v6.12/v7.0.14/v7.2/v7.4-rc1).
+# kernel-percpu-hash is excluded everywhere: no profile admits
+# the per-CPU-hash kind (MBPF101 at inspection/preflight), so the
+# suite has no parsed-route proof (its parsed route refuses by
+# design); its lane-a direct-build cases stay out of the release
+# gate. It rejoins if a profile ever admits the kind.
 LANE_SUITE_EXCLUSIONS = {
-    "v6.12-kvm": ("kernel-joint",),
-    "v6.6-kvm": ("kernel-joint",),
-    "v7.0.14-kvm": ("kernel-joint",),
-    "v7.2-kvm": ("kernel-joint",),
-    "v7.4-rc1-kvm": ("kernel-joint",),
-    "v6.12-tcg": ("kernel-joint",),
+    "v6.12-kvm": ("kernel-joint", "kernel-percpu-hash"),
+    "v6.6-kvm": ("kernel-joint", "kernel-percpu-hash"),
+    "v7.0.14-kvm": ("kernel-joint", "kernel-percpu-hash"),
+    "v7.2-kvm": ("kernel-joint", "kernel-percpu-hash"),
+    "v7.4-rc1-kvm": ("kernel-joint", "kernel-percpu-hash"),
+    "v6.12-tcg": ("kernel-joint", "kernel-percpu-hash"),
 }
 
 # Pinned plan case IDs per suite (the matrix's independent
