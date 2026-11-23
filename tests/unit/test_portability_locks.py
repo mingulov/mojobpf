@@ -704,6 +704,12 @@ def test_doctor_inventory_is_not_pin_admission():
             item.code for item in report.diagnostics
         ]
         for item in report.tools:
+            if item.name == "python":
+                # The ambient interpreter is observed statically,
+                # never pin-matched: its running version reports
+                # even when every gated pin mismatches.
+                assert item.version is not None, item
+                continue
             assert item.version is None, item
         assert not os.path.exists(marker), (
             "pin mismatch must reject before any probe executes"
@@ -996,6 +1002,98 @@ def test_ci_python_installs_are_hashed():
         assert len(hashes) >= 10, block
         for digest in hashes:
             assert len(digest) == 64, digest
+
+
+def _parse_hash_stanzas(text):
+    """Map package names to (version, frozenset-of-hashes)."""
+    import re
+
+    pkgs = {}
+    current, version, hashes = None, None, []
+    for line in text.splitlines():
+        match = re.match(
+            r"\s*([A-Za-z0-9_.-]+)==([0-9.]+)\s*(\\\s*)?$", line
+        )
+        if match is not None:
+            if current is not None:
+                pkgs[current] = (version, frozenset(hashes))
+            current, version, hashes = (
+                match.group(1), match.group(2), [],
+            )
+            continue
+        found = re.search(r"--hash=sha256:([0-9a-f]{64})", line)
+        if found is not None and current is not None:
+            hashes.append(found.group(1))
+    if current is not None:
+        pkgs[current] = (version, frozenset(hashes))
+    return pkgs
+
+
+def test_canonical_test_env_pins_match_everywhere():
+    import importlib.util
+    import re
+
+    workflow = _read_workflow()
+    wf_python = re.search(
+        r'PYTHON_VERSION: "([^"]+)"', workflow
+    ).group(1)
+    wf_sha = re.search(
+        r'PYTHON_SHA256: "([0-9a-f]{64})"', workflow
+    ).group(1)
+    wf_url = re.search(r'PYTHON_URL: "([^"]+)"', workflow).group(1)
+    wf_pkgs = {}
+    chunks = workflow.split("<<'EOF'")
+    assert len(chunks) == 4, "one hashed block per pip job"
+    for chunk in chunks[1:]:
+        lines = []
+        for line in chunk.splitlines()[1:]:
+            if line.strip() == "EOF":
+                break
+            lines.append(line)
+        else:
+            raise AssertionError("unterminated requirements heredoc")
+        for name, (version, hashes) in _parse_hash_stanzas(
+            "\n".join(lines)
+        ).items():
+            if name in wf_pkgs:
+                assert wf_pkgs[name] == (version, hashes), name
+            else:
+                wf_pkgs[name] = (version, hashes)
+    assert len(wf_pkgs) == 11, sorted(wf_pkgs)
+    with open(
+        os.path.join(REPO_ROOT, "ci", "canonical-test-requirements.txt"),
+        encoding="utf-8",
+    ) as handle:
+        req_pkgs = _parse_hash_stanzas(handle.read())
+    assert req_pkgs == wf_pkgs
+    with open(
+        os.path.join(REPO_ROOT, "docs", "install.md"),
+        encoding="utf-8",
+    ) as handle:
+        install = handle.read()
+    recipe = re.search(
+        r"<!-- canonical-test-env-start -->(.*)"
+        r"<!-- canonical-test-env-end -->",
+        install,
+        re.S,
+    ).group(1)
+    assert 'PYTHON_URL="%s"' % wf_url in recipe
+    assert 'PYTHON_SHA256="%s"' % wf_sha in recipe
+    assert "ci/canonical-test-requirements.txt" in recipe
+    # A failed checksum must stop the recipe before extraction:
+    # fail-closed provisioning like the workflow's own shell.
+    assert "set -euo pipefail" in recipe.splitlines(), recipe
+    spec = importlib.util.spec_from_file_location(
+        "lanes_canonical_pins",
+        os.path.join(REPO_ROOT, "ci", "test_lanes.py"),
+    )
+    lanes = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lanes)
+    assert ".".join(
+        str(part) for part in lanes.CANONICAL_PYTHON
+    ) == wf_python
+    for name, want in lanes.CANONICAL_PACKAGES:
+        assert wf_pkgs[name][0] == want, name
 
 
 def test_pixi_provenance_retained():

@@ -1559,12 +1559,33 @@ def _write_shadow_package_pyc(package_dir, marker):
 
 
 def _find_extension_donor():
-    """Return a loadable stdlib extension path, or None."""
+    """Return a real stdlib extension file path, or None.
+
+    The shadow's bytes are hashed and file-finder-selected but
+    never executed here, so any genuine extension file
+    qualifies; importability is not required. Builds that link
+    the common extensions statically still ship lib-dynload
+    (checked second, sorted for determinism). None only when
+    this host has no extension file at all.
+    """
     for name in ("_datetime", "_socket", "math", "_struct"):
         spec = importlib.util.find_spec(name)
         if spec and spec.origin and spec.origin.endswith(".so"):
             return spec.origin
-    return None
+    dynload = os.path.join(
+        os.path.dirname(os.__file__), "lib-dynload"
+    )
+    try:
+        candidates = sorted(
+            entry
+            for entry in os.listdir(dynload)
+            if entry.endswith(".so")
+        )
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return os.path.join(dynload, candidates[0])
 
 
 def _write_shadow_package_ext_so(package_dir):
@@ -4995,26 +5016,33 @@ def test_merge_refuses_out_dir_is_a_file():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _write_nested_shard(workdir, name, runner, depth):
+    # A shard report whose lanes block nests `depth` deep.
+    report = _shard_report(
+        "lane-a", outcomes=_full_outcomes(runner)
+    )
+    report["lanes"][0]["cache"] = "CACHE_MARKER"
+    path = os.path.join(workdir, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(report).replace(
+                '"CACHE_MARKER"',
+                "[" * depth + "]" * depth,
+                1,
+            )
+        )
+    return path
+
+
 def test_merge_refuses_undumpable_board():
-    # A board that loads but cannot be serialized (deep
-    # nesting past the dump limit) refuses (exit 2,
-    # single line) instead of an uncaught traceback.
+    # A board that loads but cannot be serialized (nesting
+    # past the merge depth bound but within loader limits)
+    # refuses (exit 2, single line) instead of an uncaught
+    # traceback, and no board file appears.
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
-        report = _shard_report(
-            "lane-a", outcomes=_full_outcomes(runner)
-        )
-        report["lanes"][0]["cache"] = "CACHE_MARKER"
-        first = os.path.join(workdir, "a.json")
-        with open(first, "w", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(report).replace(
-                    '"CACHE_MARKER"',
-                    "[" * 10000 + "]" * 10000,
-                    1,
-                )
-            )
+        first = _write_nested_shard(workdir, "a.json", runner, 200)
         second = _write_report(
             workdir, "b.json",
             _shard_report(
@@ -5027,10 +5055,39 @@ def test_merge_refuses_undumpable_board():
             out, must_not_exist=False,
         )
         assert "cannot write report" in message, message
+        assert "exceeds" in message and "bound" in message, message
         assert not os.path.isfile(
             os.path.join(out, "matrix-report.json")
         ), out
         print("PASS merge refuses undumpable board")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_merge_refuses_unloadable_board():
+    # Nesting past the loader's own recursion budget refuses
+    # at load with "cannot load shard" (exit 2, single line):
+    # invalid input never reaches the merge.
+    runner = _load_runner()
+    workdir = tempfile.mkdtemp(prefix="matrix-merge-")
+    try:
+        first = _write_nested_shard(workdir, "a.json", runner, 10000)
+        second = _write_report(
+            workdir, "b.json",
+            _shard_report(
+                "lane-b", outcomes=_full_outcomes(runner)
+            ),
+        )
+        out = os.path.join(workdir, "merged")
+        message = _merge_rejection_text(
+            runner, ["--merge", first, second, "--out-dir", out],
+            out, must_not_exist=False,
+        )
+        assert "cannot load shard" in message, message
+        assert not os.path.isfile(
+            os.path.join(out, "matrix-report.json")
+        ), out
+        print("PASS merge refuses unloadable board")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -6072,7 +6129,10 @@ def test_merge_refuses_partial_suite_coverage():
 
 def test_merge_accepts_pinned_exclusions():
     # A lane missing exactly its pinned exclusions merges: the
-    # exclusion map (not silence) explains the absent cells.
+    # exclusion map (not silence) explains the absent cells. Since
+    # recorded 7.x task_struct layouts landed, every KVM lane
+    # excludes exactly kernel-joint (kernel-core-layouts runs
+    # everywhere).
     runner = _load_runner()
     workdir = tempfile.mkdtemp(prefix="matrix-merge-")
     try:
@@ -6090,8 +6150,7 @@ def test_merge_accepts_pinned_exclusions():
             _shard_report(
                 "v7.2-kvm",
                 outcomes=_full_outcomes(
-                    runner,
-                    skip=("kernel-joint", "kernel-core-layouts"),
+                    runner, skip=("kernel-joint",)
                 ),
             ),
         )

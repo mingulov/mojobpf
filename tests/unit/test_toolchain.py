@@ -38,6 +38,7 @@ from mojobpf.execution import (  # noqa: E402
     run_admitted,
 )
 from mojobpf.toolchain import (  # noqa: E402
+    GATED_TOOLS,
     REQUIRED_TOOLS,
     ToolchainConfig,
     admit_tools,
@@ -177,10 +178,22 @@ def test_candidate_lock2_requires_strict_native_record(tmp_path):
 
 
 def test_discovery_records_versions_and_hashes():
+    import platform
+
     bindir, versions = write_tool_bindir()
     report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
     assert [tool.name for tool in report.tools] == list(REQUIRED_TOOLS)
     for tool in report.tools:
+        if tool.name == "python":
+            # The ambient interpreter is observed, never probed:
+            # running version, executable path and hash, with no
+            # fixture values involved.
+            assert tool.status == "present", tool
+            assert tool.version == platform.python_version(), tool
+            assert tool.path == os.path.realpath(sys.executable), tool
+            assert tool.sha256 == sha256_of(tool.path), tool
+            assert tool.execution is None, tool
+            continue
         assert tool.status == "present", tool
         assert tool.version == versions[tool.name], tool
         assert tool.sha256 == sha256_of(tool.path), tool
@@ -263,12 +276,18 @@ def test_missing_tool_fails_without_fallback():
     assert [tool.name for tool in report.tools] == list(REQUIRED_TOOLS)
 
 
-def test_fully_empty_path_reports_all_missing():
+def test_fully_empty_path_reports_gated_missing_python_observed():
     empty = tempfile.mkdtemp(prefix="empty-path-")
     with isolated_path(empty):
         report = probe_toolchain(ToolchainConfig())
-    assert [tool.status for tool in report.tools] == ["missing"] * 4
-    assert codes(report).count("MBPF103") == 4
+    by_name = {tool.name: tool for tool in report.tools}
+    for name in GATED_TOOLS:
+        assert by_name[name].status == "missing", by_name[name]
+    # The ambient interpreter is PATH-independent: it stays
+    # observed (and diagnostic-free) on an empty PATH.
+    assert by_name["python"].status == "present", by_name["python"]
+    assert by_name["python"].version is not None
+    assert codes(report).count("MBPF103") == len(GATED_TOOLS)
     assert report.supported is False
 
 
@@ -453,7 +472,12 @@ def test_invalid_lockfile_never_probes():
         assert report.supported is False
         for tool in report.tools:
             assert tool.status == "present", (lockfile, tool)
-            assert tool.version is None, (lockfile, tool)
+            if tool.name == "python":
+                # Statically observed, never probed: the running
+                # version reports even when every probe is refused.
+                assert tool.version is not None, (lockfile, tool)
+            else:
+                assert tool.version is None, (lockfile, tool)
             assert tool.sha256 == sha256_of(tool.path), (
                 lockfile,
                 tool,
@@ -568,9 +592,9 @@ def test_admit_tools_admits_pinned_build_tools():
     admitted, diagnostics = admit_tools(
         lockfile_path=lockfile, search_paths=(bindir,)
     )
-    assert sorted(admitted) == ["llc", "mojo"]
+    assert sorted(admitted) == ["bpftool", "llc", "mojo"]
     assert diagnostics == ()
-    for name in ("mojo", "llc"):
+    for name in ("mojo", "llc", "bpftool"):
         info = admitted[name]
         assert info.status == "present"
         assert info.version == versions[name]
@@ -605,20 +629,34 @@ def test_admit_tools_rejects_pin_mismatch():
     assert [item.code for item in diagnostics] == ["MBPF102"]
 
 
-def test_admit_tools_ignores_unpinned_extra_tools():
+def test_admit_tools_ignores_unpinned_python():
     bindir, versions = write_tool_bindir()
     lockfile = write_lockfile(bindir, versions)
     with open(lockfile, encoding="utf-8") as handle:
         data = json.load(handle)
-    del data["tools"]["bpftool"]
     del data["tools"]["python"]
     with open(lockfile, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
     admitted, diagnostics = admit_tools(
         lockfile_path=lockfile, search_paths=(bindir,)
     )
-    assert sorted(admitted) == ["llc", "mojo"]
+    assert sorted(admitted) == ["bpftool", "llc", "mojo"]
     assert diagnostics == ()
+
+
+def test_admit_tools_requires_bpftool_pin():
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    with open(lockfile, encoding="utf-8") as handle:
+        data = json.load(handle)
+    del data["tools"]["bpftool"]
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
 
 
 def test_admit_tools_rejects_unknown_names():
@@ -628,6 +666,21 @@ def test_admit_tools_rejects_unknown_names():
         pass
     else:
         raise AssertionError("unknown tool name admitted")
+
+
+def test_admit_tools_refuses_python():
+    bindir, _versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    try:
+        admit_tools(
+            lockfile_path=lockfile,
+            search_paths=(bindir,),
+            names=("mojo", "python"),
+        )
+    except ValueError as exc:
+        assert "never admits" in str(exc), exc
+    else:
+        raise AssertionError("ambient python admitted")
 
 
 def test_repository_lockfile_stays_readable():
@@ -898,9 +951,9 @@ def test_admit_tools_attaches_executions():
     admitted, diagnostics = admit_tools(
         lockfile_path=lockfile, search_paths=(bindir,)
     )
-    assert sorted(admitted) == ["llc", "mojo"]
+    assert sorted(admitted) == ["bpftool", "llc", "mojo"]
     assert diagnostics == ()
-    for name in ("mojo", "llc"):
+    for name in ("mojo", "llc", "bpftool"):
         execution = admitted[name].execution
         assert execution is not None, name
         assert execution.contract == "execution-contract-v2", name
@@ -1624,9 +1677,13 @@ def test_failed_distribution_allows_zero_probes():
         subprocess.Popen = real_popen
     assert report.supported is False, report
     assert report.lockfile_status == "mismatched", report
-    assert [tool.version for tool in report.tools] == (
-        [None] * len(report.tools)
-    ), report.tools
+    for tool in report.tools:
+        if tool.name == "python":
+            # Statically observed, never probed: the running
+            # version reports even when every probe is refused.
+            assert tool.version is not None, report.tools
+        else:
+            assert tool.version is None, report.tools
     tool_probes = [
         argv
         for argv in spawns

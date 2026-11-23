@@ -30,6 +30,7 @@ OWNERS = {
         'tests/harness/test_process_guardian_checks.py',
         'tests/harness/test_tool_admission.py',
         'tests/unit/test_artifact_publication.py',
+        'tests/unit/test_check_build_agreement.py',
         'tests/unit/test_ci_workflow_contract.py',
         'tests/unit/test_cleanup_guest_filter.py',
         'tests/unit/test_coverage_ledger.py',
@@ -144,6 +145,9 @@ OWNERS = {
         'tests/unit/test_verify.py',
         'tests/verifier/test_subset_doc.py',
     ),
+    'smoke': (
+        'tests/smoke/test_xdp_counter_smoke.py',
+    ),
     'guest': (
         'tests/kernel/test_arch_portability.py',
         'tests/kernel/test_array_maps.py',
@@ -196,6 +200,76 @@ OWNERS = {
 # under the tool-admission lease system, so those lanes validate
 # ownership only.
 GUARDED_LANES = ('unit',)
+
+# Unit-owned modules the smoke lane re-runs for its bounded
+# subset (SDK surface, safeio, helpers). They stay owned by the
+# unit lane (ownership is single-homed; reuse is not ownership),
+# and they run identically guarded or not: they spawn no tools
+# and reference no guard state. The smoke lane itself stays
+# ownership-only like the compiler lane, because its own module
+# builds with the real toolchain.
+
+# Canonical tester environment (see docs/install.md "Run the
+# test lanes" and ci/canonical-test-requirements.txt): the
+# exact interpreter plus the load-bearing package pins. A
+# portability test pins these identical to the workflow, the
+# requirements file, and the install recipe; re-pin all four
+# together.
+CANONICAL_PYTHON = (3, 11, 17)
+CANONICAL_PACKAGES = (
+    ("pytest", "9.0.2"),
+    ("setuptools", "84.2.1"),
+    ("jsonschema", "4.23.0"),
+)
+
+SMOKE_REUSE = (
+    'tests/unit/test_sdk_surface.py',
+    'tests/unit/test_safeio.py',
+    'tests/unit/test_helpers.py',
+)
+
+
+def lane_modules(lane):
+    """Return the modules one ``--lane`` run executes, in order."""
+    if lane == 'smoke':
+        # Cheapest first: the reused unit modules, then the one
+        # real build plus inspect.
+        return list(SMOKE_REUSE) + list(OWNERS[lane])
+    return list(OWNERS[lane])
+
+
+def canonical_drift():
+    """Return canonical-environment mismatches, or an empty list.
+
+    Compares the running interpreter and the load-bearing
+    installed packages against ``CANONICAL_PYTHON`` and
+    ``CANONICAL_PACKAGES``. Each entry names what drifted and
+    the expected value; an empty list means canonical.
+    """
+    drift = []
+    observed = tuple(sys.version_info[:3])
+    if observed != tuple(CANONICAL_PYTHON):
+        drift.append(
+            "python %s (want %s)"
+            % (
+                ".".join(str(part) for part in observed),
+                ".".join(str(part) for part in CANONICAL_PYTHON),
+            )
+        )
+    try:
+        from importlib.metadata import version
+    except ImportError:
+        drift.append("importlib.metadata unavailable")
+        return drift
+    for name, want in CANONICAL_PACKAGES:
+        try:
+            got = version(name)
+        except Exception:
+            drift.append("%s missing (want %s)" % (name, want))
+            continue
+        if got != want:
+            drift.append("%s %s (want %s)" % (name, got, want))
+    return drift
 
 HOST_TOOLS = guard_runtime.HOST_TOOLS if guard_runtime else ()
 FORBIDDEN = guard_runtime.FORBIDDEN if guard_runtime else None
@@ -317,6 +391,11 @@ def _run_pytest(paths, report_path, workdir, collect_only=False):
     env.pop('PYTEST_ADDOPTS', None)
     env.pop('PYTEST_PLUGINS', None)
     env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
+    # Inherited optimization would strip every assert while the
+    # lane still reports passes (pytest runs --assert=plain, so
+    # nothing re-enables them): a green lane would prove
+    # nothing. Lane verdicts always run with asserts active.
+    env.pop('PYTHONOPTIMIZE', None)
     # Sibling imports between test modules (from test_x import ...)
     # resolve through sys.path even under --import-mode=importlib.
     # Every imported sibling name is unique across the tree, so
@@ -391,7 +470,7 @@ def run_tests(paths, report):
 
 def run_lane(lane, work):
     """Run one lane module-per-process; return the process exit code."""
-    modules = list(OWNERS[lane])
+    modules = lane_modules(lane)
     expected_path = os.path.join(work, 'expected.json')
     expected_nodes = collect(modules)
     with open(expected_path, 'w', encoding='utf-8') as handle:
@@ -432,10 +511,14 @@ def matrix_suites():
 def inventory():
     """Closed-world report: files, nodes, matrix suites, direct mapping."""
     # The runner owns the mapping; it is not itself a mapped module.
+    # In-repo environments are not test modules: .pixi (pixi) and
+    # .venv (the canonical test interpreter) both ship files named
+    # test_*.py that must never enter ownership.
     files = sorted(
         str(path.relative_to(ROOT))
         for path in Path(ROOT).rglob('test_*.py')
         if '__pycache__' not in path.parts and '.pixi' not in path.parts
+        and '.venv' not in path.parts
         and path.relative_to(ROOT) != Path('ci/test_lanes.py')
     )
     owned = [module for modules in OWNERS.values() for module in modules]
@@ -461,16 +544,27 @@ def main(argv=None):
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--collect-only', action='store_true')
     parser.add_argument('--guard-tools', action='store_true')
+    parser.add_argument('--canonical', action='store_true')
     args = parser.parse_args(argv)
     if args.lane not in OWNERS:
         print('unknown lane: %s' % args.lane, file=sys.stderr)
         return 2
+    if args.canonical:
+        drift = canonical_drift()
+        if drift:
+            print(
+                'not the canonical test environment (%s); provision '
+                '.venv per docs/install.md "Run the test lanes"'
+                % ("; ".join(drift),),
+                file=sys.stderr,
+            )
+            return 2
     try:
         if args.check:
             print(json.dumps(inventory()))
             return 0
         if args.collect_only:
-            print(json.dumps(collect(list(OWNERS[args.lane]))))
+            print(json.dumps(collect(lane_modules(args.lane))))
             return 0
         work = tempfile.mkdtemp(prefix='lane-%s-' % args.lane)
         marker = os.path.join(work, 'attempts.jsonl')

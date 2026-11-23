@@ -8,6 +8,7 @@
   "capabilities/api-rows.json",
   "capabilities/coverage-ledger.json",
   "capabilities/target-matrix.json",
+  "ci/canonical-test-requirements.txt",
   "ci/kernels.arm64.lock.json",
   "ci/kernels.lock.json",
   "ci/targets/controller-result-v2.schema.json",

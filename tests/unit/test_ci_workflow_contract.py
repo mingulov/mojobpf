@@ -174,6 +174,20 @@ def test_duplicate_file_and_collected_node_are_rejected(lanes):
         lanes.validate_ownership([name], [name + '::test_a'] * 2, {'unit': (name,)})
 
 
+def test_lane_run_scrubs_inherited_optimization(lanes, tmp_path, monkeypatch):
+    # A lane verdict must never come from assert-stripped
+    # bytecode: even with PYTHONOPTIMIZE inherited, the child
+    # pytest runs with asserts active, so a failing assert
+    # fails the module (exit 1) instead of passing vacuously.
+    module = tmp_path / "test_optimize_probe.py"
+    module.write_text("def test_always_fails():\n    assert False, 'probe'\n")
+    report = tmp_path / "report.json"
+    monkeypatch.setenv("PYTHONOPTIMIZE", "1")
+    outcome = lanes.run_tests([str(module)], str(report))
+    assert outcome["failed"] == 1, outcome
+    assert outcome["exit"] == 1, outcome
+
+
 def test_collection_has_exact_file_and_node_owners(lanes):
     result = subprocess.run([sys.executable, '-B', str(SELECTOR), '--check'], cwd=ROOT,
                             capture_output=True, text=True, timeout=300)

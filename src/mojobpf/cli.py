@@ -9,7 +9,7 @@ no host load, run, or attach commands)::
         [--save-temps]
     mojobpf check --manifest mojobpf.toml [--adapter adapter_service.py]
         [--lockfile lock.json] [--json]
-    mojobpf doctor [--lockfile lock.json] [--json]
+    mojobpf doctor [--lockfile lock.json] [--json] [--strict]
     mojobpf inspect [--object prog.bpf.o | prog.bpf.o]
         [--profile linux-bpfel-v3] [--source-license S --kernel-license K]
         [--json] [--report-only]
@@ -32,11 +32,15 @@ service. ``check`` validates the manifest, the target profile and
 toolchain discovery without writing outputs; without ``--lockfile``
 it reports discovery only and says so (pins not validated), while
 with ``--lockfile`` it additionally validates the lockfile match.
-``doctor`` is informational discovery only: it reports the tool and
-SDK versions, platform, toolchain availability, versions, observed
-lockfile status, target candidates and kernel-test capability
-without changing anything, always exits 0, and never qualifies
-pins (only ``check``/``build`` with ``--lockfile`` do that).
+``doctor`` is informational discovery by default: it reports the
+tool and SDK versions, platform, toolchain availability, versions,
+observed lockfile status, target candidates and kernel-test
+capability without changing anything, always exits 0, and never
+qualifies pins. ``doctor --strict`` instead gates: it exits
+nonzero when a required tool is missing or unsupported (with
+``--lockfile``, pins are qualified too), for scripts that must
+not mistake discovery for readiness. Apart from strict mode,
+only ``check``/``build`` with ``--lockfile`` qualify pins.
 ``inspect``
 describes one object file against a target profile; with both
 license flags it additionally runs the declaration gate and judges
@@ -112,7 +116,7 @@ from .manifest import (
     parse_manifest,
 )
 from .sdk import SDK_VERSION
-from .toolchain import ToolchainConfig, probe_toolchain
+from .toolchain import GATED_TOOLS, ToolchainConfig, probe_toolchain
 from .verify import VerifyError, VerifyInterrupted, VerifyRequest
 
 EXIT_OK = 0
@@ -231,9 +235,14 @@ def _command_check(args) -> int:
     except (ManifestError, ProfileError) as exc:
         sys.stderr.write("%s\n" % _format_diagnostic(exc.diagnostic))
         return EXIT_USAGE
-    report = probe_toolchain(
-        ToolchainConfig(lockfile_path=args.lockfile)
+    # Build absolutizes request paths before admission; check must
+    # probe the same spelling, or pin-refusal locations differ
+    # between the verbs for a relative --lockfile.
+    lockfile = (
+        None if args.lockfile is None
+        else os.path.abspath(args.lockfile)
     )
+    report = probe_toolchain(ToolchainConfig(lockfile_path=lockfile))
     if args.lockfile is None and not args.json:
         # Discovery without validation must say so on every path:
         # automation must never mistake "ran fine" for "qualified".
@@ -242,7 +251,15 @@ def _command_check(args) -> int:
                 sys.stderr.write(
                     "%s\n" % _format_diagnostic(diagnostic)
                 )
-    broken = [tool for tool in report.tools if tool.status != "present"]
+    # Only gated tools fail the verdict: the ambient python
+    # observation is reported on every path but never gates, so
+    # check and build (which admits the same gated set) agree on
+    # one lockfile plus environment.
+    broken = [
+        tool
+        for tool in report.tools
+        if tool.name in GATED_TOOLS and tool.status != "present"
+    ]
     compile_result = None
     adapter_missing = False
     if args.lockfile is not None and not broken and report.supported:
@@ -301,8 +318,16 @@ def _command_check(args) -> int:
         )
         for tool in report.tools:
             if tool.status == "present":
+                # A present tool with no version was rejected
+                # before its version probe ran (pin mismatch or
+                # refused probing): say so instead of "None".
+                version = (
+                    tool.version
+                    if tool.version is not None
+                    else "version unknown: not probed"
+                )
                 sys.stdout.write(
-                    "tool %s: present (%s)\n" % (tool.name, tool.version)
+                    "tool %s: present (%s)\n" % (tool.name, version)
                 )
             else:
                 sys.stdout.write("tool %s: %s\n" % (tool.name, tool.status))
@@ -313,7 +338,14 @@ def _command_check(args) -> int:
                 "compile: skipped (no lockfile supplied; pass "
                 "--lockfile to compile)\n"
             )
-    if broken:
+    # A broken tool must not hide pin/lock refusals for the
+    # remaining tools (and vice versa): with a lockfile every
+    # toolchain finding reports, in report order. Per-diagnostic
+    # lines match build's for tool faults; cross-class ordering
+    # is unspecified, and pre-admission failures (unloadable
+    # lockfile, failed distribution binding) report discovery
+    # state here while build fails fast.
+    if broken and args.lockfile is None:
         if not args.json:
             for diagnostic in report.diagnostics:
                 if diagnostic.code == "MBPF103":
@@ -321,15 +353,22 @@ def _command_check(args) -> int:
                         "%s\n" % _format_diagnostic(diagnostic)
                     )
         return EXIT_ENVIRONMENT
-    if args.lockfile is not None and not report.supported:
+    if args.lockfile is not None and (
+        broken or not report.supported
+    ):
         if not args.json:
             for diagnostic in report.diagnostics:
                 if diagnostic.code in (
-                    "MBPF102", "MBPF104", "MBPF105",
+                    "MBPF102", "MBPF103", "MBPF104", "MBPF105",
                 ):
                     sys.stderr.write(
                         "%s\n" % _format_diagnostic(diagnostic)
                     )
+        return EXIT_ENVIRONMENT
+    if broken:
+        # Unreachable while supported requires every gated tool
+        # present, but a future verdict change must not compile
+        # with broken tools by falling through.
         return EXIT_ENVIRONMENT
     if adapter_missing:
         sys.stderr.write(
@@ -367,12 +406,22 @@ def _package_dir() -> str:
 
 
 def _command_doctor(args) -> int:
-    report = probe_toolchain(
-        ToolchainConfig(lockfile_path=args.lockfile)
+    # Same spelling as check/build: pin locations stay
+    # comparable across verbs for a relative --lockfile.
+    lockfile = (
+        None if args.lockfile is None
+        else os.path.abspath(args.lockfile)
     )
+    report = probe_toolchain(ToolchainConfig(lockfile_path=lockfile))
     guest_tool = shutil.which("vng")
     kernel_capable = guest_tool is not None
     host = "%s/%s" % (sys.platform, platform.machine())
+    gated_bad = [
+        tool
+        for tool in report.tools
+        if tool.name in GATED_TOOLS and tool.status != "present"
+    ]
+    unqualified = args.lockfile is not None and not report.supported
     if args.json:
         sys.stdout.write(
             json.dumps(
@@ -381,7 +430,7 @@ def _command_doctor(args) -> int:
                     "sdk_version": SDK_VERSION,
                     "package_path": _package_dir(),
                     "platform": host,
-                    "discovery_only": True,
+                    "discovery_only": not args.strict,
                     "toolchain": dataclasses.asdict(report),
                     "kernel_test_runner": guest_tool,
                     "kernel_test_capable": kernel_capable,
@@ -391,12 +440,34 @@ def _command_doctor(args) -> int:
             )
         )
         sys.stdout.write("\n")
+        if args.strict and (gated_bad or unqualified):
+            return EXIT_ENVIRONMENT
         return EXIT_OK
     sys.stdout.write("mojobpf doctor\n")
-    sys.stdout.write(
-        "informational discovery only: pins are qualified by "
-        "check/build with --lockfile, never here\n"
-    )
+    if not (args.strict and args.lockfile is not None):
+        # Strict mode with a lockfile genuinely gates on pins,
+        # so the never-qualifies disclaimer would contradict it.
+        sys.stdout.write(
+            "informational discovery only: pins are qualified by "
+            "check/build with --lockfile, never here\n"
+        )
+    if args.strict:
+        if args.lockfile is None:
+            sys.stdout.write(
+                "strict: gating on required-tool presence only "
+                "(no lockfile supplied; pass --lockfile to also "
+                "qualify pins)\n"
+            )
+        else:
+            sys.stdout.write(
+                "strict: gating on required tools (presence and "
+                "lockfile pins)\n"
+            )
+    else:
+        sys.stdout.write(
+            "exit 0 does not mean ready: pass --strict to gate "
+            "on this report\n"
+        )
     sys.stdout.write(
         "mojobpf %s (sdk %s) at %s\n"
         % (TOOL_VERSION, SDK_VERSION, _package_dir())
@@ -404,17 +475,30 @@ def _command_doctor(args) -> int:
     sys.stdout.write("platform: %s\n" % host)
     for tool in report.tools:
         if tool.status == "present":
+            # As in check: a present tool with no version was
+            # rejected before its version probe ran.
+            version = (
+                tool.version
+                if tool.version is not None
+                else "version unknown: not probed"
+            )
             sys.stdout.write(
                 "tool %s: present %s at %s\n"
-                % (tool.name, tool.version, tool.path)
+                % (tool.name, version, tool.path)
             )
         else:
             sys.stdout.write("tool %s: %s\n" % (tool.name, tool.status))
     if args.lockfile is not None:
+        if args.strict:
+            qualifier = "gating this verdict"
+        else:
+            qualifier = (
+                "observed; qualification verdicts "
+                "come from check/build"
+            )
         sys.stdout.write(
-            "lockfile %s: %s (observed; qualification verdicts "
-            "come from check/build)\n"
-            % (args.lockfile, report.lockfile_status)
+            "lockfile %s: %s (%s)\n"
+            % (lockfile, report.lockfile_status, qualifier)
         )
     sys.stdout.write(
         "target candidates: %s\n" % ", ".join(SUPPORTED_PROFILE_IDS)
@@ -428,6 +512,16 @@ def _command_doctor(args) -> int:
             "kernel tests: no runner on PATH "
             "(compile-only work is unaffected)\n"
         )
+    # As in check: one fault class must not hide another.
+    if args.strict and (gated_bad or unqualified):
+        for diagnostic in report.diagnostics:
+            if diagnostic.code in (
+                "MBPF102", "MBPF103", "MBPF104", "MBPF105",
+            ):
+                sys.stderr.write(
+                    "%s\n" % _format_diagnostic(diagnostic)
+                )
+        return EXIT_ENVIRONMENT
     return EXIT_OK
 
 
@@ -794,6 +888,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mojobpf", description="MojoBPF build driver"
     )
+    # Exits during parsing, so it works with no subcommand even
+    # though a subcommand is otherwise required.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="mojobpf %s (sdk %s)" % (TOOL_VERSION, SDK_VERSION),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     build = sub.add_parser("build", help="build a project manifest")
@@ -848,6 +949,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument(
         "--json", action="store_true", help="print a JSON report"
+    )
+    doctor.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit nonzero when a required tool is missing or "
+        "unsupported (with --lockfile, pins are qualified too; "
+        "without one, presence is gated and pins stay unvalidated)",
     )
     doctor.set_defaults(func=_command_doctor)
 

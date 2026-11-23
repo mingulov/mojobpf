@@ -276,6 +276,28 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv))
 """
 
+# Version-only stub: builds admit bpftool exactly like check
+# does but never invoke it beyond the admission version probe.
+BPFTOOL_FIXTURE = """\
+#!{python}
+import sys
+
+
+def main(argv):
+    # Admission probes `version` (bpftool's spelling); the
+    # lockfile helper measures `--version`. Anything else is a
+    # real invocation, which builds never perform.
+    if argv[1:] in (["--version"], ["version"]):
+        print("bpftool v0.0-fixture")
+        return 0
+    sys.stderr.write("fixture bpftool invoked beyond version\\\\n")
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+"""
+
 ADAPTER_FIXTURE = """\
 #!{python}
 import json
@@ -375,6 +397,7 @@ def _fixture_tools(parent):
     for name, template in (
         ("mojo", MOJO_FIXTURE),
         ("llc", LLC_FIXTURE),
+        ("bpftool", BPFTOOL_FIXTURE),
     ):
         path = os.path.join(bindir, name)
         rendered = template.replace("{python}", sys.executable)
@@ -390,9 +413,9 @@ def _fixture_tools(parent):
 
 
 def _lockfile(parent, bindir):
-    """Pin the fixture mojo/llc; return the lockfile path."""
+    """Pin the fixture gated set; return the lockfile path."""
     tools = {}
-    for tool in ("mojo", "llc"):
+    for tool in ("mojo", "llc", "bpftool"):
         path = os.path.join(bindir, tool)
         proc = subprocess.run(
             [path, "--version"],

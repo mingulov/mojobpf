@@ -38,6 +38,7 @@ tests/packaging/test_installed_build.py``) or under any
 ``test_``-style runner. Standard library only.
 """
 
+import ast
 import atexit
 import json
 import os
@@ -407,7 +408,33 @@ def test_installed_doctor_reports_venv_paths():
         60,
     )
     assert proc.returncode == 0, proc.stderr
-    assert REPO_ROOT not in proc.stdout, proc.stdout
+    # The venv reuses its base interpreter's standard library, so
+    # when the driving interpreter itself lives under the checkout
+    # (a project-local .venv or .pixi environment) those stdlib
+    # entries legitimately contain the repo root. Only the base's
+    # own directories are excused; any other repo-rooted entry is
+    # a source leak and still fails. The '' entry resolves against
+    # the child's working directory (the fixture-owned work dir).
+    base_roots = {
+        os.path.realpath(sys.prefix),
+        os.path.realpath(sys.exec_prefix),
+    }
+    repo_root = os.path.realpath(REPO_ROOT)
+    leaked = []
+    for entry in ast.literal_eval(proc.stdout.strip()):
+        candidate = entry or fix["work"]
+        real = os.path.realpath(candidate)
+        if real != repo_root and not real.startswith(
+            repo_root + os.sep
+        ):
+            continue
+        if any(
+            real == root or real.startswith(root + os.sep)
+            for root in base_roots
+        ):
+            continue
+        leaked.append(entry)
+    assert not leaked, (leaked, proc.stdout)
 
 
 def test_installed_builds_example_without_repo_paths():

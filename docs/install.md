@@ -41,11 +41,12 @@ a kernel-test runner is available. It changes nothing.
 
 ## Install
 
-From a wheel file, offline:
+From a wheel file, offline (any directory name works; `.venv`
+is reserved for the canonical test interpreter below):
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv install-env
+source install-env/bin/activate
 pip install --no-index mojobpf-1.0.0-py3-none-any.whl
 mojobpf doctor
 ```
@@ -111,6 +112,48 @@ remedy: build the lowering (compiler/CMakeLists.txt) and set MOJOBPF_LOWER
 
 Either put `mojobpf-lower` on `PATH` or set `MOJOBPF_LOWER` to
 the binary.
+
+## Run the test lanes
+
+The lane runner (`ci/test_lanes.py`) is the only gate; raw
+`pytest` diverges from it and proves nothing. The lanes run
+under one canonical interpreter, provisioned once per checkout:
+
+<!-- canonical-test-env-start -->
+```bash
+set -euo pipefail
+PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.11.17+20261009-x86_64-unknown-linux-gnu-install_only.tar.gz"
+PYTHON_SHA256="035b0ccfe7f3d38ab3ddab505290d200c6a265b95fbd5fac76c358751d6bb6a8"
+curl -fsSL --retry 3 "$PYTHON_URL" -o /tmp/cpython.tar.gz
+echo "$PYTHON_SHA256  /tmp/cpython.tar.gz" | sha256sum -c -
+mkdir -p .venv && tar -xzf /tmp/cpython.tar.gz -C .venv
+test -x .venv/python/bin/python3
+.venv/python/bin/python3 -m pip install --require-hashes \
+    --only-binary=:all: -r ci/canonical-test-requirements.txt
+```
+<!-- canonical-test-env-end -->
+
+(The URL, archive hash, and package pins above are the same
+values `.github/workflows/vm-matrix.yml` pins for CI; a
+portability test keeps them identical.)
+
+Then, from the checkout root:
+
+```bash
+pixi run build-lower   # fresh mojobpf-lower in build/lower
+pixi run test-smoke    # bounded subset, about a minute
+pixi run test-unit     # the full unit gate with tool supervision
+pixi run test-package  # sdist + wheel proofs
+pixi run test-compiler # the full compiler gate (slowest lane)
+```
+
+`test-smoke` runs the SDK-surface, safeio, and helper modules
+plus one real example build and inspect. `test-unit` is the
+same command CI runs. Every task verifies the canonical
+interpreter and pins before running; the toolchain environment
+(Mojo, `MOJOBPF_LOWER`) comes from the task itself, so run the
+lanes through these tasks rather than invoking the runner
+directly.
 
 ## Lockfile for your machine
 

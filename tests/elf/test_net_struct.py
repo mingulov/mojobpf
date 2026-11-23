@@ -437,7 +437,9 @@ def _write_runtime_lockfile(workdir):
         return digest.hexdigest()
 
     tools = {}
-    for name in ("mojo", "llc"):
+    # The build admits the full gated set, so the runtime
+    # lockfile pins bpftool exactly like check does.
+    for name in ("mojo", "llc", "bpftool"):
         path = shutil.which(name)
         real = os.path.realpath(path)
         out = subprocess.run(

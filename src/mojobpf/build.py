@@ -13,8 +13,9 @@ Before anything compiles, the build reconciles the manifest against
 the supported export roots and entry/section pairs
 (``MBPF213``/``217``; map names ``MBPF214``, map shapes ``MBPF215``
 and license form already gated at parse), validates the license
-declaration pair (``MBPF701``/``703``/``704``), admits ``mojo`` and
-``llc`` against the pinned lockfile (``MBPF102``/``103``/``104``)
+declaration pair (``MBPF701``/``703``/``704``), admits ``mojo``,
+``llc`` and ``bpftool`` against the pinned lockfile
+(``MBPF102``/``103``/``104``)
 through ``execution-contract-v2`` (resolved once, hashed,
 pin-checked -- including the launcher ``exec`` target -- before
 any probe runs), admits the adapter service (the packaged default
@@ -61,7 +62,9 @@ kernel operation: the only subprocesses are the frontend, the adapter
 (a ``sys.executable`` file-to-file transform of the admitted service
 script, with import-path variables stripped) and the backend
 (including its MIR frame dump for the spill gate). ``bpftool`` is
-never invoked here.
+never invoked here, but its lockfile pin is validated at admission
+exactly as ``check`` validates it, so both verbs refuse a lax
+toolchain the same way.
 
 Request and result models are versioned and frozen:
 
@@ -306,7 +309,11 @@ STDERR_ERROR_MARKER = "error:"
 # by the step deadline itself; this only covers kill recovery.
 _DRAIN_GRACE_S = 10.0
 
-REQUIRED_BUILD_TOOLS = ("mojo", "llc")
+# Every member gates the build identically to ``check``: admission
+# refuses a missing or pin-mismatched member with the same
+# MBPF102/MBPF103 diagnostics in both verbs. ``bpftool`` is
+# validated but never spawned here (see the module docstring).
+REQUIRED_BUILD_TOOLS = ("mojo", "llc", "bpftool")
 
 # Canonical frontend target: every ``mojo build`` this route runs pins
 # --target-cpu/--target-features to the frozen producer shape below,

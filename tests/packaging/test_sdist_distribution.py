@@ -217,6 +217,38 @@ def test_archive_missing_c_reference_fails_before_compilation(distribution, tmp_
         assert_native_fixture_inventory(damaged)
 
 
+def _interpreter_rebind_args(denied):
+    """Return bwrap args re-exposing a denied interpreter prefix.
+
+    When the driving interpreter lives strictly under a denied
+    root (a project-local .venv/.pixi inside the checkout), the
+    denial tmpfs would hide it and the exec would fail. The fix
+    rebinds exactly the interpreter prefix over itself, after
+    the denial mounts: this reproduces CI, where the interpreter
+    sits outside every denied root and stays visible. The
+    re-exposure covers the interpreter subtree only (no checkout
+    sources travel with it), and the canary probe still verifies
+    every denial. Interpreters outside every denied root, and
+    interpreters deliberately denied themselves, need no rebind.
+    """
+    exe_real = os.path.realpath(sys.executable)
+    venv_root = os.path.realpath(sys.prefix)
+    covered = any(
+        venv_root != root and venv_root.startswith(root + os.sep)
+        for root in denied
+    )
+    targeted = any(
+        root == venv_root or root.startswith(venv_root + os.sep)
+        for root in denied
+    )
+    if not covered or targeted:
+        return []
+    assert exe_real == venv_root or exe_real.startswith(
+        venv_root + os.sep
+    ), ("interpreter binary outside its own prefix", sys.executable)
+    return ["--ro-bind", venv_root, venv_root]
+
+
 def run_archive_python(work, exported, source, args):
     bubblewrap = shutil.which("bwrap")
     assert bubblewrap, "ENVIRONMENT FAILURE: bwrap required for denied-source collection"
@@ -227,11 +259,14 @@ def run_archive_python(work, exported, source, args):
         assert not work.resolve().is_relative_to(Path(path)), (
             "writable work directory overlaps denied source root", str(work), path)
     # Mount writable parents first: a later parent bind would expose a hidden
-    # child source export again. No bind may follow these denial mounts.
+    # child source export again. No bind may follow these denial mounts
+    # except the narrowed interpreter re-exposure below (verified by the
+    # canary like every denial: it covers the interpreter subtree only).
     sandbox = [bubblewrap, "--ro-bind", "/", "/", "--dev", "/dev",
                "--bind", str(work), str(work)]
     for path in denied:
         sandbox += ["--tmpfs", path]
+    sandbox += _interpreter_rebind_args(denied)
     sandbox += ["--unshare-net", "--chdir", str(source), "--"]
     env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(source / "src")}
@@ -454,12 +489,16 @@ def _installed_proof_sandbox(work, consumer):
     # Mount writable work FIRST: bwrap applies mounts in order, so a work
     # bind AFTER a denial tmpfs would re-expose a denied child inside work
     # (bind-after-deny). Denial mounts come last so they win; no bind may
-    # follow them. (work-inside-denied is rejected above: the denial would
-    # hide the work root the proof must run from.)
+    # follow them except the narrowed interpreter re-exposure below
+    # (verified by the canary like every denial: it covers the
+    # interpreter subtree only). (work-inside-denied is rejected
+    # above: the denial would hide the work root the proof must run
+    # from.)
     sandbox = [bubblewrap, "--ro-bind", "/", "/", "--dev", "/dev",
                "--bind", str(work), str(work)]
     for path in denied:
         sandbox += ["--tmpfs", path]
+    sandbox += _interpreter_rebind_args(denied)
     sandbox += ["--unshare-net", "--chdir", str(consumer), "--"]
     # The checkout root has a populated canary input before entering the
     # sandbox; every extra denied root contributes its populated canaries.

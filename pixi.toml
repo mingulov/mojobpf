@@ -7,6 +7,19 @@ channels = ["https://conda.modular.com/max", "conda-forge"]
 platforms = ["linux-64"]
 
 [tasks]
+# Canonical tester entry points (F-26). The lane runner
+# (ci/test_lanes.py) is the only gate; raw pytest diverges from
+# it and must not be used for verdicts. All lanes run under the
+# canonical interpreter (.venv, CPython 3.11.17 + pytest 9.0.2
+# per .github/workflows/vm-matrix.yml); a missing .venv fails
+# with the fix instead of falling back to another interpreter.
+# Ambient ccache shims are stripped: they shadow the
+# digest-pinned toolchain the lanes admit.
+build-lower = "export PATH=$(echo \"$PATH\" | tr ':' '\\n' | grep -v ccache | paste -sd:); cmake -S compiler -B build/lower -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF && cmake --build build/lower -j\"$(nproc)\" && [ -x build/lower/mojobpf-lower ]"
+test-unit = { cmd = "[ -x .venv/python/bin/python3 ] || echo 'missing canonical interpreter: provision .venv per docs/install.md \"Run the test lanes\"' >&2; [ -x .venv/python/bin/python3 ] || exit 3; export PATH=$(echo \"$PATH\" | tr ':' '\\n' | grep -v ccache | paste -sd:); .venv/python/bin/python3 ci/test_lanes.py --lane unit --guard-tools --canonical" }
+test-smoke = { cmd = "[ -x .venv/python/bin/python3 ] || echo 'missing canonical interpreter: provision .venv per docs/install.md \"Run the test lanes\"' >&2; [ -x .venv/python/bin/python3 ] || exit 3; export PATH=$(echo \"$PATH\" | tr ':' '\\n' | grep -v ccache | paste -sd:); export MOJOBPF_LOWER=\"$PWD/build/lower/mojobpf-lower\"; .venv/python/bin/python3 ci/test_lanes.py --lane smoke --canonical", depends-on = ["build-lower"] }
+test-compiler = { cmd = "[ -x .venv/python/bin/python3 ] || echo 'missing canonical interpreter: provision .venv per docs/install.md \"Run the test lanes\"' >&2; [ -x .venv/python/bin/python3 ] || exit 3; export PATH=$(echo \"$PATH\" | tr ':' '\\n' | grep -v ccache | paste -sd:); export MOJOBPF_LOWER=\"$PWD/build/lower/mojobpf-lower\"; .venv/python/bin/python3 ci/test_lanes.py --lane compiler --canonical", depends-on = ["build-lower"] }
+test-package = { cmd = "[ -x .venv/python/bin/python3 ] || echo 'missing canonical interpreter: provision .venv per docs/install.md \"Run the test lanes\"' >&2; [ -x .venv/python/bin/python3 ] || exit 3; export PATH=$(echo \"$PATH\" | tr ':' '\\n' | grep -v ccache | paste -sd:); .venv/python/bin/python3 ci/test_lanes.py --lane package --canonical" }
 
 [dependencies]
 mojo = "==1.2.0"

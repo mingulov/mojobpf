@@ -54,6 +54,21 @@ import tempfile
 import time
 
 
+# Memfd seal commands, resolved once. Some standalone interpreter
+# builds omit the seal constants from the fcntl module even on
+# kernels with full sealing support; the fallbacks are the Linux
+# UAPI numbers (include/uapi/asm-generic/fcntl.h), which are
+# stable kernel ABI. Every seal application below is verified
+# with F_GET_SEALS, so a wrong number fails closed (OSError)
+# instead of running unsealed.
+_F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+_F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+_F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+_F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+_F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+_F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+
+
 class GuestTimeout(Exception):
     """A guest run exceeded its timeout; the owned tree is reaped.
 
@@ -1635,9 +1650,17 @@ def consumed_path(path, *, preserve_name=False):
             raise
         with handle:
             handle.write(data)
-        fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
-                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
-                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        seals = (
+            _F_SEAL_WRITE | _F_SEAL_GROW |
+            _F_SEAL_SHRINK | _F_SEAL_SEAL
+        )
+        fcntl.fcntl(fd, _F_ADD_SEALS, seals)
+        applied = fcntl.fcntl(fd, _F_GET_SEALS)
+        if applied & seals != seals:
+            raise OSError(
+                "sealed input descriptor is missing seals "
+                "%#x (have %#x)" % (seals, applied)
+            )
         if (os.fstat(fd).st_size != len(data) or
                 os.pread(fd, len(data), 0) != data):
             raise OSError("sealed input descriptor differs from the logged buffer")

@@ -476,10 +476,21 @@ def write_executable(path, text):
 
 
 def write_tool_bindir(parent, extra=()):
-    """Create fixture mojo+llc (+extra version stubs); return bindir."""
+    """Create fixture mojo+llc+bpftool (+extra version stubs); return bindir.
+
+    ``bpftool`` is always planted: builds admit it exactly like
+    ``check`` does, so the default bindir carries the full gated
+    set. An ``extra`` bpftool entry rewrites identical bytes.
+    """
     bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
     write_executable(os.path.join(bindir, "mojo"), MOJO_FIXTURE)
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     for name, version in extra:
         write_executable(
             os.path.join(bindir, name),
@@ -613,12 +624,14 @@ def valid_service_request(parent, **overrides):
 
 
 def write_lockfile(parent, bindir, name="toolchains.lock.json",
-                   pins=None, tools_pinned=("mojo", "llc")):
+                   pins=None,
+                   tools_pinned=("mojo", "llc", "bpftool")):
     """Pin the fixture tools; return the lockfile path.
 
     ``pins`` optionally overrides ``{tool: (version, sha256)}`` per
     tool (used by mismatch tests); otherwise pins are measured from
-    the fixture binaries.
+    the fixture binaries. The default pins the full gated set;
+    ``python`` is ambient-observed and needs no pin.
     """
     tools = {}
     for tool in tools_pinned:
@@ -1042,6 +1055,12 @@ def write_forking_bindir(parent):
         os.path.join(bindir, "mojo"), FORKING_MOJO_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     return bindir
 
 
@@ -1537,8 +1556,10 @@ def test_missing_tools_fail_without_fallback():
             )
         )
     assert result.success is False
+    # The build gates the full gated set exactly like check: one
+    # MBPF103 per missing member (mojo, llc, bpftool).
     assert [item.code for item in result.diagnostics] == [
-        "MBPF103", "MBPF103",
+        "MBPF103", "MBPF103", "MBPF103",
     ]
     assert all(
         item.stage == "toolchain.discovery" for item in result.diagnostics
@@ -1598,6 +1619,12 @@ def test_broken_version_probe_fails():
     )
     write_executable(os.path.join(bindir, "mojo"), broken)
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     proc = subprocess.run(
@@ -1610,6 +1637,8 @@ def test_broken_version_probe_fails():
     llc_version = proc.stdout.strip().splitlines()[0].strip()
     with open(os.path.join(bindir, "llc"), "rb") as handle:
         llc_sha = hashlib.sha256(handle.read()).hexdigest()
+    with open(os.path.join(bindir, "bpftool"), "rb") as handle:
+        bpftool_sha = hashlib.sha256(handle.read()).hexdigest()
     lockfile = os.path.join(parent, "toolchains.lock.json")
     with open(lockfile, "w", encoding="utf-8") as handle:
         json.dump(
@@ -1618,6 +1647,10 @@ def test_broken_version_probe_fails():
                 "tools": {
                     "mojo": {"version": "v", "sha256": "0" * 64},
                     "llc": {"version": llc_version, "sha256": llc_sha},
+                    "bpftool": {
+                        "version": "bpftool v0.0-fixture",
+                        "sha256": bpftool_sha,
+                    },
                 },
             },
             handle,
@@ -3907,6 +3940,12 @@ def write_snapshot_bindir(parent):
         os.path.join(bindir, "mojo"), MOJO_SNAPSHOT_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     return bindir
 
 
@@ -5644,6 +5683,12 @@ def test_snapshot_stdlib_transient_swap_consumes_staged_bytes():
         os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     lockfile = write_lockfile(parent, bindir)
@@ -5735,6 +5780,12 @@ def test_snapshot_stdlib_configured_transient_swap_consumes_staged():
         os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     lockfile = write_lockfile(parent, bindir)
@@ -5824,6 +5875,12 @@ def test_snapshot_stdlib_configured_selection_preserved():
         os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     lockfile = write_lockfile(parent, bindir)
@@ -5884,6 +5941,12 @@ def test_snapshot_stdlib_configured_missing_payload_rejected():
         os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     lockfile = write_lockfile(parent, bindir)
@@ -6107,6 +6170,12 @@ def test_snapshot_trailing_empty_cfg_consumes_nothing():
         os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     lockfile = write_lockfile(parent, bindir)
@@ -6166,6 +6235,12 @@ def test_snapshot_cr_cfg_transient_swap_consumes_staged():
         os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     lockfile = write_lockfile(parent, bindir)
@@ -6252,6 +6327,12 @@ def test_snapshot_unredirected_staged_cfg_rejected():
         os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
     )
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    write_executable(
+        os.path.join(bindir, "bpftool"),
+        VERSION_STUB.format(
+            python=sys.executable, version="bpftool v0.0-fixture"
+        ),
+    )
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
     lockfile = write_lockfile(parent, bindir)
@@ -6333,6 +6414,13 @@ def test_snapshot_dropped_staged_cfg_selection_rejected():
             )
             write_executable(
                 os.path.join(bindir, "llc"), LLC_FIXTURE
+            )
+            write_executable(
+                os.path.join(bindir, "bpftool"),
+                VERSION_STUB.format(
+                    python=sys.executable,
+                    version="bpftool v0.0-fixture",
+                ),
             )
             adapter = os.path.join(parent, "adapter-ok.py")
             write_executable(adapter, ADAPTER_OK_FIXTURE)

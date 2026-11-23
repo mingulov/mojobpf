@@ -7,9 +7,10 @@ and asserts each build exits 0 with its object on disk. Fixture
 builds of a subset live in the unit lane; this suite is the
 real-toolchain proof.
 
-Requires the working Mojo compiler and LLVM ``llc`` on PATH (for
-example the project pixi environment plus system LLVM). A missing
-tool is reported as an environment failure, never a pass.
+Requires the working Mojo compiler, LLVM ``llc`` and ``bpftool``
+on PATH (for example the project pixi environment plus system
+LLVM/bpftool). A missing tool is reported as an environment
+failure, never a pass.
 
 Runnable directly (``python3 tests/compile/test_example_cli_builds.py``)
 or under any ``test_``-style runner. Standard library only.
@@ -52,7 +53,9 @@ class EnvironmentFailure(Exception):
 def check_tools():
     import shutil
 
-    for tool in ("mojo", "llc"):
+    # The builds admit the full gated set, so a missing member
+    # is an environment failure, never a build failure.
+    for tool in ("mojo", "llc", "bpftool"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
     if not os.path.isfile(LOCKFILE):

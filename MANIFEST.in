@@ -40,6 +40,7 @@ recursive-include docs *.md
 recursive-include schemas *.json
 recursive-include examples *.mojo *.toml *.md *.bin *.json *.c
 include ci/kernels.lock.json ci/kernels.arm64.lock.json ci/toolchains.investigational.lock.json
+include ci/canonical-test-requirements.txt
 recursive-include ci/targets *.json
 include toolchains.lock.json pixi.toml pixi.lock
 include tests/compile/probe.mojo tests/compile/map_roundtrip.mojo tests/compile/map_roundtrip_mutated.mojo

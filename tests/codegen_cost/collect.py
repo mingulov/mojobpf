@@ -175,6 +175,12 @@ def _json(image: bytes, what: str):
     except (ValueError, UnicodeError, RecursionError) as exc:
         if isinstance(exc, CollectionError):
             raise
+        if isinstance(exc, RecursionError):
+            # Well-formed but too deep: the decoder exhausted its
+            # recursion budget before the depth walk below could
+            # run, so this is the same input-limit refusal with
+            # the same code/stage/exit, not malformed JSON.
+            _error("input-limit", what + " exceeds JSON depth/value limits", "unsupported", 3)
         _error("schema-json", "cannot decode %s: %s" % (what, exc))
     pending, count = [(value, 0)], 0
     while pending:

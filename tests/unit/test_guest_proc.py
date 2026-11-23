@@ -6135,7 +6135,7 @@ def test_snapshot_setup_failure_emits_infra_and_cleans_immediately(
         raise OSError(errno.EMFILE, "snapshot setup exhausted descriptors")
 
     def seal(fd, command, *args):
-        if command == helper.fcntl.F_ADD_SEALS:
+        if command == helper._F_ADD_SEALS:
             return refuse()
         return real_fcntl(fd, command, *args)
 
@@ -6718,7 +6718,7 @@ def test_sealed_buffer_agrees_with_logged_bytes(handoff, fault, monkeypatch):
     real_fcntl = helper.fcntl.fcntl
 
     def seal(fd, command, *args):
-        if command == helper.fcntl.F_ADD_SEALS:
+        if command == helper._F_ADD_SEALS:
             writer.append(os.open('/proc/self/fd/%d' % fd, os.O_RDWR))
             if fault == 'write_before_seal':
                 os.pwrite(writer[0], b'changed', 0)

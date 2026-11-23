@@ -2,27 +2,34 @@
 """Toolchain discovery and lockfile matching.
 
 :func:`probe_toolchain` inspects the local machine for the required
-build tools (``mojo``, ``llc``, ``bpftool`` and ``python3``), records
-their versions and binary hashes, and optionally matches them against a
-pinned lockfile. Discovery and validated support are separate states:
-the report always describes what was found, while the ``supported``
-verdict is true only when every required tool is present and matches
-the lockfile (and the requested profile, if any, is registered).
+build tools (``mojo``, ``llc``, ``bpftool``), records their versions
+and binary hashes, and optionally matches them against a pinned
+lockfile; it also observes the ambient running interpreter
+(``python``) and reports it without ever matching or gating on it.
+Discovery and validated support are separate states: the report
+always describes what was found, while the ``supported`` verdict is
+true only when every gated tool is present and matches the lockfile
+(and the requested profile, if any, is registered).
 :func:`admit_tools` reuses the same discovery and pin matching to
 admit exactly the named build tools for one locked build.
 
 Admission runs through ``execution-contract-v2``
-(:mod:`mojobpf.execution`): every tool is resolved once, hashed, and
-compared against its lockfile pin -- including the launcher ``exec``
-target -- before any ``--version`` probe starts, and probes execute
-the captured absolute path, never a re-resolved bare name. A
-substituted tool is rejected with ``MBPF102`` without executing.
+(:mod:`mojobpf.execution`): every gated tool is resolved once,
+hashed, and compared against its lockfile pin -- including the
+launcher ``exec`` target -- before any ``--version`` probe starts,
+and probes execute the captured absolute path, never a re-resolved
+bare name. A substituted tool is rejected with ``MBPF102`` without
+executing. The ambient interpreter is never resolved, probed, or
+spawned here: the driver and the adapter transform already run as
+it (``sys.executable``), so its observation is static (path,
+running version, binary hash) and a lockfile ``python`` entry, if
+present, is informational only.
 
 This module never installs, downloads or modifies anything, and it never
 falls back silently: a missing tool stays missing, a tool whose version
 probe fails stays broken, and an unreadable or version-unknown lockfile
 fails loudly instead of being partially interpreted. Lockfile entries
-for tools outside the required set are informational and are not
+for tools outside the gated set are informational and are not
 matched; that scoping is documented here rather than guessed per tool.
 
 Standard library only.
@@ -32,8 +39,10 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -81,6 +90,14 @@ LOCKFILE_SCHEMA_VERSION = 1
 NATIVE_LOCKFILE_SCHEMA_VERSION = 2
 
 REQUIRED_TOOLS = ("mojo", "llc", "bpftool", "python")
+
+# Tools whose presence and lockfile pins gate verdicts: every
+# required tool except the ambient interpreter. ``python`` is
+# reported in ``REQUIRED_TOOLS`` order but is observed, never
+# matched: check/build/doctor verdicts ignore it, so a derived
+# (not literal) tuple keeps a future required tool gated by
+# default instead of silently unexamined.
+GATED_TOOLS = tuple(name for name in REQUIRED_TOOLS if name != "python")
 
 DISCOVERY_ARGV = {
     "mojo": ("mojo", "--version"),
@@ -215,7 +232,10 @@ class ToolInfo:
     admitted (present and pin-matched), else None. ``dialect`` is
     the frontend-dialect canary verdict for mojo (``"match"``,
     ``"skip"`` or ``"mismatch"``), else None when the canary never
-    ran there.
+    ran there. The ``python`` record instead observes the ambient
+    interpreter: ``path`` is the executable, ``version`` its
+    running version, ``sha256`` its binary hash, and
+    ``execution`` is always None.
     """
 
     name: str
@@ -238,9 +258,10 @@ class ToolchainReport:
     ``"unreadable"``, ``"unsupported_version"`` or ``"not_checked"``.
     ``profile_supported`` is true when a requested profile is
     registered. ``supported`` is the validated-support verdict: true
-    only when the lockfile matched, every required tool is present, and
-    a requested profile is registered. ``diagnostics`` holds every
-    finding in deterministic order.
+    only when the lockfile matched, every gated tool is present, and
+    a requested profile is registered; the ambient ``python``
+    observation is reported but never gates. ``diagnostics`` holds
+    every finding in deterministic order.
     """
 
     schema_version: int
@@ -366,6 +387,52 @@ def check_frontend_dialect(
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+# Bound for hashing the running interpreter binary: real
+# interpreters are megabytes, so anything larger is refused as
+# broken rather than hashed unbounded.
+_INTERPRETER_HASH_LIMIT = 1 << 30
+
+
+def _observe_ambient_python() -> ToolInfo:
+    """Report the running interpreter without resolving or probing.
+
+    The driver and the adapter transform execute as
+    ``sys.executable`` (never as a PATH-resolved ``python3``), so
+    that binary is the only python identity builds can depend on.
+    The observation is static -- real path, running version,
+    binary hash -- emits no diagnostics, and never gates: callers
+    exclude it from match/support verdicts. The version always
+    reports (it comes from the running interpreter itself, not
+    from a probe), so an observed python never carries the
+    ``version=None`` of a pre-probe rejection.
+    """
+    version = platform.python_version()
+    executable = sys.executable
+    if not executable:
+        return ToolInfo(
+            name="python", status=TOOL_MISSING, version=version
+        )
+    path = os.path.realpath(executable)
+    try:
+        digest = hash_file_capped(
+            path, limit=_INTERPRETER_HASH_LIMIT, kind="interpreter"
+        ).hexdigest()
+    except OSError:
+        return ToolInfo(
+            name="python",
+            status=TOOL_BROKEN,
+            path=path,
+            version=version,
+        )
+    return ToolInfo(
+        name="python",
+        status=TOOL_PRESENT,
+        path=path,
+        version=version,
+        sha256=digest,
+    )
+
+
 def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
     """Discover tools and match them against the lockfile.
 
@@ -375,24 +442,27 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
 
     * ``MBPF101``: unsupported target profile.
     * ``MBPF102``: tool does not match the lockfile pin.
-    * ``MBPF103``: required tool missing or broken.
+    * ``MBPF103``: gated tool missing or broken.
     * ``MBPF104``: lockfile unreadable or of unsupported version.
     * ``MBPF105``: validation skipped, no lockfile supplied (note).
 
-    When a readable lockfile is supplied, each tool's static pin
-    check (entry hash, launcher ``exec`` hash, launcher form) runs
+    The ambient ``python`` observation never emits diagnostics;
+    every code above concerns gated tools only. When a readable
+    lockfile is supplied, each gated tool's static pin check
+    (entry hash, launcher ``exec`` hash, launcher form) runs
     before its version probe, and a rejected tool is never
-    executed. Without a lockfile the probe is purely observational.
-    A supplied lockfile that cannot be loaded (missing file,
-    invalid JSON, unsupported schema) fails closed: every tool is
-    still resolved and hashed statically, but no version probe
-    runs (``version`` stays ``None``), so invalid input never
-    falls back to unpinned discovery. A lockfile carrying a
-    ``distribution`` record also has that closure binding
-    enforced: a missing file, a placeholder digest or a byte
-    mismatch fails the match (``MBPF102``) -- and then no tool is
-    probed at all, so a failed distribution binding allows zero
-    probes.
+    executed. Without a lockfile the probe is purely
+    observational. A supplied lockfile that cannot be loaded
+    (missing file, invalid JSON, unsupported schema) fails
+    closed: every gated tool is still resolved and hashed
+    statically, but no version probe runs (``version`` stays
+    ``None``), so invalid input never falls back to unpinned
+    discovery; the python observation still reports its running
+    version. A lockfile carrying a ``distribution`` record also
+    has that closure binding enforced: a missing file, a
+    placeholder digest or a byte mismatch fails the match
+    (``MBPF102``) -- and then no tool is probed at all, so a
+    failed distribution binding allows zero probes.
     """
     if not isinstance(config, ToolchainConfig):
         raise ValueError("probe_toolchain requires a ToolchainConfig")
@@ -442,6 +512,12 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
         config.lockfile_path is not None and tools_table is None
     )
     for name in REQUIRED_TOOLS:
+        if name == "python":
+            # Observed, never matched: the ambient interpreter is
+            # reported in order but contributes neither to the
+            # lockfile verdict nor to any diagnostic.
+            examined.append(_observe_ambient_python())
+            continue
         entry = tools_table.get(name) if tools_table is not None else None
         tool, tool_matched = _examine_tool(
             name,
@@ -522,7 +598,11 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
 
     supported = (
         lockfile_status == LOCKFILE_MATCHED
-        and all(tool.status == TOOL_PRESENT for tool in tools)
+        and all(
+            tool.status == TOOL_PRESENT
+            for tool in tools
+            if tool.name in GATED_TOOLS
+        )
         and (config.profile_id is None or profile_supported)
     )
     return ToolchainReport(
@@ -926,7 +1006,7 @@ def load_toolchain_lock(
     or ``LOCKFILE_UNSUPPORTED_VERSION`` on load failure, else
     ``LOCKFILE_MATCHED`` as a neutral "loaded" marker (callers
     compute the real match verdict per tool). Lockfile entries for
-    tools outside the required set stay informational.
+    tools outside the gated set stay informational.
     """
     diagnostics: list[Diagnostic] = []
     try:
@@ -1169,16 +1249,18 @@ def admit_tools(
     *,
     lockfile_path: str | None,
     search_paths: tuple[str, ...] = (),
-    names: tuple[str, ...] = ("mojo", "llc"),
+    names: tuple[str, ...] = ("mojo", "llc", "bpftool"),
     native_bundle=None,
 ) -> tuple[dict[str, ToolInfo], tuple[Diagnostic, ...]]:
     """Admit named build tools against a lockfile for one build.
 
-    Admits exactly ``names`` (default the build tools ``mojo`` and
-    ``llc``) through ``execution-contract-v2``: each tool is
+    Admits exactly ``names`` (default the build tools ``mojo``,
+    ``llc`` and ``bpftool``) through ``execution-contract-v2``: each tool is
     resolved once, hashed, and compared against its lockfile pin
     (entry hash, launcher ``exec`` hash, then the version probe
-    through the admitted chain). Admission is all-or-nothing: the
+    through the admitted chain). ``python`` is refused outright:
+    the ambient interpreter is observed, never admitted.
+    Admission is all-or-nothing: the
     returned mapping holds a present, pin-matched :class:`ToolInfo`
     -- each carrying its :class:`AdmittedExecution` -- per name on
     success and is empty otherwise. Diagnostics use the
@@ -1190,7 +1272,8 @@ def admit_tools(
     A missing lockfile is ``MBPF104``, never a silent
     unvalidated build: callers spawn through the admitted
     executions or fail, and no probe runs before the static pin
-    check passes. Once both build tools are admitted, the
+    check passes. Once the build tools are admitted (with ``mojo``
+    and ``llc`` among them), the
     frontend-dialect canary compiles a fixed probe source with
     the admitted mojo and requires the qualified LLVM header
     lines; a differing header fails admission with ``MBPF102``
@@ -1201,6 +1284,11 @@ def admit_tools(
     for name in names:
         if name not in DISCOVERY_ARGV:
             raise ValueError("admit_tools cannot discover %r" % (name,))
+        if name == "python":
+            raise ValueError(
+                "admit_tools never admits 'python': the ambient "
+                "interpreter is observed, never gated"
+            )
     if lockfile_path is None:
         diagnostics.append(
             Diagnostic(

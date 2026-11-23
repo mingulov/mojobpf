@@ -1040,6 +1040,30 @@ def _load_shard_report(path):
     return report
 
 
+# Bound for merged-board nesting: real boards nest 4 deep
+# (tool/lanes/results/records), so anything past 64 is a corrupt
+# or hostile shard, refused before serialization instead of
+# crashing a downstream re-load.
+_MAX_MERGED_DEPTH = 64
+
+
+def _merged_depth(value) -> int:
+    """Return the nesting depth of parsed JSON (iterative)."""
+    deepest = 0
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > deepest:
+            deepest = depth
+        if isinstance(item, dict):
+            pending.extend(
+                (child, depth + 1) for child in item.values()
+            )
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+    return deepest
+
+
 def merge_reports(paths, out_dir, expect_lanes=None):
     """Merge per-shard boards into one; return the process exit code.
 
@@ -1062,7 +1086,10 @@ def merge_reports(paths, out_dir, expect_lanes=None):
     verbatim (minus the per-shard ephemeral farm path),
     concatenates lanes and results in input
     order, and records ``merged_from``. A non-pass outcome
-    anywhere fails the merge (exit 1).
+    anywhere fails the merge (exit 1). The merged board's
+    nesting is bounded explicitly (``_MAX_MERGED_DEPTH``) before
+    serialization, so a corrupt deep shard refuses with
+    ``cannot write report`` instead of crashing a re-load.
     """
     if not paths:
         raise SetupFailure("merge needs at least one shard report")
@@ -1222,6 +1249,12 @@ def merge_reports(paths, out_dir, expect_lanes=None):
         "elapsed_secs": round(total_elapsed, 1),
     }
     report_path = os.path.join(out_dir, "matrix-report.json")
+    depth = _merged_depth(merged)
+    if depth > _MAX_MERGED_DEPTH:
+        raise SetupFailure(
+            "cannot write report %s: board nesting depth %d exceeds "
+            "the %d bound" % (report_path, depth, _MAX_MERGED_DEPTH)
+        )
     try:
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(merged, handle, indent=2, sort_keys=True)

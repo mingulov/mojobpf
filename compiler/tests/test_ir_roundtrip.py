@@ -240,15 +240,23 @@ class IRRoundTripTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertFalse(output.exists())
 
-    def test_stdio_paths_are_usage_failures(self):
+    def test_stdio_input_path_is_usage_failure(self):
+        # Two explicit methods instead of one subTest loop: the
+        # lane gate counts one call report per collected node,
+        # and subtests report extra calls for the same node.
+        output = self.workdir / "unused.ll"
+        result = self._run_lower("-", output)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("path", result.stderr.lower())
+        self.assertFalse(output.exists())
+
+    def test_stdio_output_path_is_usage_failure(self):
         source = self._input()
         output = self.workdir / "unused.ll"
-        for input_path, output_path in (("-", output), (source, "-")):
-            with self.subTest(input_path=input_path, output_path=output_path):
-                result = self._run_lower(input_path, output_path)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("path", result.stderr.lower())
-                self.assertFalse(output.exists())
+        result = self._run_lower(source, "-")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("path", result.stderr.lower())
+        self.assertFalse(output.exists())
 
     def test_unwritable_output_is_reported(self):
         result = self._run_lower(self._input(), self.workdir)
