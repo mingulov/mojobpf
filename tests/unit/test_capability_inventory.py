@@ -256,9 +256,9 @@ def test_public_files_stand_alone():
 def test_lock_pins_are_well_formed():
     lock = load_lock()
     assert lock["lock_version"] == 1
-    assert lock["uapi_versions"] == ["6.6.158", "6.12.112", "7.2.9"]
+    assert lock["uapi_versions"] == ["6.6.162", "6.12.118", "7.3.5"]
     assert lock["libbpf_version"] == "1.7.0"
-    assert lock["selftests_tag"] == "v7.2.9"
+    assert lock["selftests_tag"] == "v7.3.5"
     import re
     digest = re.compile(r"^[0-9a-f]{64}$")
     assert lock["expected"], "lock pins no staged files"
@@ -266,8 +266,8 @@ def test_lock_pins_are_well_formed():
         assert digest.match(value), relpath
     for doc in lock["docs"]:
         assert digest.match(doc["sha256"]), doc["id"]
-    assert lock["cohorts"]["selected_union"] == ["7.2.9", "6.12.112", "6.6.158"]
-    assert lock["cohorts"]["extracted"]["stable"]["version"] == "7.2.9"
+    assert lock["cohorts"]["selected_union"] == ["7.3.5", "6.12.118", "6.6.162"]
+    assert lock["cohorts"]["extracted"]["stable"]["version"] == "7.3.5"
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +677,76 @@ def test_value_conflict_across_versions_fails():
         text = text.replace("(1U << 0)", "(1U << 7)")
         with open(staged, "w", encoding="utf-8") as handle:
             handle.write(text)
+        fixture.repin()
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+
+
+def test_versioned_mask_drift_records_per_version_values():
+    # A DRIFTING_MASK_EXACT value change is accepted by the union
+    # gate (unlike the conflict above) and the member keeps the
+    # newest value plus the per-version map, like sentinels.
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp, uapi_versions=("v1", "v2"))
+        for version, value in (("v1", 25), ("v2", 27)):
+            staged = os.path.join(
+                fixture.sources, "uapi", version, "bpf.h")
+            with open(staged, "a", encoding="utf-8") as handle:
+                handle.write("#define BPF_F_REDIRECT_FLAGS %d\n" % value)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        members = {item["name"]: item
+                   for item in registry["enum_members"]}
+        mask = members["BPF_F_REDIRECT_FLAGS"]
+        assert mask["value"] == 27
+        assert mask["note"] == "versioned bound: v1=25, v2=27"
+
+
+def test_mask_shape_drift_across_versions_fails():
+    # DRIFTING_MASK_EXACT excuses value drift only: a
+    # declaration-shape change (define vs enum member) still
+    # fails the union gate.
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp, uapi_versions=("v1", "v2"))
+        staged = os.path.join(fixture.sources, "uapi", "v1", "bpf.h")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write("#define BPF_F_REDIRECT_FLAGS 25\n")
+        staged = os.path.join(fixture.sources, "uapi", "v2", "bpf.h")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write("enum mask_shape_probe {\n"
+                         "\tBPF_F_REDIRECT_FLAGS = 27,\n"
+                         "};\n")
+        fixture.repin()
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+
+
+def test_mask_same_value_shape_drift_fails():
+    # Mask shape is frozen even when values agree: a define
+    # becoming an enum member still fails the union gate.
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp, uapi_versions=("v1", "v2"))
+        staged = os.path.join(fixture.sources, "uapi", "v1", "bpf.h")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write("#define BPF_F_REDIRECT_FLAGS 25\n")
+        staged = os.path.join(fixture.sources, "uapi", "v2", "bpf.h")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write("enum mask_shape_probe2 {\n"
+                         "\tBPF_F_REDIRECT_FLAGS = 25,\n"
+                         "};\n")
+        fixture.repin()
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+
+
+def test_mask_function_like_drift_fails():
+    # A mask turning function-like across versions fails the
+    # union gate instead of silently excluding the record.
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp, uapi_versions=("v1", "v2"))
+        staged = os.path.join(fixture.sources, "uapi", "v1", "bpf.h")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write("#define BPF_F_REDIRECT_FLAGS 25\n")
+        staged = os.path.join(fixture.sources, "uapi", "v2", "bpf.h")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write("#define BPF_F_REDIRECT_FLAGS(val) (val)\n")
         fixture.repin()
         expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
 
@@ -1202,7 +1272,7 @@ def test_dangling_alias_fails_completeness():
     registry = mutated_registry()
     registry["enum_members"].append({
         "name": "BOGUS_ALIAS", "container": "uapi:bpf.h#bpf_cmd",
-        "value": 1, "value_text": "1", "present_in": ["7.2.9"],
+        "value": 1, "value_text": "1", "present_in": ["7.3.5"],
         "classification": "alias", "record_id": None,
         "canonical": "NO_SUCH_TARGET", "record_refs": [], "note": "",
     })
@@ -1651,6 +1721,24 @@ def test_kfunc_id_set_parser_captures_filters():
     ]
 
 
+def _assert_exe_callable_lines(predicates):
+    lines = [line for line in predicates
+             if line.startswith("callable from")]
+    # 7.3.5 registers the fs set for STRUCT_OPS too, with the
+    # filter narrowing it to binfmt-misc attachment (verified
+    # against staging fs/bpf_fs_kfuncs.c). The STRUCT_OPS line
+    # is pinned exactly -- presence and cohort -- while every
+    # other context stays LSM-only.
+    assert [line for line in lines if "STRUCT_OPS" in line] == [
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops "
+        "attachment to bpf_binfmt_misc_ops (7.3.5)"], lines
+    for line in lines:
+        assert line.startswith(
+            "callable from BPF_PROG_TYPE_LSM ") or line.startswith(
+            "callable from BPF_PROG_TYPE_STRUCT_OPS when "
+            "struct_ops attachment to bpf_binfmt_misc_ops "), line
+
+
 def test_kfunc_filters_narrow_callability():
     registry = load_registry()
     records = {entry["id"]: entry for entry in registry["records"]}
@@ -1668,10 +1756,34 @@ def test_kfunc_filters_narrow_callability():
         "BPF_TRACE_KPROBE_SESSION", "BPF_TRACE_UPROBE_SESSION"]
     exe = records["kfunc:bpf_get_task_exe_file"]
     assert exe["attach_types"] == []
-    for line in exe["callable_context_predicates"]:
-        if line.startswith("callable from"):
-            assert line.startswith(
-                "callable from BPF_PROG_TYPE_LSM "), line
+    _assert_exe_callable_lines(exe["callable_context_predicates"])
+
+
+def test_exe_file_binfmt_line_is_pinned():
+    # Dropping the binfmt line or adding a sibling-cohort line
+    # must both fail the callability assertion (Codex round 8,
+    # finding 4).
+    registry = load_registry()
+    records = {entry["id"]: entry for entry in registry["records"]}
+    predicates = records["kfunc:bpf_get_task_exe_file"][
+        "callable_context_predicates"]
+    binfmt = ("callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops "
+              "attachment to bpf_binfmt_misc_ops (7.3.5)")
+    assert binfmt in predicates
+    try:
+        _assert_exe_callable_lines(
+            [line for line in predicates if line != binfmt])
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("dropped binfmt line passed")
+    try:
+        _assert_exe_callable_lines(
+            list(predicates) + [binfmt.replace("7.3.5", "6.6.162")])
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("sibling binfmt line passed")
     bstats = records["kfunc:bpf_qdisc_bstats_update"]
     assert any("bpf_Qdisc_ops" in line
                for line in bstats["callable_context_predicates"])
@@ -2289,6 +2401,2274 @@ def test_kfunc_filter_contradictions_deny():
         ("probe_fn",), {"probe_ids": {"probe_fn"}},
         ("BPF_PROG_TYPE_TRACING",))
     assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_parenthesized_stops_comparison_narrows():
+    # A parenthesized st_ops comparison is the same narrowing as
+    # the bare form: the address-of & is not a bit operator.
+    verdict = _simulate_source(
+        "paren_ops",
+        "\tif ((prog->aux->st_ops == &probe_ops))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["stops"] == {"probe_ops"}
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": [], "stops": ["probe_ops"],
+         "notes": ["requires struct_ops attachment to probe_ops"]},
+    ]
+
+
+def test_kfunc_filter_inlined_stops_comparison_narrows():
+    # First upstream use (7.3.5 binfmt_misc filters): the st_ops
+    # comparison arrives via one-level predicate inlining, wrapped
+    # in the splice parens. It must narrow, not become a bit test.
+    header = (
+        "bool is_binfmt(const struct bpf_prog *prog)\n"
+        "{\n"
+        "\treturn prog->type == BPF_PROG_TYPE_STRUCT_OPS &&\n"
+        "\t       prog->aux->st_ops == &bpf_binfmt_misc_ops;\n"
+        "}\n")
+    verdict = _simulate_header(
+        "inlined_ops",
+        header,
+        "\tif (!btf_id_set8_contains(&probe_ids, kfunc_id))\n"
+        "\t\treturn -EACCES;\n"
+        "\tif (is_binfmt(prog))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS", "BPF_PROG_TYPE_TRACING"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["stops"] == {"bpf_binfmt_misc_ops"}
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_STRUCT_OPS"],
+         "attach": [], "stops": ["bpf_binfmt_misc_ops"],
+         "notes": ["requires struct_ops attachment to "
+                   "bpf_binfmt_misc_ops"]},
+    ]
+
+
+def test_kfunc_filter_member_offset_comparison_narrows():
+    # attach_st_ops_member_off against offsetof() narrows to the
+    # named member with a restriction note: offsets are not
+    # resolvable (member headers stay unpinned), so the member
+    # spelling carries the context.
+    verdict = _simulate_source(
+        "member_allow",
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+    verdict = _simulate_source(
+        "member_guard",
+        "\tif (prog->aux->attach_st_ops_member_off !=\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+
+
+def test_kfunc_filter_member_offset_contradiction_denies():
+    # Requiring and excluding the same member is contradictory.
+    verdict = _simulate_source(
+        "member_contra",
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, load) &&\n"
+        "\t    prog->aux->attach_st_ops_member_off !=\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # Two different required members stay satisfiable: their
+    # offsets may coincide and neither resolves from the pins.
+    verdict = _simulate_source(
+        "member_overlap",
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, load) &&\n"
+        "\t    prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, match))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+
+
+def test_kfunc_filter_member_offset_bad_shapes_rejected():
+    # Numbers, foreign calls and malformed offsetof spellings
+    # stay opaque: only offsetof(type, member) narrows.
+    _expect_unrecognized(
+        "member_number",
+        "\tif (prog->aux->attach_st_ops_member_off == 12)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        "unrecognized condition")
+    _expect_unrecognized(
+        "member_call",
+        "\tif (prog->aux->attach_st_ops_member_off == pick_off(prog))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        "unrecognized condition")
+    _expect_unrecognized(
+        "member_mirror",
+        "\tif (offsetof(struct probe_ops, load) ==\n"
+        "\t    prog->aux->attach_st_ops_member_off)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        "unrecognized condition")
+    _expect_unrecognized(
+        "member_shadowed",
+        "\tint offsetof = 0;\n"
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        "unrecognized condition")
+
+
+def test_kfunc_filter_compared_member_off_writes_rejected():
+    # A write to the compared member state before the comparison
+    # is outside the grammar, like any compared member.
+    _expect_unrecognized(
+        "member_write",
+        "\tprog->aux->attach_st_ops_member_off = 0;\n"
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        "outside the grammar")
+
+
+def test_lone_bitop_detector_ignores_address_of():
+    assert not uc._has_lone_bitop("prog->aux->st_ops == &probe_ops")
+    assert not uc._has_lone_bitop("x == &y")
+    assert not uc._has_lone_bitop("f(&x, &y)")
+    assert not uc._has_lone_bitop("a && &b")
+    assert not uc._has_lone_bitop("a = &b")
+    assert uc._has_lone_bitop("flags & FLAG")
+    assert uc._has_lone_bitop("(a&b)")
+    assert uc._has_lone_bitop("a\n& b")
+    assert uc._has_lone_bitop("&x & y")
+    assert uc._has_lone_bitop("a & &b")
+    assert uc._has_lone_bitop("a | b")
+    assert uc._has_lone_bitop("a ^ b")
+    assert not uc._has_lone_bitop("a && b")
+    assert not uc._has_lone_bitop("a || b")
+    # Postfix ++/-- before & declines bit-op reading and fails
+    # closed downstream (the condition tokenizer rejects +/-).
+    assert not uc._has_lone_bitop("a-- & b")
+    try:
+        _simulate_source(
+            "decrement_bitop",
+            "\tif ((x-- & 1))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "cannot parse filter condition" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_offsetof_matcher_accepts_single_members_only():
+    # Dotted paths never reach the matcher (the condition
+    # tokenizer has no '.'), so only one identifier matches.
+    assert uc._match_offsetof_call(
+        "offsetof(struct probe_ops, load)") == ("struct probe_ops", "load")
+    assert uc._match_offsetof_call(
+        "offsetof(struct probe_ops, nested.load)") is None
+
+
+def test_kfunc_filter_grouped_call_under_bitop_is_flagged():
+    # The bit-context check sees through extra parens: a boolean
+    # helper grouped under & still puts truth, not value, to work.
+    header = ("static bool pred(const struct bpf_prog *prog) "
+              "{ return prog->type; }\n")
+    try:
+        _simulate_header(
+            "grouped_bitop",
+            header,
+            "\tif (((pred(prog)) & 2))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "under a bit operator" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_offsetof_shadowed_by_file_binding():
+    # A file-scope offsetof binding (or #undef) defeats the
+    # builtin reading, like the errno table: the comparison
+    # cannot narrow.
+    header = ("#undef offsetof\n"
+              "enum { t = 0, m = 1 };\n"
+              "static unsigned long offsetof(int x, int y) "
+              "{ return ~0UL; }\n")
+    try:
+        _simulate_header(
+            "offsetof_shadowed",
+            header,
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(t, m))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_macro_aliased_member_is_flagged():
+    # A member spelling naming a macro could alias another
+    # spelling (MEMBER vs load below); the identity is unproven,
+    # so the comparison cannot narrow.
+    header = "#define MEMBER load\n"
+    try:
+        _simulate_header(
+            "macro_member",
+            header,
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, MEMBER) &&\n"
+            "\t    prog->aux->attach_st_ops_member_off !=\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "naming a macro" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_unrelated_tu_offsetof_ignored():
+    # Builtin defeat is scoped to the filter's file plus helper
+    # files: an offsetof declaration in an unrelated unit cannot
+    # block a valid comparison.
+    verdict = _simulate_files(
+        "scoped_member",
+        {"main.c": (
+            "static int scoped_member(const struct bpf_prog *prog,\n"
+            "                         u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+         "unrelated.c": (
+             "static unsigned long offsetof(int x, int y)\n"
+             "{ return ~0UL; }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+
+
+def test_kfunc_filter_typedef_aliased_member_contradicts():
+    # Member identity is the member name (offsets never resolve,
+    # so the struct spelling is documentary): a typedef-aliased
+    # require/exclude pair contradicts and denies.
+    header = "typedef struct probe_ops probe_alias;\n"
+    verdict = _simulate_header(
+        "typedef_member",
+        header,
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(probe_alias, load) &&\n"
+        "\t    prog->aux->attach_st_ops_member_off !=\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+
+
+def test_kfunc_filter_offsetof_invocation_is_flagged():
+    # A macro invocation inside offsetof argument position makes
+    # member identity depend on macro expansion: outside the
+    # grammar, whether spelled directly or in a called helper.
+    try:
+        _simulate_header(
+            "invoked_member",
+            "#define ID(x) x\n",
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, ID(load)))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro invocation" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    header = ("static bool picky(const struct bpf_prog *prog)\n"
+              "{\n"
+              "\treturn prog->aux->attach_st_ops_member_off ==\n"
+              "\t       offsetof(struct probe_ops, ID(load));\n"
+              "}\n"
+              "#define ID(x) x\n")
+    try:
+        _simulate_header(
+            "invoked_helper_member",
+            header,
+            "\tif (picky(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro invocation" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_unused_helper_file_not_in_scope():
+    # Builtin defeat covers the filter file plus files of CALLED
+    # helpers: an offsetof shadow beside an uncalled helper in
+    # another unit cannot block.
+    verdict = _simulate_files(
+        "scoped_called",
+        {"main.c": (
+            "static int scoped_called(const struct bpf_prog *prog,\n"
+            "                         u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+         "unrelated.c": (
+             "static unsigned long offsetof(int x, int y)\n"
+             "{ return ~0UL; }\n"
+             "static bool unused(const struct bpf_prog *prog)\n"
+             "{ return prog->type != BPF_PROG_TYPE_UNSPEC; }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+
+
+def test_kfunc_filter_helper_supplied_member_scope():
+    # A called helper supplying a member comparison joins the
+    # scope: clean files grant with both notes, a shadow in the
+    # helper's file defeats the builtin.
+    main_c = (
+        "static int scoped_supply(const struct bpf_prog *prog,\n"
+        "                         u32 kfunc_id)\n"
+        "{\n"
+        "\tif (other(prog) &&\n"
+        "\t    prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n")
+    helper = (
+        "static bool other(const struct bpf_prog *prog)\n"
+        "{ return prog->aux->attach_st_ops_member_off ==\n"
+        "           offsetof(struct probe_ops, match); }\n")
+    verdict = _simulate_files(
+        "scoped_supply",
+        {"main.c": main_c, "other.c": helper},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert sorted(verdict["probe_fn"]["notes"]) == [
+        "requires struct_ops member load of struct probe_ops",
+        "requires struct_ops member match of struct probe_ops"]
+    try:
+        _simulate_files(
+            "scoped_supply",
+            {"main.c": main_c,
+             "other.c": ("static unsigned long offsetof(int x, int y)\n"
+                         "{ return ~0UL; }\n" + helper)},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_member_scope_follows_text_provenance():
+    # Each member node is scoped to the files contributing its
+    # spelling: a shadow in the filter file cannot block a member
+    # compared only in a helper file, and vice versa.
+    verdict = _simulate_files(
+        "provenance_member",
+        {"main.c": (
+            "static unsigned long offsetof(int x, int y)\n"
+            "{ return ~0UL; }\n"
+            "static int provenance_member(const struct bpf_prog *prog,\n"
+            "                             u32 kfunc_id)\n"
+            "{\n"
+            "\tif (other(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+         "other.c": (
+             "static bool other(const struct bpf_prog *prog)\n"
+             "{ return prog->aux->attach_st_ops_member_off ==\n"
+             "           offsetof(struct probe_ops, load); }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+
+
+def test_kfunc_filter_offsetof_named_helper_not_in_scope():
+    # Scope follows member spellings, not name substrings: a
+    # helper merely calling z_offsetof_guard contributes no
+    # spelling, so its shadowed file stays out of scope.
+    verdict = _simulate_files(
+        "substring_member",
+        {"main.c": (
+            "static int substring_member(const struct bpf_prog *prog,\n"
+            "                            u32 kfunc_id)\n"
+            "{\n"
+            "\tif (h1(prog) &&\n"
+            "\t    prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+         "mid.c": (
+             "static unsigned long offsetof(int x, int y)\n"
+             "{ return ~0UL; }\n"
+             "static bool h1(const struct bpf_prog *prog)\n"
+             "{ return z_offsetof_guard(prog); }\n"
+             "static bool z_offsetof_guard(const struct bpf_prog *prog)\n"
+             "{ return prog->type != BPF_PROG_TYPE_UNSPEC; }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+
+
+def test_kfunc_filter_transitive_macro_invocation_is_flagged():
+    # The invocation scan follows the transitive call chain: an
+    # offsetof-with-invocation two helpers deep still rejects,
+    # even though only the outer helper is called directly.
+    try:
+        _simulate_files(
+            "chain_invoked",
+            {"main.c": (
+                "static int chain_invoked(const struct bpf_prog *prog,\n"
+                "                         u32 kfunc_id)\n"
+                "{\n"
+                "\tif (a_outer(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"),
+             "outer.c": (
+                 "static bool a_outer(const struct bpf_prog *prog)\n"
+                 "{ return z_inner(prog); }\n"),
+             "inner.c": (
+                 "#define ID(x) x\n"
+                 "static bool z_inner(const struct bpf_prog *prog)\n"
+                 "{ return prog->aux->attach_st_ops_member_off ==\n"
+                 "           offsetof(struct probe_ops, ID(load)); }\n"),
+             "unrelated.c": "#define load match\n"},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro invocation" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_conditional_rewrite_not_cleared_by_trailing_undef():
+    # A trailing #undef must not clear earlier conditional
+    # uncertainty: with CONFIG_SHADOW enabled the call expands
+    # to ~0UL and the allow branch is unreachable, so the
+    # comparison cannot narrow. The uncertain callee rewrite
+    # reports at the expansion check; the scope check keeps
+    # bindings and dead/never-defined states.
+    try:
+        _simulate_files(
+            "shadowed_rewrite",
+            {"main.c": (
+                "#include <linux/stddef.h>\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef offsetof\n"
+                "#define offsetof(T, M) (~0UL)\n"
+                "#endif\n"
+                "static int shadowed_rewrite(const struct bpf_prog *prog,\n"
+                "                            u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef offsetof\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_spliced_else_keeps_shadow_live():
+    # Line splices join with no space (C phase 2): a spliced
+    # #else still flips the branch, so the shadow beneath it
+    # stays live and defeats the builtin.
+    try:
+        _simulate_files(
+            "spliced_else",
+            {"main.c": (
+                "#include <linux/stddef.h>\n"
+                "#if 0\n"
+                "#el\\\n"
+                "se\n"
+                "#undef offsetof\n"
+                "static unsigned long offsetof(int x, int y)\n"
+                "{ return ~0UL; }\n"
+                "#endif\n"
+                "enum { t = 0, m = 1 };\n"
+                "static int spliced_else(const struct bpf_prog *prog,\n"
+                "                        u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(t, m))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_trailing_define_does_not_rewrite():
+    # A function-like #define after the filter cannot rewrite
+    # the earlier call: C uses the builtin there, so the
+    # comparison narrows normally.
+    verdict = _simulate_files(
+        "trailing_define_call",
+        {"main.c": (
+            "static int trailing_define_call(const struct bpf_prog *prog,\n"
+            "                                u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef offsetof\n"
+            "#define offsetof(T, M) (~0UL)\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+
+
+def test_kfunc_filter_positional_tables_grant_and_bind():
+    # Splice tables are positional per unit: a trailing same-file
+    # define cannot rewrite an earlier member call, while a helper
+    # body still splices with its own unit's tables.
+    verdict = _simulate_files(
+        "positional_tables",
+        {"main.c": (
+            "static int positional_tables(const struct bpf_prog *prog,\n"
+            "                             u32 kfunc_id)\n"
+            "{\n"
+            "\tif (other(prog) &&\n"
+            "\t    prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#define offsetof(T, M) (~0UL)\n"),
+         "other.c": (
+             "static bool other(const struct bpf_prog *prog)\n"
+             "{ return prog->type == BPF_PROG_TYPE_STRUCT_OPS; }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+
+
+def test_scoped_tables_match_universe_on_full_spans():
+    # Per-unit tables are built by the same mergers over
+    # truncated texts: full spans reproduce the universe build
+    # exactly, and trailing directives drop out of prefixes.
+    texts = {
+        "a.c": "#define KEEP 1\n#define CUT 2\nint x;\n",
+        "b.c": "#define OTHER 3\n",
+    }
+    universe = uc._prepare_macro_expansion(
+        dict(uc._merge_file_defines(texts)),
+        uc._merge_zero_arg_defines(texts),
+        uc._merge_param_defines(texts))
+    full = uc._scoped_macro_tables(
+        texts, [("a.c", 99), ("b.c", 99)], None)
+    assert dict(full[0]) == dict(universe[0])
+    assert dict(full[2]) == dict(universe[2])
+    assert dict(full[3]) == dict(universe[3])
+    assert full.definitions == universe.definitions
+    scoped = uc._scoped_macro_tables(texts, [("a.c", 1)], None)
+    assert "KEEP" in scoped[0]
+    assert "CUT" not in scoped[0]
+    assert "OTHER" in scoped[0]
+
+
+def test_kfunc_filter_trailing_unknown_undef_does_not_defeat():
+    # A trailing #undef in an unknown region is provably
+    # ineffective in all worlds (active: after the use;
+    # inactive: nothing), so the earlier comparison narrows.
+    verdict = _simulate_files(
+        "trailing_unknown_undef",
+        {"main.c": (
+            "static int trailing_unknown_undef(const struct bpf_prog *prog,\n"
+            "                                  u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#ifdef CONFIG_UNPROVEN_X\n"
+            "#undef offsetof\n"
+            "#endif\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+
+
+def test_kfunc_filter_offsetof_carve_needs_member_comparison():
+    # The offsetof exemption from the generic preprocessor check
+    # exists only for the member-comparison positional logic: a
+    # predicate call with an unproven macro override and no member
+    # comparison must still reject (Codex round 8, finding 1).
+    try:
+        _simulate_files(
+            "shadow_predicate",
+            {"main.c": (
+                "#undef offsetof\n"
+                "static bool offsetof(const struct bpf_prog *prog)\n"
+                "{ return true; }\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#define offsetof(p) false\n"
+                "#endif\n"
+                "static int shadow_predicate(\n"
+                "    const struct bpf_prog *prog, u32 kfunc_id)\n"
+                "{\n"
+                "\tif (offsetof(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_offsetof_carve_sees_transitive_predicate():
+    # The deferred check must see transitively called offsetof
+    # predicates, not just direct ones (Codex round 9, finding
+    # 1): a_outer inlines offsetof(prog), whose macro override
+    # is unproven, while z_member supplies a clean member
+    # comparison that must not excuse it.
+    files = {
+        "main.c": (
+            "static int trans_pred(const struct bpf_prog *prog,\n"
+            "                      u32 kfunc_id)\n"
+            "{\n"
+            "\tif (a_outer(prog) && z_member(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+        "outer.c": (
+            "#undef offsetof\n"
+            "static bool offsetof(const struct bpf_prog *prog)\n"
+            "{ return true; }\n"
+            "#ifdef CONFIG_SHADOW\n"
+            "#define offsetof(p) false\n"
+            "#endif\n"
+            "static bool a_outer(const struct bpf_prog *prog)\n"
+            "{ return offsetof(prog); }\n"),
+        "member.c": (
+            "static bool z_member(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(struct probe_ops, load); }\n"),
+    }
+    try:
+        _simulate_files(
+            "trans_pred", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_offsetof_carve_sees_deep_chain():
+    # consulted covers transitively inlined bodies: offsetof
+    # mentioned only two hops down must still trip the gate
+    # (Codex round 10, finding 1).
+    files = {
+        "main.c": (
+            "static int deep_pred(const struct bpf_prog *prog,\n"
+            "                     u32 kfunc_id)\n"
+            "{\n"
+            "\tif (a_outer(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+        "outer.c": (
+            "static bool a_outer(const struct bpf_prog *prog)\n"
+            "{ return b_middle(prog); }\n"),
+        "middle.c": (
+            "#undef offsetof\n"
+            "static bool offsetof(const struct bpf_prog *prog)\n"
+            "{ return true; }\n"
+            "#ifdef CONFIG_SHADOW\n"
+            "#define offsetof(p) false\n"
+            "#endif\n"
+            "static bool b_middle(const struct bpf_prog *prog)\n"
+            "{ return offsetof(prog); }\n"),
+    }
+    try:
+        _simulate_files(
+            "deep_pred", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Same root with a clean member comparison alongside: the
+    # deep predicate must still trip the gate.
+    files["main.c"] = (
+        "static int deep_pred(const struct bpf_prog *prog,\n"
+        "                     u32 kfunc_id)\n"
+        "{\n"
+        "\tif (a_outer(prog) && z_member(prog))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n")
+    files["member.c"] = (
+        "static bool z_member(const struct bpf_prog *prog)\n"
+        "{ return prog->aux->attach_st_ops_member_off ==\n"
+        "           offsetof(struct probe_ops, load); }\n")
+    try:
+        _simulate_files(
+            "deep_pred", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_offsetof_carve_sees_undefd_connector():
+    # The consulted closure must see ever-active macros, not
+    # just finally-live ones: CALL_OFFSET is live at the use
+    # but killed after, and hides the unproven offsetof
+    # predicate (Codex round 11, finding 1).
+    files = {
+        "main.c": (
+            "#undef offsetof\n"
+            "static bool offsetof(const struct bpf_prog *prog)\n"
+            "{ return true; }\n"
+            "#ifdef CONFIG_SHADOW\n"
+            "#define offsetof(p) false\n"
+            "#endif\n"
+            "#define CALL_OFFSET(p) offsetof(p)\n"
+            "static int conn_pred(const struct bpf_prog *prog,\n"
+            "                     u32 kfunc_id)\n"
+            "{\n"
+            "\tif (CALL_OFFSET(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef CALL_OFFSET\n"),
+    }
+    try:
+        _simulate_files(
+            "conn_pred", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Precision: a #undef'd connector over proven names still
+    # grants (ever-active consulted is a superset, not a veto).
+    verdict = _simulate_files(
+        "clean_conn",
+        {"main.c": (
+            "#define CALL(p) z_inner(p)\n"
+            "static int clean_conn(const struct bpf_prog *prog,\n"
+            "                      u32 kfunc_id)\n"
+            "{\n"
+            "\tif (CALL(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef CALL\n"),
+         "inner.c": (
+            "static bool z_inner(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(struct probe_ops, load); }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+    # Nested certain wrappers over certain names grant too: the
+    # transitive chase only fires on uncertainty.
+    verdict = _simulate_files(
+        "clean_nest",
+        {"main.c": (
+            "#define INNER(p) z_inner(p)\n"
+            "#define OUTER(p) INNER(p)\n"
+            "static int clean_nest(const struct bpf_prog *prog,\n"
+            "                      u32 kfunc_id)\n"
+            "{\n"
+            "\tif (OUTER(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef OUTER\n"
+            "#undef INNER\n"),
+         "inner.c": (
+            "static bool z_inner(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(struct probe_ops, load); }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+    # Same bypass with the connector inside a helper.
+    files = {
+        "main.c": (
+            "#undef offsetof\n"
+            "static bool offsetof(const struct bpf_prog *prog)\n"
+            "{ return true; }\n"
+            "#ifdef CONFIG_SHADOW\n"
+            "#define offsetof(p) false\n"
+            "#endif\n"
+            "static int conn_pred(const struct bpf_prog *prog,\n"
+            "                     u32 kfunc_id)\n"
+            "{\n"
+            "\tif (a_outer(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+        "outer.c": (
+            "#define CALL_OFFSET(p) offsetof(p)\n"
+            "static bool a_outer(const struct bpf_prog *prog)\n"
+            "{ return CALL_OFFSET(prog); }\n"
+            "#undef CALL_OFFSET\n"),
+    }
+    try:
+        _simulate_files(
+            "conn_pred", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_offsetof_carve_sees_return_scalar():
+    # A clean member comparison must not excuse an unproven
+    # offsetof folded as a return value (Codex round 9, finding
+    # 2): the SHADOW world returns 1 (deny) while the simulator
+    # folds 0 (allow).
+    files = {
+        "main.c": (
+            "#undef offsetof\n"
+            "#define offsetof 0\n"
+            "#ifdef CONFIG_SHADOW\n"
+            "#undef offsetof\n"
+            "#define offsetof 1\n"
+            "#endif\n"
+            "static int ret_scalar(const struct bpf_prog *prog,\n"
+            "                      u32 kfunc_id)\n"
+            "{\n"
+            "\tif (z_member(prog))\n"
+            "\t\treturn offsetof;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+        "member.c": (
+            "static bool z_member(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(struct probe_ops, load); }\n"),
+    }
+    try:
+        _simulate_files(
+            "ret_scalar", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Same hole through an atomic alias: the gate expands uses
+    # with offsetof itself held back, so `off` surfaces instead
+    # of vanishing into its value.
+    files["main.c"] = (
+        "#undef offsetof\n"
+        "#define offsetof 0\n"
+        "#ifdef CONFIG_SHADOW\n"
+        "#undef offsetof\n"
+        "#define offsetof 1\n"
+        "#endif\n"
+        "#define off offsetof\n"
+        "static int ret_scalar(const struct bpf_prog *prog,\n"
+        "                      u32 kfunc_id)\n"
+        "{\n"
+        "\tif (z_member(prog))\n"
+        "\t\treturn off;\n"
+        "\treturn -EACCES;\n"
+        "}\n")
+    try:
+        _simulate_files(
+            "ret_scalar", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_trailing_function_does_not_defeat():
+    # A static function defined after the filter is invisible at
+    # the earlier call (which the live macro expands), so it
+    # cannot shadow the builtin reading.
+    verdict = _simulate_files(
+        "trailing_function",
+        {"main.c": (
+            "static int trailing_function(const struct bpf_prog *prog,\n"
+            "                             u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef offsetof\n"
+            "static unsigned long offsetof(int x, int y)\n"
+            "{ return ~0UL; }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+
+
+def test_kfunc_filter_trailing_undef_does_not_defeat():
+    # #undef applies from its own line on: a directive after the
+    # filter's closing brace cannot defeat a builtin reading
+    # above it.
+    verdict = _simulate_files(
+        "trailing_undef",
+        {"main.c": (
+            "static int trailing_undef(const struct bpf_prog *prog,\n"
+            "                          u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef offsetof\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    # A #undef before the filter still defeats.
+    try:
+        _simulate_header(
+            "leading_undef",
+            "#undef offsetof\n",
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_undef_position_edges():
+    # Directives inside a body never reach the scope check: the
+    # body grammar rejects them first. Provably excluded regions
+    # never compiled.
+    try:
+        _simulate_source(
+            "midbody_undef",
+            "\tif (prog->type == BPF_PROG_TYPE_STRUCT_OPS)\n"
+            "\t\treturn 0;\n"
+            "#undef offsetof\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "preprocessor directive inside" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    verdict = _simulate_header(
+        "inactive_undef",
+        "#if 0\n#undef offsetof\n#endif\n",
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    # Unknown-region directives before the use reject: an
+    # uncertain callee rewrite reports at the expansion check
+    # (its charter: world-dependent definitions), while an
+    # undef-only name (never defined, so nothing to expand)
+    # skips expansion and defeats at the positional scope
+    # check. Both reject; the messages reflect the mechanism.
+    for tag, directive, fragment in (
+            ("unknown_undef", "#undef offsetof\n",
+             "builtin readings are defeated"),
+            ("unknown_define", "#define offsetof MYIMPL\n",
+             "unproven preprocessor state")):
+        try:
+            _simulate_header(
+                tag,
+                "#ifdef CONFIG_UNPROVEN_X\n" + directive + "#endif\n",
+                "\tif (prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n",
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_STRUCT_OPS",))
+        except uc.FilterNotUnderstood as exc:
+            assert fragment in str(exc), (tag, exc)
+        else:
+            raise AssertionError(
+                "expected FilterNotUnderstood for %s" % tag)
+
+
+def test_kfunc_filter_spliced_undef_defeats():
+    # Directive scanning joins logical lines first: a spliced
+    # #undef kills the builtin exactly like an unspliced one.
+    # (The shadow lives in unpinned shadow.h, so the #undef is
+    # the only visible signal.)
+    try:
+        _simulate_files(
+            "spliced_undef",
+            {"main.c": (
+                '#include <linux/stddef.h>\n#include "shadow.h"\n'
+                "#un\\\n"
+                "def offsetof\n"
+                "enum { t = 0, m = 1 };\n"
+                "static int spliced_undef(const struct bpf_prog *prog,\n"
+                "                         u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(t, m))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_live_define_offsetof_defeats():
+    # A live #define offsetof rewrites the callee, so the bound
+    # spelling is not the builtin; a trailing one provably
+    # cannot rewrite anything above it.
+    try:
+        _simulate_header(
+            "defined_offsetof",
+            "#define offsetof MYIMPL\n",
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    verdict = _simulate_files(
+        "trailing_define",
+        {"main.c": (
+            "static int trailing_define(const struct bpf_prog *prog,\n"
+            "                           u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#define offsetof MYIMPL\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+
+
+def test_kfunc_filter_transitive_helper_shadow_rejects():
+    # Builtin defeat follows the transitive call chain: a shadow
+    # in the inner helper's file blocks even though only the
+    # outer helper is called directly.
+    files = {
+        "main.c": (
+            "static int chain_member(const struct bpf_prog *prog,\n"
+            "                        u32 kfunc_id)\n"
+            "{\n"
+            "\tif (a_outer(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+        "outer.c": (
+            "static bool a_outer(const struct bpf_prog *prog)\n"
+            "{ return z_inner(prog); }\n"),
+        "inner.c": (
+            "enum { t = 0, m = 1 };\n"
+            "static unsigned long offsetof(int x, int y)\n"
+            "{ return ~0UL; }\n"
+            "static bool z_inner(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(t, m); }\n"),
+    }
+    try:
+        _simulate_files(
+            "chain_member", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A macro indirection the universe tables lose (#undef after
+    # the use) must not bypass the member-identity guard: ID/load
+    # resolve through macros, so the comparison is unproven
+    # (Codex round 8, finding 2).
+    files["outer.c"] = (
+        "#define NEXT(p) z_inner(p)\n"
+        "static bool a_outer(const struct bpf_prog *prog)\n"
+        "{ return NEXT(prog); }\n"
+        "#undef NEXT\n")
+    files["inner.c"] = (
+        "#define ID(x) x\n"
+        "static bool z_inner(const struct bpf_prog *prog)\n"
+        "{ return prog->aux->attach_st_ops_member_off ==\n"
+        "           offsetof(struct probe_ops, ID(load)); }\n")
+    files["stray.c"] = "#define load match\n"
+    try:
+        _simulate_files(
+            "chain_member", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro invocation" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    files["outer.c"] = (
+        "static bool a_outer(const struct bpf_prog *prog)\n"
+        "{ return z_inner(prog); }\n")
+    del files["stray.c"]
+    # Without the shadow the same chain grants with the member.
+    files["inner.c"] = (
+        "static bool z_inner(const struct bpf_prog *prog)\n"
+        "{ return prog->aux->attach_st_ops_member_off ==\n"
+        "           offsetof(struct probe_ops, load); }\n")
+    verdict = _simulate_files(
+        "chain_member", files, ("probe_fn",),
+        {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+    # A shadow in a conduit file (no member text of its own)
+    # cannot block the comparison supplied downstream.
+    files["outer.c"] = (
+        "static unsigned long offsetof(int x, int y)\n"
+        "{ return ~0UL; }\n"
+        "static bool a_outer(const struct bpf_prog *prog)\n"
+        "{ return z_inner(prog); }\n")
+    verdict = _simulate_files(
+        "chain_member", files, ("probe_fn",),
+        {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+
+
+def test_kfunc_filter_member_alias_resolves_in_helper_scope():
+    # A member spelling naming a macro in the helper's own scope
+    # is rejected even when the filter's table lacks it: MEMBER
+    # is defined after the filter but before z_inner, so C
+    # compares the same offset in both arms (Codex round 9,
+    # finding 3).
+    try:
+        _simulate_files(
+            "fwd_member",
+            {"main.c": (
+                "static bool z_inner(const struct bpf_prog *prog);\n"
+                "static int fwd_member(const struct bpf_prog *prog,\n"
+                "                      u32 kfunc_id)\n"
+                "{\n"
+                "\tif (z_inner(prog) &&\n"
+                "\t    prog->aux->attach_st_ops_member_off !=\n"
+                "\t    offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#define MEMBER load\n"
+                "static bool z_inner(const struct bpf_prog *prog)\n"
+                "{ return prog->aux->attach_st_ops_member_off ==\n"
+                "           offsetof(struct probe_ops, MEMBER); }\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven identity" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # The union covers contributing helpers only: an alias in
+    # an uncalled helper must not taint a clean filter.
+    verdict = _simulate_files(
+        "clean_member",
+        {"main.c": (
+            "static int clean_member(const struct bpf_prog *prog,\n"
+            "                        u32 kfunc_id)\n"
+            "{\n"
+            "\tif (z_member(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+         "member.c": (
+            "static bool z_member(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(struct probe_ops, load); }\n"),
+         "stray.c": (
+            "#define MEMBER load\n"
+            "static bool unused(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(struct probe_ops, MEMBER); }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+
+
+def test_kfunc_filter_late_helper_macro_spares_earlier_member():
+    # A helper's later macro must not taint the filter's own
+    # earlier member spelling: each spelling resolves in its
+    # own unit (Codex round 10, finding 2).
+    verdict = _simulate_files(
+        "early_member",
+        {"main.c": (
+            "static bool z_inner(const struct bpf_prog *prog);\n"
+            "static int early_member(const struct bpf_prog *prog,\n"
+            "                        u32 kfunc_id)\n"
+            "{\n"
+            "\tif (z_inner(prog) &&\n"
+            "\t    prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#define load match\n"
+            "static bool z_inner(const struct bpf_prog *prog)\n"
+            "{ return prog->type != BPF_PROG_TYPE_UNSPEC; }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+    # Crossed multi-spot case: the helper holds its own clean
+    # spot while its table aliases the filter's spelling. Each
+    # spelling still resolves in its own unit, so both notes
+    # stand (note-conjunction semantics are the engine's own,
+    # identical without any macro involved).
+    verdict = _simulate_files(
+        "crossed_member",
+        {"main.c": (
+            "static bool z_inner(const struct bpf_prog *prog);\n"
+            "static int crossed_member(const struct bpf_prog *prog,\n"
+            "                          u32 kfunc_id)\n"
+            "{\n"
+            "\tif (z_inner(prog) &&\n"
+            "\t    prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#define load match\n"
+            "static bool z_inner(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(struct probe_ops, other); }\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops",
+        "requires struct_ops member other of struct probe_ops"]
+
+
+def test_kfunc_filter_member_alias_sees_killed_conditional():
+    # A trailing #undef must not clear use-time uncertainty: in
+    # the SHADOW world match aliases load at the use while the
+    # final state is dead-certain, so the identity is unproven
+    # (Codex round 11, finding 2).
+    header = (
+        "struct probe_ops { int load; int match; };\n"
+        "#ifdef CONFIG_SHADOW\n"
+        "#define match load\n"
+        "#endif\n")
+    body = (
+        "static int cond_member(const struct bpf_prog *prog,\n"
+        "                       u32 kfunc_id)\n"
+        "{\n"
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, match) &&\n"
+        "\t    prog->aux->attach_st_ops_member_off !=\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+        "#undef match\n")
+    try:
+        _simulate_files(
+            "cond_member", {"main.c": header + body},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven identity" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Control: without the trailing #undef the same shape
+    # rejects at the early preprocessor check instead.
+    try:
+        _simulate_files(
+            "cond_member",
+            {"main.c": header + body.replace(
+                "}\n#undef match\n", "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A leading active #undef clears an earlier define: the use
+    # is dead-certain in all worlds, so it grants.
+    verdict = _simulate_files(
+        "cleared_member",
+        {"main.c": (
+            "struct probe_ops { int load; int match; };\n"
+            "#define match load\n"
+            "#undef match\n"
+            "static int cleared_member(const struct bpf_prog *prog,\n"
+            "                          u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->aux->attach_st_ops_member_off ==\n"
+            "\t    offsetof(struct probe_ops, match))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member match of struct probe_ops"]
+    # Same uncertainty inside a helper's own unit.
+    try:
+        _simulate_files(
+            "helper_member",
+            {"main.c": (
+                "static int helper_member(const struct bpf_prog *prog,\n"
+                "                         u32 kfunc_id)\n"
+                "{\n"
+                "\tif (z_inner(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"),
+             "inner.c": (
+                "#ifdef CONFIG_SHADOW\n"
+                "#define MEMBER load\n"
+                "#endif\n"
+                "static bool z_inner(const struct bpf_prog *prog)\n"
+                "{ return prog->aux->attach_st_ops_member_off ==\n"
+                "           offsetof(struct probe_ops, MEMBER); }\n"
+                "#undef MEMBER\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven identity" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_strip_comments_joins_continuations_first():
+    # Phase 2 precedes phase 3: a backslash-newline inside a //
+    # comment joins the next line into it (newlines preserved).
+    assert uc.strip_comments(
+        "x = 1; // hide \\\n#define Y 1\nint z;\n") == \
+        "x = 1;  \n\nint z;\n"
+    # A // opener inside a block comment never starts one, and
+    # strings on the line survive verbatim.
+    assert uc.strip_comments("/* // */\nint z;\n") == " \nint z;\n"
+    assert uc.strip_comments("x = \"a//b\"; // c\nint z;\n") == \
+        "x = \"a//b\";  \nint z;\n"
+
+
+def test_kfunc_filter_continued_comment_hides_else_branch():
+    # Translation phase 2 joins continued lines before phase 3
+    # strips comments: the #else below is commented out, so the
+    # member alias is active and the identity is unproven
+    # (Codex round 12, finding 1).
+    header = (
+        "struct probe_ops { int load; int match; };\n"
+        "#if 1\n"
+        "// hide else \\\n"
+        "#else\n"
+        "#define match load\n"
+        "#endif\n")
+    body = (
+        "static int cont_comment(const struct bpf_prog *prog,\n"
+        "                        u32 kfunc_id)\n"
+        "{\n"
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct probe_ops, match) &&\n"
+        "\t    prog->aux->attach_st_ops_member_off !=\n"
+        "\t    offsetof(struct probe_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n")
+    try:
+        _simulate_files(
+            "cont_comment", {"main.c": header + body},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven identity" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Control: without the continuation the #else is live, the
+    # define sits in the skipped branch, and the filter grants.
+    verdict = _simulate_files(
+        "cont_comment",
+        {"main.c": header.replace("// hide else \\\n",
+                                  "// hide else\n") + body},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    # A continued comment hiding a #define kills it: the alias
+    # is dead and the filter grants.
+    verdict = _simulate_files(
+        "cont_define",
+        {"main.c": (
+            "struct probe_ops { int load; int match; };\n"
+            "// hide \\\n"
+            "#define match load\n") + body.replace(
+                "cont_comment", "cont_define")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    # Exact-C splicing: trailing spaces after the backslash
+    # mean no continuation, so the #else stays live.
+    verdict = _simulate_files(
+        "cont_comment",
+        {"main.c": header.replace("// hide else \\\n",
+                                  "// hide else \\   \n") + body},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+
+
+def test_kfunc_filter_gate_rewrite_cleared_by_trailing_undef():
+    # A trailing #undef must not clear use-time rewrite
+    # uncertainty: in the SHADOW world GATE denies while
+    # positional expansion follows the original definition
+    # (Codex round 12, finding 2).
+    try:
+        _simulate_files(
+            "gate_rewrite",
+            {"main.c": (
+                "#define GATE(p) p->aux->attach_st_ops_member_off"
+                " == offsetof(struct probe_ops, load)\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef GATE\n"
+                "#define GATE(p) (0)\n"
+                "#endif\n"
+                "static int gate_rewrite(const struct bpf_prog *prog,\n"
+                "                        u32 kfunc_id)\n"
+                "{\n"
+                "\tif (GATE(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef GATE\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Control: without the trailing #undef the same shape
+    # rejects at the early preprocessor check instead.
+    try:
+        _simulate_files(
+            "gate_rewrite",
+            {"main.c": (
+                "#define GATE(p) p->aux->attach_st_ops_member_off"
+                " == offsetof(struct probe_ops, load)\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef GATE\n"
+                "#define GATE(p) (0)\n"
+                "#endif\n"
+                "static int gate_rewrite(const struct bpf_prog *prog,\n"
+                "                        u32 kfunc_id)\n"
+                "{\n"
+                "\tif (GATE(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Precision: a gate macro with no rewrite expands
+    # deterministically and grants.
+    verdict = _simulate_files(
+        "plain_gate",
+        {"main.c": (
+            "#define GATE(p) p->aux->attach_st_ops_member_off"
+            " == offsetof(struct probe_ops, load)\n"
+            "static int plain_gate(const struct bpf_prog *prog,\n"
+            "                      u32 kfunc_id)\n"
+            "{\n"
+            "\tif (GATE(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == [
+        "requires struct_ops member load of struct probe_ops"]
+    # Same rewrite uncertainty inside a helper's own unit.
+    try:
+        _simulate_files(
+            "helper_gate",
+            {"main.c": (
+                "static int helper_gate(const struct bpf_prog *prog,\n"
+                "                       u32 kfunc_id)\n"
+                "{\n"
+                "\tif (z_inner(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"),
+             "inner.c": (
+                "#define G(p) p->aux->attach_st_ops_member_off"
+                " == offsetof(struct probe_ops, load)\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef G\n"
+                "#define G(p) (0)\n"
+                "#endif\n"
+                "static bool z_inner(const struct bpf_prog *prog)\n"
+                "{ return G(prog); }\n"
+                "#undef G\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # An uncertain object macro in a plain comparison rejects
+    # the same way (expansion, not aliasing).
+    try:
+        _simulate_files(
+            "type_rewrite",
+            {"main.c": (
+                "#define T BPF_PROG_TYPE_XDP\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef T\n"
+                "#define T BPF_PROG_TYPE_TRACING\n"
+                "#endif\n"
+                "static int type_rewrite(const struct bpf_prog *prog,\n"
+                "                        u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->type == T)\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef T\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_TRACING"))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Precision: an uncertain macro that is never used cannot
+    # taint the verdict.
+    verdict = _simulate_files(
+        "unused_rewrite",
+        {"main.c": (
+            "#define U 1\n"
+            "#ifdef CONFIG_SHADOW\n"
+            "#undef U\n"
+            "#define U 2\n"
+            "#endif\n"
+            "static int unused_rewrite(const struct bpf_prog *prog,\n"
+            "                          u32 kfunc_id)\n"
+            "{\n"
+            "\tif (prog->type == BPF_PROG_TYPE_XDP)\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef U\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_XDP",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+    # A bare spelling inside a member spot belongs to the
+    # alias check by positional jurisdiction (the expansion
+    # check judges everything outside spots), so it reports
+    # identity even though the macro is also uncertain.
+    try:
+        _simulate_files(
+            "bare_gate",
+            {"main.c": (
+                "#define GATE(p) p->x\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef GATE\n"
+                "#define GATE(p) (0)\n"
+                "#endif\n"
+                "static int bare_gate(const struct bpf_prog *prog,\n"
+                "                     u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(struct probe_ops, GATE))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef GATE\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "naming a macro" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_expansion_check_sees_nested_wrapper():
+    # The expansion check chases macro bodies transitively: a
+    # certain wrapper cannot hide its uncertain dependency
+    # (Codex round 13, finding 1).
+    header = (
+        "#define GATE(p) p->aux->attach_st_ops_member_off == \\\n"
+        "                        offsetof(struct probe_ops, load)\n"
+        "#ifdef CONFIG_SHADOW\n"
+        "#undef GATE\n"
+        "#define GATE(p) (0)\n"
+        "#endif\n"
+        "#define WRAP(p) GATE(p)\n")
+    body = (
+        "static int nest_wrap(const struct bpf_prog *prog,\n"
+        "                     u32 kfunc_id)\n"
+        "{\n"
+        "\tif (WRAP(prog))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+        "#undef GATE\n")
+    try:
+        _simulate_files(
+            "nest_wrap", {"main.c": header + body},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Two nested wrappers behave identically (fixpoint depth).
+    try:
+        _simulate_files(
+            "nest_wrap2",
+            {"main.c": header + "#define WRAP2(p) WRAP(p)\n" +
+                body.replace("nest_wrap", "nest_wrap2").replace(
+                    "WRAP(prog)", "WRAP2(prog)")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A wrapper over an unknown-only macro stays opaque (no
+    # resolved expansion to chase) and rejects upstream.
+    try:
+        _simulate_files(
+            "wrap_unknown",
+            {"main.c": (
+                "#define WRAP(p) MYSTERY(p)\n"
+                "#ifdef CONFIG_X\n"
+                "#define MYSTERY(p) (1)\n"
+                "#endif\n"
+                "static int wrap_unknown(const struct bpf_prog *prog,\n"
+                "                        u32 kfunc_id)\n"
+                "{\n"
+                "\tif (WRAP(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Self-recursive macros terminate (expander and closure
+    # both bound the chain) and reject.
+    try:
+        _simulate_files(
+            "self_rec",
+            {"main.c": (
+                "#define R R\n"
+                "static int self_rec(const struct bpf_prog *prog,\n"
+                "                    u32 kfunc_id)\n"
+                "{\n"
+                "\tif (R && prog->type == BPF_PROG_TYPE_XDP)\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_XDP",))
+    except uc.FilterNotUnderstood as exc:
+        assert "does not terminate" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_member_access_expands_uncertain_macro():
+    # Preprocessing is token-based: an identifier following ->
+    # still expands, so member access never excuses an
+    # uncertain macro (Codex round 13, finding 2).
+    try:
+        _simulate_files(
+            "pick_field",
+            {"main.c": (
+                "#define PICK() type\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef PICK\n"
+                "#define PICK() expected_attach_type\n"
+                "#endif\n"
+                "static int pick_field(const struct bpf_prog *prog,\n"
+                "                      u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->PICK() == BPF_PROG_TYPE_STRUCT_OPS &&\n"
+                "\t    prog->expected_attach_type !="
+                " BPF_PROG_TYPE_STRUCT_OPS &&\n"
+                "\t    prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef PICK\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Atomic field-macro spellings stay opaque (pre-existing
+    # limitation, verified identical at base: presentation
+    # spellings never rename fields).
+    try:
+        _simulate_files(
+            "member_macro",
+            {"main.c": (
+                "#define TYPE type\n"
+                "static int member_macro(const struct bpf_prog *prog,\n"
+                "                        u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->TYPE == BPF_PROG_TYPE_XDP)\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_XDP",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unrecognized condition" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A dotted offsetof operand dies at the tokenizer, so
+    # receiver-blind binding is unreachable.
+    try:
+        _simulate_files(
+            "dot_operand",
+            {"main.c": (
+                "static int dot_operand(const struct bpf_prog *prog,\n"
+                "                       u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->aux->attach_st_ops_member_off ==\n"
+                "\t    x.offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "cannot parse filter condition" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_expansion_check_sees_unresolved_field():
+    # Unresolved does not mean harmless: an unknown-region
+    # macro over an existing field name still rewrites it in
+    # some worlds, while the simulator reads the raw spelling
+    # as valid grammar (Codex round 14, finding 1, field
+    # variant).
+    try:
+        _simulate_files(
+            "shadow_field",
+            {"main.c": (
+                "#ifdef CONFIG_SHADOW\n"
+                "#define type expected_attach_type\n"
+                "#endif\n"
+                "static int shadow_field(const struct bpf_prog *prog,\n"
+                "                        u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->type == BPF_PROG_TYPE_STRUCT_OPS &&\n"
+                "\t    prog->expected_attach_type !="
+                " BPF_PROG_TYPE_STRUCT_OPS &&\n"
+                "\t    prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef type\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_expansion_check_sees_unresolved_helper():
+    # Same hole through helper inlining: the SHADOW world
+    # rewrites the callee to a constant while the simulator
+    # inlines the function body (Codex round 14, finding 1,
+    # helper variant).
+    try:
+        _simulate_files(
+            "shadow_callee",
+            {"main.c": (
+                "static bool z_check(const struct bpf_prog *prog)\n"
+                "{\n"
+                "\treturn prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(struct probe_ops, load);\n"
+                "}\n"
+                "#define WRAP(p) z_check(p)\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#define z_check(p) (0)\n"
+                "#endif\n"
+                "static int shadow_callee(const struct bpf_prog *prog,\n"
+                "                         u32 kfunc_id)\n"
+                "{\n"
+                "\tif (WRAP(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef z_check\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_expansion_check_sees_uncertain_callee():
+    # The member-spot exemption must not hide the callee: an
+    # uncertain offsetof rewrite governs the whole call, and
+    # with no member comparison bound neither the alias check
+    # (spliced call already gone) nor the scope check (runs
+    # only on bind) sees it (Codex round 15, finding 1).
+    try:
+        _simulate_files(
+            "shadow_callee",
+            {"main.c": (
+                "#define offsetof(t, m) (1)\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef offsetof\n"
+                "#define offsetof(t, m) (0)\n"
+                "#endif\n"
+                "static int shadow_callee(const struct bpf_prog *prog,\n"
+                "                         u32 kfunc_id)\n"
+                "{\n"
+                "\tif (offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef offsetof\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_expansion_check_joins_splices():
+    # Identifier scanning joins line splices first: a helper
+    # spelling split across a continuation still names the
+    # uncertain macro (Codex round 15, finding 2).
+    try:
+        _simulate_files(
+            "spliced_ident",
+            {"main.c": (
+                "#ifdef CONFIG_SHADOW\n"
+                "#define type expected_attach_type\n"
+                "#endif\n"
+                "static bool z_check(const struct bpf_prog *prog)\n"
+                "{\n"
+                "\treturn prog->ty\\\n"
+                "pe == BPF_PROG_TYPE_STRUCT_OPS &&\n"
+                "\t    prog->expected_attach_type !="
+                " BPF_PROG_TYPE_STRUCT_OPS;\n"
+                "}\n"
+                "static int spliced_ident(const struct bpf_prog *prog,\n"
+                "                         u32 kfunc_id)\n"
+                "{\n"
+                "\tif (z_check(prog))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef type\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven preprocessor state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A spliced member alias still reports identity: the
+    # alias path joins continuations end to end.
+    try:
+        _simulate_files(
+            "spliced_alias",
+            {"main.c": (
+                "#ifdef CONFIG_SHADOW\n"
+                "#define load match\n"
+                "#endif\n"
+                "static int spliced_alias(const struct bpf_prog *prog,\n"
+                "                         u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->aux->attach_st_ops_member_off ==\n"
+                "\t    offsetof(struct probe_ops, loa\\\n"
+                "d))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef load\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven identity" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Spliced uncertain spellings in arms and initializers
+    # reject through folder failure (final-dead names cannot
+    # fold), so no consulted change is needed for splices.
+    try:
+        _simulate_files(
+            "arm_frag",
+            {"main.c": (
+                "#ifdef CONFIG_SHADOW\n"
+                "#define THRESH 1\n"
+                "#endif\n"
+                "static int arm_frag(const struct bpf_prog *prog,\n"
+                "                    u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->type == BPF_PROG_TYPE_XDP)\n"
+                "\t\treturn THRE\\\n"
+                "SH;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef THRESH\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_XDP",))
+    except uc.FilterNotUnderstood as exc:
+        assert "cannot parse" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_files(
+            "init_frag",
+            {"main.c": (
+                "#ifdef CONFIG_SHADOW\n"
+                "#define THRESH 1\n"
+                "#endif\n"
+                "static int init_frag(const struct bpf_prog *prog,\n"
+                "                     u32 kfunc_id)\n"
+                "{\n"
+                "\tint t = THRE\\\n"
+                "SH;\n"
+                "\tif (prog->type == t)\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef THRESH\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_XDP",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unrecognized condition" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_alias_sees_erased_spot():
+    # A deterministic callee expansion must not hide an
+    # uncertain argument: the alias guard scans the raw unit
+    # too, so the erased spot still reports identity (Codex
+    # round 16, finding 1).
+    try:
+        _simulate_files(
+            "erased_spot",
+            {"main.c": (
+                "#define offsetof(t, m) (m)\n"
+                "#define load 1\n"
+                "#ifdef CONFIG_SHADOW\n"
+                "#undef load\n"
+                "#define load 0\n"
+                "#endif\n"
+                "static int erased_spot(const struct bpf_prog *prog,\n"
+                "                       u32 kfunc_id)\n"
+                "{\n"
+                "\tif (offsetof(struct probe_ops, load))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"
+                "#undef load\n")},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unproven identity" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Precision: a deterministic erasure grants (all worlds
+    # agree), with no member note to misspell.
+    verdict = _simulate_files(
+        "certain_erasure",
+        {"main.c": (
+            "#define offsetof(t, m) (1)\n"
+            "static int certain_erasure(const struct bpf_prog *prog,\n"
+            "                           u32 kfunc_id)\n"
+            "{\n"
+            "\tif (offsetof(struct probe_ops, load))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n")},
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["probe_fn"]["notes"] == []
+
+
+def test_kfunc_filter_undefd_call_hides_live_offsetof_define():
+    # A macro indirection the universe tables lose (#undef after
+    # the use) must not bypass the shadow guard: the live
+    # #define offsetof in the inner file defeats the builtin
+    # reading even though universe discovery misses the chain
+    # (Codex round 8, finding 3).
+    files = {
+        "main.c": (
+            "#define CALL(p) z_inner(p)\n"
+            "static int chain_call(const struct bpf_prog *prog,\n"
+            "                      u32 kfunc_id)\n"
+            "{\n"
+            "\tif (CALL(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"
+            "#undef CALL\n"),
+        "inner.c": (
+            "enum { t = 0, m = 1 };\n"
+            "#define offsetof impl\n"
+            "static unsigned long impl(int x, int y)\n"
+            "{ return ~0UL; }\n"
+            "static bool z_inner(const struct bpf_prog *prog)\n"
+            "{ return prog->aux->attach_st_ops_member_off ==\n"
+            "           offsetof(t, m); }\n"),
+    }
+    try:
+        _simulate_files(
+            "chain_call", files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_unmatched_member_sees_live_offsetof_define():
+    # The fallback governs member spellings matched to no unit,
+    # so the use position is unknown and any-time directives
+    # count: a live #define offsetof defeats even though no
+    # declaration or #undef names it (Codex round 8, finding 3).
+    parsed = [("if", ("member_cmp", "==", "t", "m"),
+               ("seq",), {})]
+    stmts = [("if", "prog->type == 1", ("seq",))]
+    texts = {"a.c": uc.strip_comments(
+        "#define offsetof impl\n"
+        "static unsigned long impl(int x, int y)\n"
+        "{ return ~0UL; }\n")}
+    try:
+        uc._reject_defeated_offsetof(
+            parsed, stmts, texts, {}, "prog", None, None, {},
+            "a.c", 3, "probe", "v9")
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A redefined-then-killed spelling counts too: the unknown
+    # use position may sit in the live span.
+    texts["a.c"] = uc.strip_comments(
+        "#define offsetof impl\n"
+        "static unsigned long impl(int x, int y)\n"
+        "{ return ~0UL; }\n"
+        "#undef offsetof\n")
+    try:
+        uc._reject_defeated_offsetof(
+            parsed, stmts, texts, {}, "prog", None, None, {},
+            "a.c", 4, "probe", "v9")
+    except uc.FilterNotUnderstood as exc:
+        assert "builtin readings are defeated" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # With no directive or binding trace the fallback still
+    # grants (fail-open shape unchanged for clean trees).
+    texts["a.c"] = uc.strip_comments(
+        "static int probe(const struct bpf_prog *prog)\n"
+        "{ return 1; }\n")
+    uc._reject_defeated_offsetof(
+        parsed, stmts, texts, {}, "prog", None, None, {},
+        "a.c", 3, "probe", "v9")
+
+
+def test_kfunc_filter_spliced_offsetof_invocation_is_flagged():
+    # A line splice cannot hide a macro invocation from the
+    # shape check: the callee still takes ID(load).
+    try:
+        _simulate_files(
+            "spliced_member",
+            {"main.c": (
+                "#define ID(x) x\n"
+                "struct probe_ops { int load; int match; };\n"
+                "static int spliced_member(const struct bpf_prog *prog,\n"
+                "                          u32 kfunc_id)\n"
+                "{\n"
+                "\tif (prog->aux->attach_st_ops_member_off == offse\\\n"
+                "tof(struct probe_ops, ID(load)))\n"
+                "\t\treturn 0;\n"
+                "\treturn -EACCES;\n"
+                "}\n"),
+             "unrelated.c": "#define load match\n"},
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro invocation" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Same hole through a helper body: the splice joins the
+    # callee and universe expansion would launder the member.
+    helper_files = {
+        "main.c": (
+            "#define ID(x) x\n"
+            "static bool picky(const struct bpf_prog *prog)\n"
+            "{\n"
+            "\treturn prog->aux->attach_st_ops_member_off == offse\\\n"
+            "tof(struct probe_ops, ID(load));\n"
+            "}\n"
+            "static int spliced_helper(const struct bpf_prog *prog,\n"
+            "                          u32 kfunc_id)\n"
+            "{\n"
+            "\tif (picky(prog))\n"
+            "\t\treturn 0;\n"
+            "\treturn -EACCES;\n"
+            "}\n"),
+        "unrelated.c": "#define load match\n",
+    }
+    try:
+        _simulate_files(
+            "spliced_helper", helper_files, ("probe_fn",),
+            {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_STRUCT_OPS",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro invocation" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_distinct_struct_members_stay_distinct():
+    # Provably different struct tags keep their members
+    # distinct: requiring load-at-0 while excluding load-at-4
+    # grants.
+    verdict = _simulate_source(
+        "distinct_members",
+        "\tif (prog->aux->attach_st_ops_member_off ==\n"
+        "\t    offsetof(struct a_ops, load) &&\n"
+        "\t    prog->aux->attach_st_ops_member_off !=\n"
+        "\t    offsetof(struct b_ops, load))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_STRUCT_OPS",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_STRUCT_OPS"}
+    assert sorted(verdict["probe_fn"]["notes"]) == [
+        "excludes struct_ops member load of struct b_ops",
+        "requires struct_ops member load of struct a_ops"]
 
 
 def test_kfunc_filter_alias_mutation_is_flagged():
@@ -3989,11 +6369,15 @@ FILTER_CORPUS_FLAGGED = [
      "\t\treturn -EACCES;\n"
      "\treturn 0;\n",
      "unrecognized condition"),
+    # A membership test over a literal id degrades to an opaque
+    # atom (per the documented design) and the guarded denial has
+    # no provable scope, so the filter is rejected at denial
+    # scoping rather than at tokenizing.
     ("wrong_id_membership",
      "\tif (!btf_id_set8_contains(&corpus_ids, 42))\n"
      "\t\treturn -EACCES;\n"
      "\treturn 0;\n",
-     "cannot parse filter condition"),
+     "cannot scope the denial"),
     ("stops_null_deny",
      "\tif (!prog->aux->st_ops)\n"
      "\t\treturn -EACCES;\n"
@@ -4097,7 +6481,7 @@ def test_scx_dsq_move_alternatives_stay_distinct():
     move = records["kfunc:scx_bpf_dsq_move"]
     assert move["helpers_or_kfuncs"][0]["callable"] is True
     lines = move["callable_context_predicates"]
-    assert "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)" in lines
+    assert "callable from BPF_PROG_TYPE_SYSCALL (7.3.5)" in lines
     dispatch = [line for line in lines if "SCX_KF_ALLOW_DISPATCH" in line]
     unlocked = [line for line in lines if "SCX_KF_ALLOW_UNLOCKED" in line]
     assert len(dispatch) == 1, lines
@@ -4160,18 +6544,20 @@ def test_structops_consumers_enumerated():
     records = {entry["id"]: entry for entry in registry["records"]
                if entry["family"] == "structops-consumers"}
     assert sorted(records) == [
-        "structops:dummy", "structops:hid-bpf", "structops:qdisc",
-        "structops:smc-hs", "structops:tcp-congestion"]
+        "structops:binfmt-misc", "structops:dummy", "structops:hid-bpf",
+        "structops:qdisc", "structops:smc-hs", "structops:tcp-congestion"]
     want_present = {
-        "structops:dummy": ["6.12.112", "6.6.158", "7.2.9"],
-        "structops:hid-bpf": ["6.12.112", "7.2.9"],
-        "structops:qdisc": ["7.2.9"],
-        "structops:smc-hs": ["7.2.9"],
-        "structops:tcp-congestion": ["6.12.112", "6.6.158", "7.2.9"],
+        "structops:binfmt-misc": ["7.3.5"],
+        "structops:dummy": ["6.12.118", "6.6.162", "7.3.5"],
+        "structops:hid-bpf": ["6.12.118", "7.3.5"],
+        "structops:qdisc": ["7.3.5"],
+        "structops:smc-hs": ["7.3.5"],
+        "structops:tcp-congestion": ["6.12.118", "6.6.162", "7.3.5"],
     }
     members = {(item["container"], item["name"]): item
                for item in registry["enum_members"]}
     want_symbols = {
+        "structops:binfmt-misc": "bpf_binfmt_misc_ops",
         "structops:dummy": "bpf_bpf_dummy_ops",
         "structops:hid-bpf": "bpf_hid_bpf_ops",
         "structops:qdisc": "bpf_Qdisc_ops",
@@ -4192,7 +6578,7 @@ def test_structops_consumers_enumerated():
         assert member["record_id"] == rid
         assert sorted(member["present_in"]) == present
     hid = records["structops:hid-bpf"]
-    assert any("absent from 6.6.158" in line
+    assert any("absent from 6.6.162" in line
                for line in hid["callable_context_predicates"])
 
 
@@ -4201,20 +6587,20 @@ def test_sched_ext_interface_enumerated():
     records = {entry["id"]: entry for entry in registry["records"]
                if entry["family"] == "sched-ext"}
     assert "scx:sched-ext" in records
-    assert len(records) == 43, len(records)
+    assert len(records) == 54, len(records)
     sched = records["scx:sched-ext"]
     assert sched["owner_task"] == "O-SCX"
     assert any("docs.kernel.org/scheduler/sched-ext.html" in ref
                for ref in sched["upstream_source_refs"])
     assert any("no stability guarantees" in line
                for line in sched["callable_context_predicates"])
-    assert any("absent from 6.6.158" in line
+    assert any("absent from 6.6.162" in line
                for line in sched["callable_context_predicates"])
     assert any(line.endswith("#bpf_sched_ext_ops")
                for line in sched["kernel_registration_refs"])
     callbacks = {rid: entry for rid, entry in records.items()
                  if rid != "scx:sched-ext"}
-    assert len(callbacks) == 42
+    assert len(callbacks) == 53
     for rid, entry in callbacks.items():
         assert entry["owner_task"] == "O-SCX", rid
         assert entry["program_types"] == ["BPF_PROG_TYPE_STRUCT_OPS"], rid
@@ -4222,15 +6608,15 @@ def test_sched_ext_interface_enumerated():
         assert any(line.startswith("callback signature")
                    for line in entry["callable_context_predicates"]), rid
     select_cpu = callbacks["scx:select_cpu"]
-    assert any("cpu-form (6.12.112, 7.2.9)" in line
+    assert any("cpu-form (6.12.118, 7.3.5)" in line
                for line in select_cpu["callable_context_predicates"])
     select_cid = callbacks["scx:select_cid"]
-    assert any("cid-form (7.2.9)" in line
+    assert any("cid-form (7.3.5)" in line
                for line in select_cid["callable_context_predicates"])
     enqueue = callbacks["scx:enqueue"]
-    assert any("cpu-form (6.12.112, 7.2.9)" in line
+    assert any("cpu-form (6.12.118, 7.3.5)" in line
                for line in enqueue["callable_context_predicates"])
-    assert any("cid-form (7.2.9)" in line
+    assert any("cid-form (7.3.5)" in line
                for line in enqueue["callable_context_predicates"])
     members = {(item["container"], item["name"]): item
                for item in registry["enum_members"]}
@@ -4251,23 +6637,24 @@ def test_no_upstream_blockers_remain_except_afxdp():
 def test_lock_pins_scheduler_and_consumer_sources():
     lock = load_lock()
     files = lock["kernel_files"]
-    assert "kernel/sched/ext.c" in files["6.12.112"]
-    assert "include/linux/sched/ext.h" in files["6.12.112"]
-    assert "drivers/hid/bpf/hid_bpf_struct_ops.c" in files["6.12.112"]
-    assert "net/bpf/bpf_dummy_struct_ops.c" in files["6.12.112"]
+    assert "kernel/sched/ext.c" in files["6.12.118"]
+    assert "include/linux/sched/ext.h" in files["6.12.118"]
+    assert "drivers/hid/bpf/hid_bpf_struct_ops.c" in files["6.12.118"]
+    assert "net/bpf/bpf_dummy_struct_ops.c" in files["6.12.118"]
     for relpath in ("kernel/sched/ext/internal.h",
                     "kernel/sched/ext/ext.c", "kernel/sched/ext/idle.c",
                     "kernel/sched/ext/cid.c",
                     "include/linux/sched/ext.h",
                     "drivers/hid/bpf/hid_bpf_struct_ops.c",
                     "net/bpf/bpf_dummy_struct_ops.c",
-                    "net/smc/smc_hs_bpf.c"):
-        assert relpath in files["7.2.9"], relpath
-    assert files["6.6.158"].count(
+                    "net/smc/smc_hs_bpf.c",
+                    "fs/binfmt_misc_bpf.c"):
+        assert relpath in files["7.3.5"], relpath
+    assert files["6.6.162"].count(
         "net/bpf/bpf_dummy_struct_ops.c") == 1
-    assert not [relpath for relpath in files["6.6.158"]
+    assert not [relpath for relpath in files["6.6.162"]
                 if relpath.startswith("kernel/sched/")]
-    assert "drivers/hid/bpf/hid_bpf_struct_ops.c" not in files["6.6.158"]
+    assert "drivers/hid/bpf/hid_bpf_struct_ops.c" not in files["6.6.162"]
     kernel = next(entry for entry in lock["sources"]
                   if entry["id"] == "linux-kernel")
     pinned = {(version["version"], item["name"]): item
@@ -6621,7 +9008,7 @@ def test_kfunc_filter_aliased_calls_invalidate():
         ("probe_fn",), {"probe_ids": {"probe_fn"}},
         ("BPF_PROG_TYPE_TRACING",))
     assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
-    # Corpus shape (7.2.9 scx/qdisc filters): integer locals
+    # Corpus shape (7.3.5 scx/qdisc filters): integer locals
     # declared without an initializer and assigned later are
     # still proven value types, whether plain-declared or the
     # last declarator of a multi-declarator; passing them by
@@ -13589,6 +15976,20 @@ def test_declaration_ownership_extension_long_marker_sequence():
         header, sorted(unknown)[:5])
     body = _membership_condition_body("in_set")
     _f01_expect(header, body, False)
+
+
+def test_uapi_mask_drift_allowlisted():
+    # Valid-bits masks grow as upstream adds flag bits
+    # (BPF_F_REDIRECT_FLAGS gained EGRESS in 7.3: 25 ->
+    # 27), so the union merger must accept their drift
+    # while still refusing any other value conflict.
+    # Individual flag bits must never drift.
+    assert uc.is_versioned_bound("BPF_F_REDIRECT_FLAGS")
+    assert not uc.is_versioned_bound("BPF_F_BROADCAST")
+    assert not uc.is_versioned_bound("BPF_F_EGRESS")
+    # Masks drift in value only; sentinels may also drift in shape.
+    assert not uc.is_structural_bound("BPF_F_REDIRECT_FLAGS")
+    assert uc.is_structural_bound("MAX_BPF_ATTACH_TYPE")
 
 
 # Ported from the thirteenth-round inventory repair line (b39283a):

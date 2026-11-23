@@ -665,6 +665,7 @@ FLAG_HELPER_PREFIXES = (
     "BPF_F_INGRESS",
     "BPF_F_BROADCAST",
     "BPF_F_EXCLUDE_INGRESS",
+    "BPF_F_EGRESS",
     "BPF_F_REDIRECT_FLAGS",
     "BPF_F_MTU_CHK_SEGS",
     "BPF_MTU_CHK_SEGS",
@@ -777,14 +778,40 @@ SENTINEL_EXACT = frozenset({
 })
 
 
-def is_versioned_bound(name):
-    """True for sentinels and limits whose values may legitimately drift.
+def is_structural_bound(name):
+    """True for sentinels and limits whose value AND shape may drift.
 
-    Count sentinels and structural bounds grow as upstream enums grow;
-    they are recorded with their newest value plus the per-version map.
+    Count sentinels and structural bounds grow as upstream enums grow
+    and may move between defines and enum members; they are recorded
+    with their newest value plus the per-version map.
     """
     return (name in SENTINEL_EXACT or name in LIMIT_EXACT
             or name.startswith("__MAX") or name.startswith("MAX_BPF_"))
+
+
+def is_versioned_bound(name):
+    """True for names whose values may legitimately drift.
+
+    Structural bounds (above) plus valid-bits masks
+    (DRIFTING_MASK_EXACT), which grow the same way when upstream
+    adds flag bits; individual flag bits must never drift. Masks
+    keep their declaration shape: only the value gate consults
+    this set, while the shape gate consults the structural set.
+    """
+    return is_structural_bound(name) or name in DRIFTING_MASK_EXACT
+
+
+# Valid-bits masks whose values grow as upstream adds flag bits.
+# The value gate accepts their drift and the member note records
+# the per-version map; the shape gate holds them frozen (any
+# declaration or macro-form change conflicts). Unlike LIMIT_EXACT
+# this never reclassifies the atom (masks keep their capability
+# records with the newest value plus the per-version map).
+DRIFTING_MASK_EXACT = frozenset({
+    # OR of INGRESS|EGRESS|BROADCAST|EXCLUDE_INGRESS since 7.3
+    # (EGRESS added; was 25, now 27).
+    "BPF_F_REDIRECT_FLAGS",
+})
 
 # Structural constants and bounds: enumerated with values, no record needed.
 LIMIT_EXACT = frozenset({
@@ -1015,6 +1042,31 @@ SELFTEST_EXACT = {
     ("progs", "get_cgroup_id_kern.c"): "helper:get_current_cgroup_id",
     ("progs", "local_storage_bench.c"): "map:TASK_STORAGE",
     ("progs", "htab_mem_bench.c"): "map:HASH",
+    # First pinned in v7.3.5. The ksock kfuncs live in the unpinned
+    # net/core/bpf_ksock.c, so the ksock tests anchor to the program
+    # types that carry them (LSM) and the exercised wq callback.
+    ("prog_tests", "bpf_ma_ttrace.c"): "map:HASH",
+    ("progs", "bpf_ma_ttrace.c"): "map:HASH",
+    ("prog_tests", "get_smp_processor_id.c"): "helper:get_smp_processor_id",
+    ("progs", "get_smp_processor_id.c"): "helper:get_smp_processor_id",
+    ("prog_tests", "icmp_send_kfunc.c"): "kfunc:bpf_icmp_send",
+    ("progs", "icmp_send.c"): "kfunc:bpf_icmp_send",
+    ("prog_tests", "ksock.c"): "prog:LSM",
+    ("progs", "ksock_lsm.c"): "prog:LSM",
+    ("progs", "ksock_lsm_verifier.c"): "prog:LSM",
+    ("prog_tests", "ksock_wq.c"): "kfunc:bpf_wq_start",
+    ("progs", "ksock_wq.c"): "kfunc:bpf_wq_start",
+    ("prog_tests", "local_kptr_ownership.c"): "btf:STRUCT",
+    ("prog_tests", "sock_xattr.c"): "kfunc:bpf_sock_read_xattr",
+    ("progs", "sock_read_xattr.c"): "kfunc:bpf_sock_read_xattr",
+    ("prog_tests", "test_map_uninit.c"): "map:PERCPU_ARRAY",
+    ("progs", "test_global_percpu_data.c"): "map:PERCPU_ARRAY",
+    ("prog_tests", "tramp_prog_detach.c"): "prog:TRACING",
+    ("progs", "tramp_prog_detach.c"): "prog:TRACING",
+    ("progs", "bpf_for_bench.c"): "kfunc:bpf_iter_num_new",
+    ("progs", "veristat_foo.c"): "cmd:PROG_LOAD",
+    ("progs", "veristat_bar.c"): "cmd:PROG_LOAD",
+    ("verifier", "pseudo_func.c"): "isa:BPF_PSEUDO_FUNC",
 }
 
 SELFTEST_PREFIX = (
@@ -1772,7 +1824,9 @@ def check_binding(registry, lock, registry_digest):
 def strip_comments(text):
     # Translation phase 3 replaces a comment with whitespace, never joins
     # tokens. Preserve newlines for preprocessor inclusion and provenance.
-    return re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//[^\n]*',
+    # Phase 2 runs first: a backslash-newline inside a // comment joins the
+    # next line into the comment, so // matches across continuations.
+    return re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//(?:\\\n|[^\n])*',
                   lambda m: (' ' + '\n' * m.group().count('\n'))
                   if m.group().startswith(('/',)) else m.group(),
                   text, flags=re.S)
@@ -2452,13 +2506,32 @@ Conditions (<COND>):
   C2  understood comparisons (either operand order for the first
       two shapes): ``<prog>->type ==/!= BPF_PROG_TYPE_*``,
       ``<prog>->expected_attach_type ==/!= BPF_*``,
-      ``<prog>->aux->st_ops ==/!= &<ops>``. Comparisons against any
-      other value (including numbers) are opaque atoms. A compared
-      name bound as a filter local resolves to the canonical name
+      ``<prog>->aux->st_ops ==/!= &<ops>``,
+      ``<prog>->aux->attach_st_ops_member_off ==/!=
+      offsetof(<struct>, <member>)``. The member shape never
+      mirrors and never resolves values (member headers stay
+      unpinned): it narrows with a restriction note naming the
+      member spelling. One member name required under one
+      struct spelling and excluded under another contradicts
+      unless both structs are plain tag forms naming provably
+      different types (anything else might typedef-alias).
+      Offsetof arguments invoking macros are outside the
+      grammar (member identity would depend on macro
+      expansion). Comparisons against any other value
+      (including numbers) are opaque atoms. A compared name
+      bound as a filter local resolves to the canonical name
       carrying its provable value; a shadow without a provable
-      value, or one matching no (unique) canonical name, and any
-      st_ops comparison against a filter local's address, is
-      outside the grammar.
+      value, or one matching no (unique) canonical name, any
+      st_ops comparison against a filter local's address, and
+      any member comparison while ``offsetof`` names a filter
+      local, is #undef-killed at-or-before the use, or carries a
+      file-scope mention at-or-before the use (C preprocessing
+      is a single ordered pass, so trailing directives and
+      bindings provably cannot reach an earlier use; the
+      errno-table fallback stays whole-file conservative), or
+      while a compared spelling names a macro (macro aliases
+      have unproven identity, resolved in the spelling's own
+      unit), is outside the grammar.
   C3  membership tests: ``btf_id_set8?_contains(&<SET>, <id>)``
       calls (or their negations) and alias names from rule S1. <SET>
       must be a known ID block; an unknown block is a fatal unknown
@@ -2476,8 +2549,9 @@ Conditions (<COND>):
       value is outside the grammar, never a spelling-guessed
       constant.
   C7  anything else -- bit tests such as ``(flags & <FLAG>)``
-      (over ``&``, ``|`` or ``^``), unknown calls, foreign member
-      access -- is an opaque atom carrying its original text,
+      (over ``&``, ``|`` or ``^``; a ``&`` in unary position is
+      address-of, never a bit operator), unknown calls, foreign
+      member access -- is an opaque atom carrying its original text,
       after non-atomic macros splice textually (C preprocessing
       semantics). Only bit-test atoms keep existential permission
       (see rule E2); every other opaque atom in an allow
@@ -2497,8 +2571,8 @@ Conditions (<COND>):
 
 Evaluation (per caller program type and member):
   E1  Type comparisons and membership tests fold to constants and
-      decide directly; attach-type and struct_ops comparisons
-      narrow the context without deciding.
+      decide directly; attach-type, struct_ops and member-offset
+      comparisons narrow the context without deciding.
   E2  Bit-test atoms in an allow requirement become restriction
       notes (the permission is existential: it holds in some
       further-restricted context). Bit-test notes honor negation
@@ -2560,10 +2634,11 @@ until an owner extends the grammar and tests.
 
 
 def _c_definition_hits(clean, name):
-    """Yield (offset, params, body) for each definition of ``name``.
+    """Yield (offset, params, body, endline) for each definition of ``name``.
 
     ``clean`` must be comment-stripped. Only true definitions (with a
     brace body, not a ``;`` declaration) match, in source order.
+    ``endline`` is the 1-based line of the closing brace.
     """
     for match in re.finditer(r"\b%s\s*\(" % re.escape(name), clean):
         pos = match.end() - 1
@@ -2586,7 +2661,9 @@ def _c_definition_hits(clean, name):
             continue
         if clean.find(";", end, brace) != -1:
             continue
-        yield match.start(), params, c_brace_body(clean, brace)
+        body = c_brace_body(clean, brace)
+        endline = clean.count("\n", 0, brace + len(body)) + 1
+        yield match.start(), params, body, endline
 
 
 def c_function_body(clean, name):
@@ -2596,7 +2673,7 @@ def c_function_body(clean, name):
     brace body, not a ``;`` declaration) match; the first definition
     wins.
     """
-    for _, params, body in _c_definition_hits(clean, name):
+    for _, params, body, _ in _c_definition_hits(clean, name):
         return params, body
     return None
 
@@ -2673,7 +2750,8 @@ def _cond_parse(tokens, id_param, source_words=()):
     atom shapes (bit tests, unknown calls, foreign member access).
     Bound nodes are ("const", bool), ("not", sub), ("and"/"or",
     [subs]), ("type_cmp"/"attach_cmp"/"stops_cmp", op, value),
-    ("member", set), ("stops_null",) or ("opaque", placeholder).
+    ("member_cmp", op, struct, member), ("member", set),
+    ("stops_null",) or ("opaque", placeholder).
     A membership call only binds when its tested argument is exactly
     the filter's id parameter; anything else is opaque.
     """
@@ -2802,6 +2880,191 @@ def _cond_parse(tokens, id_param, source_words=()):
     if pos[0] != len(tokens):
         raise FilterNotUnderstood("cannot parse filter condition tail")
     return node, opaque, tokens
+
+
+_OFFSETOF_CALL_RE = re.compile(
+    r"^offsetof\s*\(\s*([^,()]+?)\s*,\s*([A-Za-z_]\w*)\s*\)$")
+
+
+def _match_offsetof_call(text):
+    """(struct spelling, member) for offsetof(type, member).
+
+    Returns None for anything else. The type is one optional
+    struct/union/enum tag or bare typedef spelling; the member is
+    one identifier (the condition tokenizer has no ``.``, so
+    dotted paths never reach this matcher). Generated reference
+    markers never match (a bit-test placeholder must not pose as
+    a member). Offsets never resolve to values here (member
+    headers stay unpinned); the spelling narrows the context with
+    a restriction note instead.
+    """
+    match = _OFFSETOF_CALL_RE.match(" ".join(text.split()))
+    if match is None:
+        return None
+    struct = match.group(1)
+    member = match.group(2)
+    if re.search(r"__(?:bitop|opaque|member)_", struct + member):
+        return None
+    if re.fullmatch(
+            r"(?:struct|union|enum)\s+[A-Za-z_]\w*|[A-Za-z_]\w*",
+            struct) is None:
+        return None
+    return (struct, member)
+
+
+def _reject_uncertain_expansions(units, edges, fn_name, version):
+    """Reject uses of use-uncertain macros.
+
+    ``units`` is [(raw text, uncertain)] over the filter
+    condition plus each substituted helper's original body
+    (pre-fold: collection may resolve one world). ``edges``
+    maps macro names to the identifiers in their ever-active
+    bodies. A use of a use-uncertain macro reads a different
+    definition per world, so the verdict cannot stand --
+    whether or not the name resolved here: an unresolved
+    spelling that stays textual is only harmless when no
+    grammar reads it, and existing field and helper spellings
+    do. Preprocessing is token-based: member access never
+    excuses a use, and no parens are required (neighbor
+    expansion may complete a call). The check chases bodies
+    transitively (cycles terminate on the visited set).
+    Jurisdiction: identifiers inside bindable member-spot
+    arguments belong to the alias check (which reports
+    identity); this check judges everything else, including
+    the callee itself. Scanning joins line splices first (C
+    phase order), so a split spelling still resolves.
+    """
+    fired = set()
+    for text, uncertain in units:
+        if not uncertain:
+            continue
+        clean = _strip_c_strings(_strip_line_splices(text))
+        spans = [args for _, _, args in _member_spots(clean)]
+        seed = set()
+        for match in re.finditer(r"[A-Za-z_]\w*", clean):
+            if any(start <= match.start() < end
+                   for start, end in spans):
+                continue
+            seed.add(match.group(0))
+        seen = set()
+        queue = sorted(seed)
+        while queue:
+            name = queue.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in uncertain:
+                fired.add(name)
+            if edges is not None:
+                for dep in edges.get(name, ()):
+                    if dep not in seen:
+                        queue.append(dep)
+    if fired:
+        raise FilterNotUnderstood(
+            "kfunc filter %s@%s consults %s with unproven "
+            "preprocessor state (conditional inclusion or "
+            "redefinition); unproven state is outside the grammar"
+            % (fn_name, version, ", ".join(sorted(fired)[:5])))
+
+
+def _member_spots(text):
+    """[((start, end), (struct, member), (args_start, args_end))] spots.
+
+    Only bindable offsetof calls (same matcher the binder
+    uses). Member access never excuses a spelling:
+    preprocessing is token-based, so x.offsetof still expands
+    when offsetof is a macro. The spot matcher is whole-call
+    anchored, so each occurrence feeds it the balanced call
+    substring. The args span covers the parenthesized
+    arguments only, so the callee itself stays visible to the
+    expansion check: an uncertain callee rewrite governs the
+    whole call.
+    """
+    found = []
+    for match in re.finditer(r"\boffsetof\b", text):
+        raw = text[match.start() + len("offsetof"):]
+        rest = raw.lstrip()
+        if not rest.startswith("("):
+            continue
+        base = match.start() + len("offsetof") + \
+            (len(raw) - len(rest))
+        depth = 0
+        end = None
+        for index, char in enumerate(rest):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if not depth:
+                    end = index
+                    break
+        if end is None:
+            continue
+        call_end = base + end + 1
+        spot = _match_offsetof_call(
+            "offsetof" + rest[:end + 1])
+        if spot is not None:
+            found.append(((match.start(), call_end), spot,
+                          (base + 1, base + end)))
+    return found
+
+
+def _reject_aliased_member_spellings(units, fn_name, version):
+    """Reject member spellings naming a macro in their own unit.
+
+    ``units`` is [(text, names)] over exactly the pieces the
+    binder sees: the filter's spliced condition plus each
+    substituted helper body, each with its own resolved-plus-
+    uncertain macro names. Each offsetof spot (same matcher
+    the binder uses, so only bindable shapes are judged;
+    member accesses never count) resolves against its own
+    unit's names -- merged sets let one unit's macros taint
+    another unit's spellings in both directions.
+    """
+    for text, names in units:
+        if not names:
+            continue
+        for _, spot, _ in _member_spots(text):
+            for ident in re.findall(r"[A-Za-z_]\w*", spot[0]) + \
+                    [spot[1]]:
+                if ident in names:
+                    raise FilterNotUnderstood(
+                        "kfunc filter %s@%s compares member "
+                        "spelling %s naming a macro; "
+                        "macro-aliased members have unproven "
+                        "identity and are outside the grammar"
+                        % (fn_name, version, ident))
+
+
+def _offsetof_has_invocation(text):
+    """Whether an offsetof call in text takes a macro invocation.
+
+    Member identity must not depend on macro expansion, so any
+    call-shaped argument inside offsetof argument position fails
+    the shape. Line splices join first (C order), so a split
+    callee spelling cannot hide the call; string contents never
+    count.
+    """
+    joined = _strip_line_splices(text)
+    if "offsetof" not in joined:
+        return False
+    stripped = _strip_c_strings(joined)
+    for match in re.finditer(r"\boffsetof\s*\(", stripped):
+        depth = 0
+        index = match.end() - 1
+        while index < len(stripped):
+            char = stripped[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        if re.search(r"\b[A-Za-z_]\w*\s*\(",
+                     stripped[match.end():index]):
+            return True
+    return False
 
 
 def _opaque_for(opaque, tokens, text):
@@ -2971,6 +3234,18 @@ def _bind_condition_frame(node, prog_param, aliases, protected_members,
                         "grammar"
                         % (fn_name, version, value[1:]))
                 return ("stops_cmp", op, value[1:])
+        if left[0] == "field" and left[1][0] == prog_param and \
+                left[1][1:] == ("aux", "attach_st_ops_member_off") and \
+                right[0] == "opaque" and "offsetof" not in locals_set:
+            # File-scope offsetof bindings defeat the builtin
+            # reading one layer up (simulate_kfunc_filter rejects
+            # member_cmp nodes when offsetof is blocked there).
+            spot = _match_offsetof_call(opaque.get(right[1], ""))
+            # Macro-aliased spellings were rejected per-unit
+            # before binding (each spelling resolves in its own
+            # unit's scope); only clean spots reach this return.
+            if spot is not None:
+                return ("member_cmp", op, spot[0], spot[1])
         # Mirrored comparison (constant on the left): ``==`` and
         # ``!=`` are symmetric, so the operand order carries no
         # meaning for the two shapes grammar rule C2 mirrors.
@@ -3028,9 +3303,7 @@ def _protect_condition_atoms(text, id_param, expansion=None,
     counter = [0]
 
     def has_lone_bitop(group):
-        return re.search(
-            r"(?<![&|])&(?![&=|])|(?<![|&])\|(?![|=])|"
-            r"(?<!\^)\^(?![=])", group) is not None
+        return _has_lone_bitop(group)
 
     def handle_group(start, end, group):
         nonlocal rewritten
@@ -3150,9 +3423,7 @@ def _nested_group_holding_bitop(rewritten):
                 continue
             start = stack.pop()
             group = rewritten[start:index + 1]
-            if re.search(
-                    r"(?<![&|])&(?![&=|])|(?<![|&])\|(?![|=])|"
-                    r"(?<!\^)\^(?![=])", group) is not None:
+            if _has_lone_bitop(group):
                 return (start, index + 1, group)
     return None
 
@@ -3203,9 +3474,7 @@ def _protect_group_segments(rewritten, start, group, spans, counter,
     body = group[1:-1]
     for span_start, span_end in reversed(spans):
         segment = body[span_start:span_end]
-        if re.search(
-                r"(?<![&|])&(?![&=|])|(?<![|&])\|(?![|=])|"
-                r"(?<!\^)\^(?![=])", segment) is None:
+        if not _has_lone_bitop(segment):
             continue
         folded = _fold_const_text(segment, opaque, expansion, bound)
         offset = start + 1
@@ -3930,9 +4199,28 @@ def _is_zero_absorbing_and(core, expansion=None, bound=()):
     return False
 
 
-_LONE_BITOP_RE = re.compile(
-    r"(?<![&|])&(?![&=|])|(?<![|&])\|(?![|=])|"
-    r"(?<!\^)\^(?![=])")
+# Unary & (address-of): at the start or after an operator or opener,
+# modulo whitespace. The anchor set mirrors _zero_fold_core_impure;
+# the (?<!&) keeps the second & of && out of the match.
+_UNARY_AMP_RE = re.compile(
+    r"(?:^|(?<=[(\[,;?=:<>!&|^+~%/*-]))\s*(?<!&)&(?![&=|])")
+
+
+def _has_lone_bitop(text):
+    """Whether text holds a lone bit operator over &, | or ^.
+
+    Unary & (address-of) is never a bit operator: ``st_ops ==
+    &ops`` is a comparison, not a bit test. Postfix ++/-- ahead
+    of & reads as unary anchors and declines bit-op reading;
+    such spellings fail closed downstream (the condition
+    tokenizer rejects +/-). Conversely a cast address operand
+    (``(type)&x``) still reads as a bit test and fails closed
+    as an unproven shape.
+    """
+    scrubbed = _UNARY_AMP_RE.sub(" ", text)
+    return re.search(
+        r"(?<![&|])&(?![&=|])|(?<![|&])\|(?![|=])|"
+        r"(?<!\^)\^(?![=])", scrubbed) is not None
 
 
 def _call_in_bit_context(text, start, end):
@@ -3942,7 +4230,10 @@ def _call_in_bit_context(text, start, end):
     all groups blanked): a lone ``&``/``|``/``^`` at the call's
     own nesting level -- nested groups blanked first, so a
     sibling ``(a & b)`` never taints a ``&&`` operand -- puts the
-    call's value (not just its truth) to work.
+    call's value (not just its truth) to work. Blanking keeps
+    the group delimiters: a grouped operand still proves a
+    following ``&`` binary, so extra parens never hide a bit
+    context.
     """
     depths = []
     depth = 0
@@ -3959,10 +4250,10 @@ def _call_in_bit_context(text, start, end):
         for char in body:
             if char == "(":
                 level += 1
-                out.append(" ")
+                out.append("(")
             elif char == ")":
                 level -= 1
-                out.append(" ")
+                out.append(")")
             else:
                 out.append(" " if level else char)
         return "".join(out)
@@ -3990,10 +4281,9 @@ def _call_in_bit_context(text, start, end):
                     break
         if closed is None or closed < end:
             continue
-        if _LONE_BITOP_RE.search(
-                blanked(text[opened + 1:closed])) is not None:
+        if _has_lone_bitop(blanked(text[opened + 1:closed])):
             return True
-    return _LONE_BITOP_RE.search(blanked(text)) is not None
+    return _has_lone_bitop(blanked(text))
 
 
 def _audit_unfolded_condition(text, id_param, typed_map, pipe_map, widths,
@@ -4010,13 +4300,13 @@ def _audit_unfolded_condition(text, id_param, typed_map, pipe_map, widths,
     text = re.sub(r"\bbtf_id_set8?_contains\s*\(\s*&\s*(\w+)\s*,\s*"
                   + re.escape(id_param or "__no_id") + r"\s*\)",
                   lambda match: "__member_" + match.group(1), text)
-    if _LONE_BITOP_RE.search(text) is None:
+    if not _has_lone_bitop(text):
         return
     candidates = [text] + [text[start + 1:end - 1]
                            for start, end in _paren_groups_outermost_first(text)]
     seen = set()
     for core in candidates:
-        if core in seen or not re.search(r"(?<![&|])[&|^](?![&|])", core):
+        if core in seen or not _has_lone_bitop(core):
             continue
         seen.add(core)
         failures = []
@@ -4040,12 +4330,38 @@ def _audit_unfolded_condition(text, id_param, typed_map, pipe_map, widths,
             raise failures[0]
 
 
+def _table_names(table):
+    """Macro-name set of one macro-table tuple (or empty)."""
+    if table is None:
+        return frozenset()
+    return frozenset(table[0]) | frozenset(table[2]) | \
+        frozenset(table[3])
+
+
 def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
                    fn_name, version, locals_set, local_values,
                    rev_type, rev_attach, param_names, expansion,
-                   file_values, bit_context=None):
+                   file_values, bit_context=None, filter_tables=None,
+                   helper_tables=None, filter_uncertain=None,
+                   helper_uncertain=None, filter_rewrite_uncertain=None,
+                   helper_rewrite_uncertain=None,
+                   macro_body_idents=None):
     """Parse and bind one filter condition for simulation.
 
+    ``filter_tables``/``helper_tables`` scope textual rewriting
+    positionally (directives apply from their own line on);
+    ``None`` falls back to ``expansion`` (legacy universe
+    behavior, used by direct unit tests). Value folding keeps
+    the universe tables (semantic domain, unchanged).
+    ``filter_uncertain``/``helper_uncertain`` are the
+    per-unit maybe-macro sets supplementing the resolved
+    tables for member-identity (``None`` preserves legacy
+    tables-only behavior). ``filter_rewrite_uncertain``/
+    ``helper_rewrite_uncertain`` are the per-unit
+    use-uncertain-definition sets gating expansion itself.
+    ``macro_body_idents`` maps macro names to their ever-active
+    body identifiers for the transitive chase (``None`` checks
+    direct uses only).
     Unsafe (non-atomic) macros splice textually first, matching C
     preprocessing exactly; predicate calls over ``prog`` are then
     inlined one level from ``pred_exprs`` (converted literals,
@@ -4060,7 +4376,10 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
     opaque mapping placeholders to original text.
     """
     guarded = set(locals_set) - {prog_param}
-    expanded = _splice_unsafe_macros(text, expansion)
+    stable = filter_tables if filter_tables is not None else expansion
+    expanded = _splice_unsafe_macros(text, stable)
+    spliced_text = expanded
+    inlined_units = []
     for pred, (expr, mask, check_bit, _) in sorted(pred_exprs.items()):
         if set(re.findall(r"[A-Za-z_]\w*", expr)) & guarded:
             continue
@@ -4080,12 +4399,35 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
                         "and value differ there and the shape is "
                         "outside the grammar"
                         % (fn_name, version, pred))
-        spliced = _splice_unsafe_macros(expr, expansion)
+        htable = (helper_tables or {}).get(pred, expansion)
+        spliced = _splice_unsafe_macros(expr, htable)
         if mask is None:
             replacement = "(%s)" % spliced
         else:
             replacement = "((%s) & %d)" % (spliced, mask)
+        if re.search(pattern, expanded):
+            inlined_units.append((expr, spliced, htable, pred))
         expanded = re.sub(pattern, replacement, expanded)
+    scan_units = [text, expanded]
+    originals = getattr(pred_exprs, "originals", {})
+    seed = set()
+    for pred in pred_exprs:
+        pattern = r"\b%s\s*\(\s*%s\s*\)" % (
+            re.escape(pred), re.escape(prog_param))
+        if re.search(pattern, spliced_text):
+            seed.add(pred)
+    closure = _transitive_helper_closure(
+        pred_exprs, seed, prog_param, expansion,
+        helper_tables)
+    for helper in closure:
+        if helper in originals:
+            scan_units.append(originals[helper])
+    if any(_offsetof_has_invocation(unit) for unit in scan_units):
+        raise FilterNotUnderstood(
+            "kfunc filter %s@%s uses offsetof with a macro "
+            "invocation; member identity would depend on macro "
+            "expansion and is outside the grammar"
+            % (fn_name, version))
     if bit_context is not None:
         _audit_unfolded_condition(expanded, id_param, *bit_context,
                                   locals_set, expansion, fn_name, version)
@@ -4095,6 +4437,26 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
     node, opaque, tokens = _cond_parse(
         _cond_tokenize(expanded), id_param, protected_opaque.source_words)
     opaque.update(protected_opaque)
+    filter_names = _table_names(stable) | set(filter_uncertain or ())
+    # The raw filter text is judged too: a deterministic callee
+    # expansion can erase a spot before the binder sees it,
+    # hiding an uncertain argument from spliced-only scanning.
+    alias_units = [(spliced_text, filter_names),
+                   (text, filter_names)]
+    raw_units = [(text, set(filter_rewrite_uncertain or ()))]
+    for expr, spliced, htable, pred in inlined_units:
+        alias_units.append((
+            spliced,
+            _table_names(htable) |
+            set((helper_uncertain or {}).get(pred, ()))))
+        raw_units.append((
+            originals.get(pred, expr),
+            set((helper_rewrite_uncertain or {}).get(pred, ()))
+        ))
+    _reject_uncertain_expansions(
+        raw_units, macro_body_idents, fn_name, version)
+    _reject_aliased_member_spellings(
+        alias_units, fn_name, version)
     return _bind_condition(
         node, prog_param, aliases, protected_members,
         opaque, tokens, fn_name, version, locals_set,
@@ -4406,7 +4768,10 @@ def _pp_line_states(text):
         while logical.rstrip().endswith("\\") and \
                 index + 1 < len(lines):
             index += 1
-            logical = logical.rstrip()[:-1] + " " + lines[index]
+            # C phase 2 deletes backslash-newline (no space added,
+            # mirroring parse_defines), so a spliced directive
+            # still resolves to its keyword.
+            logical = logical.rstrip()[:-1] + lines[index]
         for lineno in range(start, index + 1):
             states[lineno] = state
         match = re.match(r"[ \t]*#[ \t]*(\w+)(.*)$", logical, re.S)
@@ -4492,9 +4857,23 @@ def _blank_inactive_pp_regions(text):
 
 
 def _pp_undef_stream(text):
-    """[(lineno, name)] ``#undef`` directives of ``text`` in order."""
+    """[(lineno, name)] ``#undef`` directives of ``text`` in order.
+
+    Logical lines join on backslash-newline before matching
+    (mirroring parse_defines), so a spliced directive still
+    resolves; lineno is the first physical line, aligning with
+    ``_pp_line_states`` records.
+    """
     found = []
-    for lineno, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    chunks = []
+    for lineno, line in enumerate(lines, 1):
+        if chunks and chunks[-1][1].endswith("\\"):
+            start, prev = chunks.pop()
+            chunks.append((start, prev[:-1] + line))
+        else:
+            chunks.append((lineno, line))
+    for lineno, line in chunks:
         match = re.match(r"\s*#\s*undef\s+([A-Za-z_]\w*)", line)
         if match:
             found.append((lineno, match.group(1)))
@@ -4608,30 +4987,77 @@ def _pp_unproven_names(text):
     return flagged
 
 
+def _ever_active_macro_bodies(text):
+    """{name: [bodies]} for every non-inactive #define, any flavor.
+
+    Unlike the live maps, a later ``#undef`` does not remove a
+    name (a use may precede the kill) and unknown-region
+    defines count (they may be live); only provably-inactive
+    lines are excluded. Bodies mirror the live extraction
+    (parameters stripped), with parameter-list validation
+    relaxed to a conservative superset: ill-formed lists never
+    survive the compiler, and extra identifiers only consult.
+    """
+    states = _pp_line_states(text)
+    bodies = {}
+    for name, value_text, func_like, lineno in parse_defines(text):
+        if not value_text:
+            continue
+        if lineno - 1 < len(states) and \
+                states[lineno - 1] == "inactive":
+            continue
+        if not func_like:
+            bodies.setdefault(name, []).append(value_text)
+            continue
+        depth = 0
+        end = None
+        for index, char in enumerate(value_text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    end = index
+                    break
+                depth -= 1
+        if end is None:
+            continue
+        bodies.setdefault(name, []).append(
+            strip_comments(value_text[end + 1:]).strip())
+    return bodies
+
+
+def _macro_body_idents(texts):
+    """{name: idents} in ever-active macro bodies over all texts.
+
+    Parameters stripped, like the consulted map: only names
+    that rescan could surface count.
+    """
+    idents = {}
+    for relpath in sorted(texts):
+        text = _strip_line_splices(_strip_c_strings(texts[relpath]))
+        for name, bodies in _ever_active_macro_bodies(text).items():
+            for body in bodies:
+                idents.setdefault(name, set()).update(
+                    re.findall(r"[A-Za-z_]\w*", body))
+    return idents
+
+
 def _pp_file_reftexts(texts):
     """{name: idents} referenced by each file constant definition.
 
-    Unions, over every text, the identifiers in active object-like
-    macro bodies, zero-argument function-like macro bodies,
-    parameterized macro bodies, enumerator value expressions
-    (provably-excluded regions blanked) and const- plus
-    mutable-object initializers. The consulted closure walks
-    this map. Line splices join before matching, so a spliced
-    name still consults.
+    Unions, over every text, the identifiers in ever-active
+    macro bodies (any flavor: a use may precede a later
+    ``#undef``, and unknown-region defines may be live),
+    enumerator value expressions (provably-excluded regions
+    blanked) and const- plus mutable-object initializers. The
+    consulted closure walks this map. Line splices join before
+    matching, so a spliced name still consults.
     """
     reftexts = {}
+    for name, idents in _macro_body_idents(texts).items():
+        reftexts.setdefault(name, set()).update(idents)
     for relpath in sorted(texts):
         text = _strip_line_splices(_strip_c_strings(texts[relpath]))
-        for name, body in _live_file_defines(text).items():
-            reftexts.setdefault(name, set()).update(
-                re.findall(r"[A-Za-z_]\w*", body))
-        for name, body in _live_zero_arg_defines(text).items():
-            reftexts.setdefault(name, set()).update(
-                re.findall(r"[A-Za-z_]\w*", body))
-        for name, (_, body) in _live_parameterized_defines(
-                text).items():
-            reftexts.setdefault(name, set()).update(
-                re.findall(r"[A-Za-z_]\w*", body))
         for _, members, _ in parse_enums(
                 _blank_inactive_pp_regions(text)):
             for member, value_text in members:
@@ -4647,8 +5073,99 @@ def _pp_file_reftexts(texts):
     return reftexts
 
 
-def _called_helper_idents(pred_exprs, stmts, prog_param, expansion):
-    """Identifiers of helper bodies one filter actually calls.
+def _called_helper_names(pred_exprs, stmts, prog_param, expansion,
+                         cond_tables=None):
+    """Names of inlinable helpers one filter's conditions call.
+
+    Matches ``name(prog)`` call sites after unsafe-macro
+    splicing (ternary conditions included), so macro-generated
+    calls count. Splices with both the universe tables and the
+    conditions' own positional tables when given: neither is a
+    subset of the other (a trailing ``#undef`` kills a name the
+    use still saw), so discovery takes the union and the guards
+    never miss a chain the positional inliner follows.
+    """
+    tables = [expansion]
+    if cond_tables is not None:
+        tables.append(cond_tables)
+    conds = []
+    for kind, cond, extra in stmts:
+        if cond is not None:
+            for table in tables:
+                conds.append(_splice_unsafe_macros(cond, table))
+        if kind == "if" and isinstance(extra, tuple) and \
+                extra[0] in ("ternary", "ternary_const"):
+            for table in tables:
+                conds.append(
+                    _splice_unsafe_macros(extra[1], table))
+    called = set()
+    for pred in pred_exprs:
+        pattern = r"\b%s\s*\(\s*%s\s*\)" % (
+            re.escape(pred), re.escape(prog_param))
+        if any(re.search(pattern, cond) for cond in conds):
+            called.add(pred)
+    return called
+
+
+def _transitive_helper_closure(pred_exprs, seed, prog_param, expansion,
+                               helper_tables=None):
+    """Fixpoint of helpers reachable from ``seed`` through bodies.
+
+    Follows ``name(prog)`` call sites in spliced helper bodies
+    (spliced bodies reveal macro-generated calls). Each body is
+    spliced with both the universe tables and its own positional
+    tables when given (union: a trailing ``#undef`` hides a live
+    link from the universe view). Bounded by the helper count,
+    so cycles terminate.
+    """
+    called = set(seed)
+    originals = getattr(pred_exprs, "originals", {})
+    queue = sorted(called)
+    while queue:
+        name = queue.pop()
+        body = originals.get(name)
+        if body is None:
+            continue
+        tables = [expansion]
+        if helper_tables is not None and \
+                helper_tables.get(name) is not None:
+            tables.append(helper_tables[name])
+        spliced = [_splice_unsafe_macros(body, table)
+                   for table in tables]
+        for dep in pred_exprs:
+            if dep in called:
+                continue
+            pattern = r"\b%s\s*\(\s*%s\s*\)" % (
+                re.escape(dep), re.escape(prog_param))
+            if any(re.search(pattern, text) for text in spliced):
+                called.add(dep)
+                queue.append(dep)
+    return called
+
+
+def _transitive_called_helpers(pred_exprs, stmts, prog_param, expansion,
+                               cond_tables=None, helper_tables=None):
+    """Inlinable helpers reachable from one filter's conditions.
+
+    Seeds from directly called helpers, then closes
+    transitively (see _transitive_helper_closure). Positional
+    tables join the universe view (union) when given.
+    """
+    return _transitive_helper_closure(
+        pred_exprs,
+        _called_helper_names(
+            pred_exprs, stmts, prog_param, expansion,
+            cond_tables),
+        prog_param, expansion, helper_tables)
+
+
+def _called_helper_idents(pred_exprs, called, expansion):
+    """Identifiers of helper bodies one filter reaches.
+
+    ``called`` is the transitive (union-closure) helper set:
+    transitively inlined bodies contribute text and values, so
+    their identifiers consult even when no direct body names
+    them.
 
     A helper called from a condition (ternary conditions
     included, after unsafe-macro splicing) evaluates its body
@@ -4665,20 +5182,9 @@ def _called_helper_idents(pred_exprs, stmts, prog_param, expansion):
     redefinition or mutation of one between definition and use
     must reject. Uncalled helpers consult nothing.
     """
-    conds = []
-    for kind, cond, extra in stmts:
-        if cond is not None:
-            conds.append(_splice_unsafe_macros(cond, expansion))
-        if kind == "if" and isinstance(extra, tuple) and \
-                extra[0] in ("ternary", "ternary_const"):
-            conds.append(
-                _splice_unsafe_macros(extra[1], expansion))
     idents = set()
-    for pred, (_, _, _, orig) in pred_exprs.items():
-        pattern = r"\b%s\s*\(\s*%s\s*\)" % (
-            re.escape(pred), re.escape(prog_param))
-        if any(re.search(pattern, cond) for cond in conds):
-            idents.update(orig)
+    for pred in called:
+        idents.update(pred_exprs[pred][3])
     if expansion is not None:
         expanded = expansion[0]
         queue = sorted(idents)
@@ -5194,6 +5700,228 @@ def _prepare_macro_expansion(defines, func_defines=None, param_defines=None):
     definitions.update({name: ((), body) for name, body in functions.items()})
     definitions.update(parameters)
     return _MacroExpansion((expanded, unsafe, functions, parameters), definitions)
+
+
+def _prefix_through_line(text, endline):
+    """File text through ``endline`` plus continuation lines.
+
+    Cuts after the given 1-based line, extending past
+    backslash-newline continuations so no logical line splits.
+    Preprocessor state is prefix-computable, so states on the
+    prefix match the full text exactly.
+    """
+    lines = text.splitlines(keepends=True)
+    index = min(max(endline, 0), len(lines))
+    while index < len(lines) and \
+            lines[index - 1].rstrip("\n").endswith("\\"):
+        index += 1
+    return "".join(lines[:index])
+
+
+def _macros_maybe_live_through(text, endline):
+    """Names possibly reading as macros at-or-before ``endline``.
+
+    Last-non-inactive-directive-wins per name: a trailing
+    active ``#undef`` proves death at the use, while a last
+    ``#define`` (active or unknown) or an unknown ``#undef``
+    leaves the use-time state uncertain. Inactive lines never
+    compiled. Supplements the resolved tables, which cannot
+    represent unknown-region defines.
+    """
+    states = _pp_line_states(text)
+    touches = [(lineno, name, "define")
+               for name, _, _, lineno in parse_defines(text)]
+    touches += [(lineno, name, "undef")
+                for lineno, name in _pp_undef_stream(text)]
+    last = {}
+    for lineno, name, kind in sorted(touches):
+        if lineno > endline:
+            continue
+        if lineno - 1 < len(states):
+            state = states[lineno - 1]
+        else:
+            state = "active"
+        if state == "inactive":
+            continue
+        last[name] = (kind, state)
+    return {name for name, (kind, state) in last.items()
+            if kind == "define" or state == "unknown"}
+
+
+def _macros_unproven_through(text, endline):
+    """Names with use-time-uncertain definitions at-or-before ``endline``.
+
+    Positionalized ``_pp_unproven_names``: an unknown touch
+    (``#define`` or ``#undef``) not shadowed by a later active
+    touch at-or-before the end leaves the resolved definition
+    world-dependent. Later directives cannot clear use-time
+    uncertainty. Inactive touches never compiled.
+    """
+    states = _pp_line_states(text)
+    touches = []
+    for name, _, _, lineno in parse_defines(text):
+        if lineno > endline:
+            continue
+        if lineno - 1 < len(states):
+            state = states[lineno - 1]
+        else:
+            state = "active"
+        if state == "inactive":
+            continue
+        touches.append((lineno, name, state))
+    for lineno, name in _pp_undef_stream(text):
+        if lineno > endline:
+            continue
+        if lineno - 1 < len(states):
+            state = states[lineno - 1]
+        else:
+            state = "active"
+        if state == "inactive":
+            continue
+        touches.append((lineno, name, state))
+    flagged = set()
+    for _, name, state in sorted(touches):
+        if state == "active":
+            flagged.discard(name)
+        else:
+            flagged.add(name)
+    return flagged
+
+
+def _unit_defined_macros(texts, spans):
+    """Macro names with a visible definition at unit spans.
+
+    Own files count non-inactive ``#define`` directives
+    at-or-before their latest endline; other files count
+    ever-active (inclusion point unknown). A name without any
+    visible definition cannot expand anywhere, so vacuous
+    ``#undef`` hygiene never counts as uncertainty.
+    """
+    latest = {}
+    for relpath, endline in spans:
+        if endline is None:
+            continue
+        if relpath not in latest or endline > latest[relpath]:
+            latest[relpath] = endline
+    names = set()
+    for relpath, endline in sorted(latest.items()):
+        states = _pp_line_states(texts[relpath])
+        for name, _, _, lineno in parse_defines(texts[relpath]):
+            if lineno > endline:
+                continue
+            if lineno - 1 < len(states) and \
+                    states[lineno - 1] == "inactive":
+                continue
+            names.add(name)
+    for relpath in sorted(texts):
+        if relpath in latest:
+            continue
+        states = _pp_line_states(texts[relpath])
+        for name, _, _, lineno in parse_defines(texts[relpath]):
+            if lineno - 1 < len(states) and \
+                    states[lineno - 1] == "inactive":
+                continue
+            names.add(name)
+    return names
+
+
+def _unit_rewrite_uncertain(texts, spans):
+    """Macro names with use-uncertain definitions at unit spans.
+
+    Mirrors ``_unit_maybe_macros`` scoping: spanned files count
+    positionally (unknown touches unshadowed at-or-before the
+    end), other files count any unknown touch anywhere (their
+    inclusion point is unknown). Unlike the maybe set, proven
+    macros are excluded: deterministic expansions are sound.
+    Names without any visible definition are excluded too: a
+    macro that is never defined cannot expand, so unknown
+    ``#undef``-only hygiene never fires the expansion check.
+    """
+    latest = {}
+    for relpath, endline in spans:
+        if endline is None:
+            continue
+        if relpath not in latest or endline > latest[relpath]:
+            latest[relpath] = endline
+    names = set()
+    for relpath, endline in sorted(latest.items()):
+        names |= _macros_unproven_through(
+            texts[relpath], endline)
+    for relpath in sorted(texts):
+        if relpath in latest:
+            continue
+        states = _pp_line_states(texts[relpath])
+        defines = [(lineno, name) for name, _, _, lineno
+                   in parse_defines(texts[relpath])]
+        undefs = [(lineno, name) for lineno, name
+                  in _pp_undef_stream(texts[relpath])]
+        for lineno, name in defines + undefs:
+            if lineno - 1 < len(states) and \
+                    states[lineno - 1] == "unknown":
+                names.add(name)
+    return names & _unit_defined_macros(texts, spans)
+
+
+def _unit_maybe_macros(texts, spans):
+    """Macro names possibly live at the given unit spans.
+
+    Mirrors ``_scoped_macro_tables`` scoping: spanned files
+    count positionally through their latest endline, other
+    files count ever-active (their inclusion point is unknown,
+    so any non-inactive ``#define`` may be live at the use --
+    own-file ``#undef`` directives cannot clear them, since the
+    header may include after the kill).
+    """
+    latest = {}
+    for relpath, endline in spans:
+        if endline is None:
+            continue
+        if relpath not in latest or endline > latest[relpath]:
+            latest[relpath] = endline
+    names = set()
+    for relpath, endline in sorted(latest.items()):
+        names |= _macros_maybe_live_through(
+            texts[relpath], endline)
+    for relpath in sorted(texts):
+        if relpath in latest:
+            continue
+        states = _pp_line_states(texts[relpath])
+        for name, _, _, lineno in parse_defines(texts[relpath]):
+            if lineno - 1 < len(states) and \
+                    states[lineno - 1] == "inactive":
+                continue
+            names.add(name)
+    return names
+
+
+def _scoped_macro_tables(texts, spans, const_values):
+    """Macro expansion tables visible to the given unit spans.
+
+    ``spans`` holds (relpath, endline) pairs. Directives apply
+    from their own line on, so each spanned file contributes
+    only through its latest endline; other files stay whole
+    (their headers may include them anywhere -- superset, fail
+    closed). Pipeline names stay excluded exactly like the
+    universe build. Merge conflicts poison exactly like the
+    universe build.
+    """
+    scoped = dict(texts)
+    latest = {}
+    for relpath, endline in spans:
+        if endline is None:
+            continue
+        if relpath not in latest or endline > latest[relpath]:
+            latest[relpath] = endline
+    for relpath, endline in sorted(latest.items()):
+        scoped[relpath] = _prefix_through_line(
+            texts[relpath], endline)
+    pipeline_names = set(const_values or ())
+    return _prepare_macro_expansion(
+        {name: body for name, body in
+         _merge_file_defines(scoped).items()
+         if name not in pipeline_names},
+        _merge_zero_arg_defines(scoped),
+        _merge_param_defines(scoped))
 
 
 def _splice_unsafe_macros(text, expansion):
@@ -8423,7 +9151,7 @@ def _split_filter_stmts(inner, fn_name, version, stmts, values,
 
 
 # Standard kernel errno values, verified against the pinned stable
-# tree (v7.2.9 include/uapi/asm-generic/errno-base.h sha256
+# tree (v7.3.5 include/uapi/asm-generic/errno-base.h sha256
 # 2c148e92b8318deeb767fabd60822113e575ee664ff09a1873aed8f7a495793c
 # and errno.h sha256
 # 66a5ad60566fdd62e41701bcfc42bfeca5e5696ad1d47d78981575e0c51622be;
@@ -8667,7 +9395,7 @@ def _audit_dropped_condition(sub, opaque, fn_name, version,
     opaque operand -- a foreign read or numeric comparison C
     would skip -- rejects exactly as it would when kept (an
     unrecognized condition grants or denies nothing silently).
-    Proven leaves (membership, type and attach/struct_ops
+    Proven leaves (membership, type, attach/struct_ops and member
     comparisons, st_ops-null tests) are plain reads C skips
     without effect and drop silently. Nested placeholders audit
     recursively.
@@ -8732,7 +9460,8 @@ def _fold_condition_frame(node, prog_type, member, membersets, _audit):
         _, op, value = node
         matched = prog_type == value
         return ("const", matched if op == "==" else not matched)
-    if kind in ("attach_cmp", "stops_cmp", "opaque", "stops_null"):
+    if kind in ("attach_cmp", "stops_cmp", "member_cmp", "opaque",
+                  "stops_null"):
         return node
     if kind == "not":
         sub = yield _fold_condition_frame(
@@ -8800,6 +9529,9 @@ def _negate_condition_frame(node):
     if kind in ("attach_cmp", "stops_cmp"):
         _, op, value = node
         return (kind, "!=" if op == "==" else "==", value)
+    if kind == "member_cmp":
+        _, op, struct, member = node
+        return (kind, "!=" if op == "==" else "==", struct, member)
     return ("not", node)
 
 
@@ -8851,12 +9583,58 @@ def _union_notes(notes, union, prefix, varied):
 # OPERAND, CONST) keys track one operand's flag polarity while
 # ("text", text) keys track one bit-test spelling's polarity, so
 # one operand's flag required and excluded at once contradicts
-# while independent operands stay satisfiable. Notes always mirror
-# the sets: every requirement and exclusion leaf carries its own
-# rendering, so notes unions stay exact across conjunction and
-# factoring.
+# while independent operands stay satisfiable. ("member",
+# STRUCT, MEMBER) keys track one member spelling's polarity;
+# merging additionally contradicts a required and an excluded
+# spelling of one member name unless both structs are plain
+# tag forms naming provably different types (offsets never
+# resolve, so any other pairing might alias). Notes always
+# mirror the sets: every requirement and exclusion leaf carries
+# its own rendering, so notes unions stay exact across
+# conjunction and factoring.
 _CONJ_UNCONSTRAINED = (frozenset(), frozenset(), frozenset(),
                        frozenset(), frozenset(), frozenset())
+
+
+def _provably_different_structs(left, right):
+    """Whether two offsetof struct spellings name different types.
+
+    Only plain ``struct``/``union`` tag forms with different
+    (kind, tag) pairs prove difference; bare identifiers might
+    typedef-alias anything, so any other pairing might alias.
+    """
+    forms = []
+    for spelling in (left, right):
+        match = re.fullmatch(
+            r"(struct|union)\s+([A-Za-z_]\w*)", spelling)
+        if match is None:
+            return False
+        forms.append((match.group(1), match.group(2)))
+    return forms[0] != forms[1]
+
+
+def _member_requirements_clash(obits):
+    """Whether required/excluded member spellings contradict.
+
+    One member name required under one struct spelling and
+    excluded under another contradicts unless both structs are
+    plain tag forms naming provably different types.
+    """
+    required = {}
+    excluded = {}
+    for key, holds in obits:
+        if not (isinstance(key, tuple) and len(key) == 3 and
+                key[0] == "member"):
+            continue
+        _, struct, member = key
+        slot = required if holds else excluded
+        slot.setdefault(member, set()).add(struct)
+    for member in required.keys() & excluded.keys():
+        for first in required[member]:
+            for second in excluded[member]:
+                if not _provably_different_structs(first, second):
+                    return True
+    return False
 
 
 def _conj_merge(base, extra):
@@ -8898,6 +9676,8 @@ def _conj_merge(base, extra):
         if key in polarity and polarity[key] != holds:
             return None
         polarity[key] = holds
+    if _member_requirements_clash(obits):
+        return None
     held_masks = {}
     excl_masks = {}
     for key, holds in obits:
@@ -9719,6 +10499,20 @@ def _dnf_condition_frame(node, opaque, fn_name, version, allow, typed_map,
         return [(frozenset(), frozenset(), frozenset(),
                  frozenset({value}), frozenset(),
                  frozenset({"rejected when attached to %s" % value}))]
+    if kind == "member_cmp":
+        _, op, struct, member = node
+        if neg:
+            op = "!=" if op == "==" else "=="
+        key = ("member", struct, member)
+        if op == "==":
+            return [(frozenset(), frozenset(), frozenset(),
+                     frozenset(), frozenset({(key, True)}),
+                     frozenset({"requires struct_ops member %s of %s"
+                                % (member, struct)}))]
+        return [(frozenset(), frozenset(), frozenset(), frozenset(),
+                 frozenset({(key, False)}),
+                 frozenset({"excludes struct_ops member %s of %s"
+                            % (member, struct)}))]
     if kind == "opaque":
         if allow and not node[1].startswith("__bitop_"):
             raise FilterNotUnderstood(
@@ -11019,6 +11813,7 @@ class _PredicateExpressions(dict):
     def __init__(self):
         super().__init__()
         self.originals = {}
+        self.deffiles = {}
 
 
 def _collect_pred_exprs(texts, fn_name, version, renders,
@@ -11034,7 +11829,9 @@ def _collect_pred_exprs(texts, fn_name, version, renders,
     (symbolic boolean returns only), and ``orig_idents`` the
     identifiers of the pre-folding return expression, so
     dependency collection sees the helper's true inputs even
-    when the splice is a folded literal. Only the active
+    when the splice is a folded literal. ``deffiles`` maps each
+    accepted helper to (file, closing-brace line) pairs for its
+    active definitions. Only the active
     (post-conditional-inclusion) definition inlines:
     provably-excluded definitions never compiled, and a name
     with any unknown-region definition never inlines (unknown
@@ -11062,11 +11859,16 @@ def _collect_pred_exprs(texts, fn_name, version, renders,
             if state == "inactive":
                 continue
             lineno = clean.count("\n", 0, match.start()) + 1
-            deflocs.setdefault(name, []).append((relpath, lineno))
+            deflocs.setdefault(name, []).append(
+                (relpath, lineno, None, state))
             try:
                 body = c_brace_body(clean, match.end() - 1)
             except InventoryError:
                 continue
+            deflocs[name][-1] = (
+                relpath, lineno,
+                clean.count("\n", 0, match.end() - 1 + len(body)) + 1,
+                state)
             inner = body.strip()[1:-1].strip()
             ret = re.match(r"\s*return\b(.*);\s*$", inner, re.S)
             if ret and "?" not in ret.group(1) and \
@@ -11127,6 +11929,11 @@ def _collect_pred_exprs(texts, fn_name, version, renders,
         if _helper_macro_inputs_unprovable(
                 texts, deflocs.get(name, ()), exprs[name][3]):
             del exprs[name]
+    for name in exprs:
+        exprs.deffiles[name] = {
+            (relpath, endline)
+            for relpath, _, endline, state in deflocs.get(name, [])
+            if state == "active" and endline is not None}
     return exprs
 
 
@@ -11144,7 +11951,7 @@ def _helper_macro_inputs_unprovable(texts, deflocs, orig):
     activity stay provable here (cross-file inputs consult
     through the dependency closure instead).
     """
-    for relpath, lineno in deflocs:
+    for relpath, lineno, _, _ in deflocs:
         text = _strip_c_strings(texts[relpath])
         states = _pp_line_states(text)
         live = _live_file_defines(text)
@@ -11166,6 +11973,286 @@ def _helper_macro_inputs_unprovable(texts, deflocs, orig):
     return False
 
 
+def _member_payloads(node):
+    """{(struct, member)} spellings one bound condition compares."""
+    found = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        kind = current[0]
+        if kind == "member_cmp":
+            found.add((current[2], current[3]))
+        elif kind in ("and", "or"):
+            stack.extend(reversed(current[1]))
+        elif kind == "not":
+            stack.append(current[1])
+    return found
+
+
+_MEMBER_SHAPED_ARGS_RE = re.compile(
+    r"\s*(?:(?:struct|union|enum)\s+)?[A-Za-z_]\w*\s*,"
+    r"\s*[A-Za-z_]\w*\s*")
+
+
+def _offsetof_uses_are_member_shaped(
+        params, body, pred_exprs, called, prog_param, expansion,
+        filter_tables, helper_tables):
+    """Whether every offsetof spelling is a plain member call.
+
+    Bodies (filter params/body plus transitively called helper
+    originals, comments and strings stripped) are scanned raw
+    and fully expanded under both universe and positional
+    tables, so atomic aliases can neither hide a use nor (by
+    expanding it away) excuse one; every offsetof spelling in
+    every view must be a plain two-identifier call with no
+    nested invocation. Member access never excuses a spelling
+    (preprocessing is token-based), and directives live outside
+    bodies and need no handling. The carve is a privilege:
+    disagreement between views denies it.
+    """
+    def _without_offsetof(view):
+        if isinstance(view, _MacroExpansion):
+            maps = tuple(
+                {name: body for name, body in part.items()
+                 if name != "offsetof"}
+                if isinstance(part, dict) else part
+                for part in view)
+            return _MacroExpansion(
+                maps,
+                {name: entry for name, entry in
+                 view.definitions.items()
+                 if name != "offsetof"})
+        if not isinstance(view, tuple) or len(view) != 4:
+            return view
+        return tuple(
+            {name: body for name, body in part.items()
+             if name != "offsetof"}
+            if isinstance(part, dict) else part
+            for part in view)
+
+    originals = getattr(pred_exprs, "originals", {})
+    reached = _transitive_helper_closure(
+        pred_exprs, set(called), prog_param, expansion,
+        helper_tables)
+    units = [(params, filter_tables), (body, filter_tables)]
+    for helper in sorted(reached):
+        original = originals.get(helper)
+        if original is not None:
+            table = None
+            if helper_tables is not None:
+                table = helper_tables.get(helper)
+            units.append((original, table))
+    for text, table in units:
+        clean = _strip_c_strings(strip_comments(text))
+        tables = [expansion]
+        if table is not None:
+            tables.append(table)
+        views = [clean]
+        for view in tables:
+            if view is None:
+                continue
+            # offsetof itself stays unexpanded so aliases
+            # resolving to it surface instead of vanishing
+            # into its value.
+            views.append(_expand_all_macros(
+                clean, _without_offsetof(view)))
+        for expanded in views:
+            if _offsetof_has_invocation(expanded):
+                return False
+            # Member access never excuses a spelling:
+            # preprocessing is token-based, so x.offsetof still
+            # expands when offsetof is a macro.
+            for match in re.finditer(r"\boffsetof\b", expanded):
+                rest = expanded[match.end():].lstrip()
+                if not rest.startswith("("):
+                    return False
+                depth = 0
+                end = None
+                for index, char in enumerate(rest):
+                    if char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if not depth:
+                            end = index
+                            break
+                if end is None:
+                    return False
+                if _MEMBER_SHAPED_ARGS_RE.fullmatch(
+                        rest[1:end]) is None:
+                    return False
+    return True
+
+
+def _offsetof_ever_directived(texts):
+    """Whether offsetof is ever #defined/#undefed outside dead code.
+
+    The unmatched-spelling fallback governs a use at an unknown
+    position, so any-time directive state counts: only
+    provably-inactive lines are excluded.
+    """
+    for text in texts.values():
+        states = _pp_line_states(text)
+        for name, _, _, lineno in parse_defines(text):
+            if name == "offsetof" and \
+                    states[lineno - 1] != "inactive":
+                return True
+        for lineno, name in _pp_undef_stream(text):
+            if name == "offsetof" and \
+                    states[lineno - 1] != "inactive":
+                return True
+    return False
+
+
+def _file_defeats_offsetof_at(text, endline):
+    """True if file-scope offsetof state defeats the builtin below ``endline``.
+
+    Any ``offsetof`` mention at file scope at-or-before the
+    unit end defeats: a binding there shadows the builtin at
+    the use (linkage needs no line order beyond preceding the
+    use, and kernel builds reject implicit declarations
+    (``-Werror=implicit-function-declaration`` in
+    ``scripts/Makefile.warn``), so any visible binding is
+    load-bearing), while uses and casts mentioning it are
+    either redundant with their declaration or ill-formed
+    input (both fail closed). Bodies, strings, directives and
+    inactive regions stay blanked, so only real file-scope
+    spellings count; logical lines join first so split
+    spellings still resolve. ``#undef`` and ``#define``
+    directives apply with the same positional rule
+    (preprocessor order is absolute; a live ``#define``
+    rewrites the callee spelling, so the bound text is not the
+    builtin; directives inside a body never reach here -- the
+    body grammar rejects them first). Unknown-region
+    directives at-or-before the unit end also defeat: their
+    effect at the use cannot be proven absent (the generic
+    consulted/unproven check uses final-state semantics, so a
+    trailing directive can clear it while the use stays
+    uncertain). Inactive regions never compiled.
+    """
+    scoped = _file_scope_text(text)
+    chunks = []
+    for lineno, line in enumerate(scoped.splitlines(), 1):
+        if chunks and chunks[-1][1].endswith("\\"):
+            start, prev = chunks.pop()
+            chunks.append((start, prev[:-1] + line))
+        else:
+            chunks.append((lineno, line))
+    for lineno, logical in chunks:
+        if lineno > endline:
+            break
+        if re.search(r"\boffsetof\b", logical):
+            return True
+    states = _pp_line_states(text)
+    directives = [(lineno, name)
+                  for lineno, name in _pp_undef_stream(text)]
+    directives.extend(
+        (lineno, name)
+        for name, _, _, lineno in parse_defines(text))
+    for lineno, name in directives:
+        if name != "offsetof":
+            continue
+        if lineno - 1 < len(states) and \
+                states[lineno - 1] == "inactive":
+            continue
+        if lineno <= endline:
+            return True
+    return False
+
+
+def _reject_defeated_offsetof(parsed, stmts, texts, pred_exprs,
+                              prog_param, expansion, filter_tables,
+                              helper_tables, found_relpath,
+                              found_endline, fn_name, version):
+    """Reject member comparisons when offsetof is shadowed in scope.
+
+    A member comparison binds the ``offsetof`` builtin spelling;
+    when ``offsetof`` is #undef-killed or carries a file-scope
+    binding in a file whose scope the comparison reads, the
+    builtin reading is defeated, like the errno table. Each
+    member node is scoped to the (file, closing line) spans
+    contributing its spelling: the filter's spliced conditions
+    plus spliced bodies of transitively called helpers, matched
+    whitespace-free (splicing is deterministic, so every bound
+    spelling occurs in its source unit; an unmatched spelling
+    falls back to whole-universe bindings plus any-time
+    offsetof directives (the use position is unknown there, so
+    only provably-inactive lines are excluded), fail closed).
+    Units splice with their own positional tables, and helper
+    discovery unions the universe and positional views (neither
+    is a subset of the other once ``#undef`` is considered). A
+    helper body evaluates in its own file scope. Bindings in
+    unrelated units never block. Runs only when a member
+    comparison bound, so filters without one pay nothing.
+    Returns True when a member comparison bound (the member
+    path governed offsetof here), False otherwise.
+    """
+    payloads = set()
+    for kind, node, extra, _ in parsed:
+        check = [node] if node is not None else []
+        if kind == "if" and isinstance(extra, tuple) and \
+                extra[0] in ("ternary", "ternary_const"):
+            check.append(extra[1][0])
+        for sub in check:
+            payloads.update(_member_payloads(sub))
+    if not payloads:
+        return False
+    units = []
+    for kind, cond, extra in stmts:
+        if cond is not None:
+            units.append(_splice_unsafe_macros(cond, filter_tables))
+        if kind == "if" and isinstance(extra, tuple) and \
+                extra[0] in ("ternary", "ternary_const"):
+            units.append(
+                _splice_unsafe_macros(extra[1], filter_tables))
+    cond_text = "\n".join(units)
+    deffiles = getattr(pred_exprs, "deffiles", {})
+    helper_texts = {}
+    for helper in _transitive_called_helpers(
+            pred_exprs, stmts, prog_param, expansion,
+            filter_tables, helper_tables):
+        splice = pred_exprs[helper][0]
+        helper_texts[helper] = _splice_unsafe_macros(
+            splice, helper_tables.get(helper, expansion))
+    # found_relpath/found_endline are always set here (an
+    # unfound filter raises before parsing).
+    spans = {}
+    fallback = False
+    for struct, member in sorted(payloads):
+        key = "offsetof(%s,%s)" % (
+            re.sub(r"\s+", "", struct), member)
+        matched = False
+        if key in re.sub(r"\s+", "", cond_text):
+            spans.setdefault(found_relpath, []).append(found_endline)
+            matched = True
+        for helper, text in helper_texts.items():
+            if key in re.sub(r"\s+", "", text):
+                for relpath, endline in deffiles.get(helper, ()):
+                    spans.setdefault(relpath, []).append(endline)
+                matched = True
+        if not matched:
+            fallback = True
+    if fallback and ("offsetof" in _filter_errno_blocked(texts) or
+                     _offsetof_ever_directived(texts)):
+        raise FilterNotUnderstood(
+            "kfunc filter %s@%s compares against offsetof while "
+            "offsetof is #undef-killed or carries a file-scope "
+            "binding; builtin readings are defeated and outside "
+            "the grammar"
+            % (fn_name, version))
+    if fallback:
+        return True
+    for relpath, ends in spans.items():
+        if _file_defeats_offsetof_at(texts[relpath], max(ends)):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s compares against offsetof while "
+                "offsetof is #undef-killed or carries a file-scope "
+                "binding; builtin readings are defeated and outside "
+                "the grammar"
+                % (fn_name, version))
+    return True
+
+
 def _condition_sets(node):
     """Yield every ID-block name a bound condition consults."""
     stack = [node]
@@ -11183,8 +12270,9 @@ def _condition_sets(node):
 def _compared_member_fields(parsed, prog_param):
     """Field names one filter's conditions consult through members.
 
-    Covers the understood comparison leaves (type, attach type and
-    the ``aux``/``st_ops`` path, including null tests) plus every
+    Covers the understood comparison leaves (type, attach type,
+    the ``aux``/``st_ops`` path including null tests, and the
+    ``aux``/``attach_st_ops_member_off`` path) plus every
     ``prog->...`` chain spelled inside an opaque condition text
     (nested placeholders expanded), since a skipped write feeding
     any later condition -- understood or opaque -- is not
@@ -11203,6 +12291,8 @@ def _compared_member_fields(parsed, prog_param):
                 fields.add("expected_attach_type")
             elif kind in ("stops_cmp", "stops_null"):
                 fields.update(("aux", "st_ops"))
+            elif kind == "member_cmp":
+                fields.update(("aux", "attach_st_ops_member_off"))
             elif kind == "opaque":
                 # A missing issued root has no stored row to visit below.
                 # Validate the node identity as well as stored fragments.
@@ -11798,9 +12888,11 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     """
     found = None
     found_state = None
+    found_relpath = None
+    found_endline = None
     saw_inactive = False
     for relpath in sorted(texts):
-        for offset, params, body in _c_definition_hits(
+        for offset, params, body, endline in _c_definition_hits(
                 texts[relpath], fn_name):
             state = _pp_state_at(texts[relpath], offset)
             if state == "inactive":
@@ -11818,6 +12910,8 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
                     % (fn_name, version))
             found = (params, body)
             found_state = state
+            found_relpath = relpath
+            found_endline = endline
             break
     if found is None:
         if saw_inactive:
@@ -11874,8 +12968,38 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     file_renders.setdefault("false", "0")
     pred_exprs = _collect_pred_exprs(
         texts, fn_name, version, file_renders, expansion)
+    filter_tables = _scoped_macro_tables(
+        texts, [(found_relpath, found_endline)], const_values)
+    helper_tables = {}
+    for helper, spans in getattr(
+            pred_exprs, "deffiles", {}).items():
+        helper_tables[helper] = _scoped_macro_tables(
+            texts, sorted(spans), const_values)
+    deffiles = getattr(pred_exprs, "deffiles", {})
+    filter_uncertain = _unit_maybe_macros(
+        texts, [(found_relpath, found_endline)])
+    helper_uncertain = {
+        helper: _unit_maybe_macros(
+            texts, sorted(deffiles.get(helper, ())))
+        for helper in pred_exprs}
+    filter_rewrite_uncertain = _unit_rewrite_uncertain(
+        texts, [(found_relpath, found_endline)])
+    helper_rewrite_uncertain = {
+        helper: _unit_rewrite_uncertain(
+            texts, sorted(deffiles.get(helper, ())))
+        for helper in pred_exprs}
+    macro_body_idents = _macro_body_idents(texts)
+    called_helpers = _called_helper_names(
+        pred_exprs, stmts, prog_param, expansion,
+        filter_tables)
+    transitive_helpers = _transitive_helper_closure(
+        pred_exprs, set(called_helpers), prog_param, expansion,
+        helper_tables)
+    # Transitively inlined bodies contribute text and values, so
+    # their identifiers consult even when no direct body names
+    # them; a direct-only set misses deep predicate chains.
     helper_idents = _called_helper_idents(
-        pred_exprs, stmts, prog_param, expansion)
+        pred_exprs, transitive_helpers, expansion)
     consulted = _pp_consulted_names(
         params, body, stmts, order, _pp_file_reftexts(texts),
         helper_idents)
@@ -11919,7 +13043,24 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
             "kfunc filter %s@%s consults file binding %s without a "
             "provable scalar initializer; the declaration is outside the grammar"
             % (fn_name, version, ", ".join(bad_bindings[:5])))
-    bad = sorted((unproven | contested) & consulted)
+    # offsetof is deferred here, not exempt, and only when
+    # every spelling is a plain member call: member comparisons
+    # using it are covered positionally by the scope check
+    # instead (a trailing unknown directive provably cannot
+    # affect an earlier use, while leading ones still defeat
+    # there), but any other spelling (predicate calls, return
+    # scalars, bare idents, macro-hidden uses) keeps the legacy
+    # early rejection. The deferred verdict lands after the
+    # scope check runs.
+    offsetof_bad = "offsetof" in ((unproven | contested) &
+                                  consulted)
+    offsetof_deferred = offsetof_bad and \
+        _offsetof_uses_are_member_shaped(
+            params, body, pred_exprs, called_helpers,
+            prog_param, expansion, filter_tables,
+            helper_tables)
+    bad = sorted(((unproven | contested) & consulted) -
+                 ({"offsetof"} if offsetof_deferred else set()))
     if bad:
         raise FilterNotUnderstood(
             "kfunc filter %s@%s consults %s with unproven "
@@ -11951,12 +13092,20 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         node, opaque = _parse_condition(
             cond, prog_param, id_param, aliases, pred_exprs, fn_name,
             version, blocked, local_values, rev_type, rev_attach,
-            param_names, expansion, values, (typed_map, pipe_map, widths))
+            param_names, expansion, values, (typed_map, pipe_map, widths),
+            filter_tables, helper_tables,
+            filter_uncertain, helper_uncertain,
+            filter_rewrite_uncertain, helper_rewrite_uncertain,
+            macro_body_idents)
         if kind == "if" and extra[0] in ("ternary", "ternary_const"):
             inner_node, inner_opaque = _parse_condition(
                 extra[1], prog_param, id_param, aliases, pred_exprs,
                 fn_name, version, blocked, local_values, rev_type,
-                rev_attach, param_names, expansion, values, (typed_map, pipe_map, widths))
+                rev_attach, param_names, expansion, values, (typed_map, pipe_map, widths),
+                filter_tables, helper_tables,
+                filter_uncertain, helper_uncertain,
+                filter_rewrite_uncertain, helper_rewrite_uncertain,
+                macro_body_idents)
             extra = (extra[0], (inner_node, inner_opaque), extra[2])
             check_nodes = (node, inner_node)
         else:
@@ -11968,6 +13117,21 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
                         "kfunc filter %s@%s consults unknown ID block %s"
                         % (fn_name, version, block))
         parsed.append((kind, node, extra, opaque))
+    member_governed = _reject_defeated_offsetof(
+        parsed, stmts, texts, pred_exprs, prog_param, expansion,
+        filter_tables, helper_tables, found_relpath,
+        found_endline, fn_name, version)
+    # The transitive clause is subsumed by the early shape gate
+    # (any pred-shaped mention fails it) and stays as defense in
+    # depth against gate/desync regressions.
+    if offsetof_deferred and not (
+            member_governed and
+            "offsetof" not in transitive_helpers):
+        raise FilterNotUnderstood(
+            "kfunc filter %s@%s consults %s with unproven "
+            "preprocessor state (conditional inclusion or "
+            "redefinition); unproven state is outside the grammar"
+            % (fn_name, version, "offsetof"))
     _reject_compared_member_writes(
         body, parsed, prog_param, pred_exprs, fn_name, version,
         value_typed, straight, expansion, blocked)
@@ -12288,6 +13452,9 @@ STRUCT_OPS_CONSUMERS = {
     "bpf_hid_bpf_ops": ("hid-bpf", "HID-BPF device handling"),
     "bpf_bpf_dummy_ops": ("dummy", "dummy test consumer"),
     "bpf_smc_hs_ctrl_ops": ("smc-hs", "SMC handshake offload"),
+    # bpf-backed binary type handler (fs/binfmt_misc_bpf.c,
+    # first pinned in 7.3.5; map name "binfmt_misc_ops").
+    "bpf_binfmt_misc_ops": ("binfmt-misc", "binfmt_misc binary type handling"),
 }
 
 # Scheduler endpoint registrations, owned by the sched-ext family
@@ -12783,20 +13950,28 @@ def collect_uapi_atoms(staging):
                 ))
             )
         shapes = set()
+        likes = set()
         for version in staging["uapi_versions"]:
             for entry in per_version[version].get(name, []):
                 shapes.add((entry["kind"], entry["enum"], entry["file"]))
-        if len(shapes) > 1 and not is_versioned_bound(name):
+                likes.add(entry.get("function_like", False))
+        if name in DRIFTING_MASK_EXACT and len(likes) > 1:
+            conflicts.append(
+                "shape conflict for %s: macro form differs across versions "
+                "(function-like vs object-like)" % name)
+        if len(shapes) > 1 and not is_structural_bound(name):
             # Multi-shape atoms merge only when every occurrence that
             # carries a value agrees on it: a self-referential no-value
             # define plus a valued enum member, or internal machinery
-            # with no value at all.
+            # with no value at all. Drifting masks are frozen here:
+            # only their values may drift, never their shape, so any
+            # shape difference conflicts even when values agree.
             distinct = set()
             for version in staging["uapi_versions"]:
                 for entry in per_version[version].get(name, []):
                     if entry.get("value") is not None:
                         distinct.add(entry["value"])
-            if len(distinct) > 1:
+            if len(distinct) > 1 or name in DRIFTING_MASK_EXACT:
                 conflicts.append(
                     "shape conflict for %s: %s"
                     % (name, ", ".join(
@@ -13823,7 +14998,8 @@ def inventory(staging, lock, flips=None):
         classification, group, family, note, canonical_name = \
             classify_uapi_atom(name, atom, canonical)
         container = container_of(atom)
-        if classification in ("sentinel", "limit"):
+        if classification in ("sentinel", "limit") or \
+                name in DRIFTING_MASK_EXACT:
             per_version = sorted(
                 {atom.values[ver] for ver in present
                  if atom.values.get(ver) is not None}
