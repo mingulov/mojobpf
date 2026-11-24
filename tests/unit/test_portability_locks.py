@@ -946,6 +946,9 @@ def test_release_actions_are_pinned():
     assert ("softprops/action-gh-release", "8a0cd651e5b2365bd640854a3fa5dfc70e4875f3", "v3.0.4") in pinned, (
         "release.yml: gh-release"
     )
+    assert "fail_on_unmatched_files: true" in text, (
+        "release.yml: a missing draft asset must fail the step, not silently attach nothing"
+    )
     uses = re.findall(r"uses:\s*(\S+)", text)
     assert len(uses) == 3, uses
 
@@ -961,14 +964,25 @@ def test_dependabot_actions_only():
 
 
 def test_scorecard_actions_are_pinned():
+    import re
+
     with open(os.path.join(REPO_ROOT, ".github", "workflows", "scorecard.yml"), encoding="utf-8") as handle:
         text = handle.read()
+    assert re.search(r"[a-z0-9-]+/[a-z0-9-]+@v\d", text) is None, "scorecard.yml: floating major"
     assert "ossf/scorecard-action@23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0" in text, "scorecard.yml: scorecard-action"
     assert "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2" in text, "scorecard.yml: upload-artifact"
     assert "github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5" in text, "scorecard.yml: upload-sarif"
     assert "publish_results: false" in text, "no external publication without an owner call"
-    assert "security-events: write" in text, "SARIF upload needs it or the PR goes red"
+    perms = text.split("jobs:", 1)[1].split("permissions:", 1)[1].split("steps:", 1)[0]
+    assert "security-events: write" in perms, "scorecard.yml: job block must grant SARIF upload (a comment does not count)"
+    assert "contents: read" in perms, "scorecard.yml: job permissions replace top-level; checkout needs contents:read here"
     assert "schedule" not in text and "branch_protection_rule" not in text
+    uses = re.findall(r"uses:\s*(\S+)", text)
+    assert len(uses) == 4, uses
+    for reference in uses:
+        _action, _, revision = reference.partition("@")
+        assert len(revision) == 40, reference
+        int(revision, 16)
 
 
 def test_release_verify_steps():
@@ -993,6 +1007,17 @@ def test_release_verify_steps():
     )
     assert "ci/release_sbom.py" in text and "cyclonedx" in text
     assert "python3 -m json.tool" in text
+    assert "sha256sum dist/" in text, "manifest paths are root-relative for one-command verify"
+    assert "sha256sum -c" in text
+    assert _at("write SHA256SUMS") < _at("attest the artifacts"), (
+        "the manifest is complete before attestation covers dist/*"
+    )
+    assert "subject-path: dist/*" in text
+    derive = "\n".join(lines[_at("derive the version"):_at("provision the pinned build backend")])
+    for record in ("checksums", "evidence", "release-notes"):
+        assert ('docs/%s-${version}.md" ||' % record) in derive, (
+            "release.yml: derive asserts " + record
+        )
 
 
 def test_release_sbom_emitter(tmp_path):
@@ -1048,6 +1073,16 @@ def test_release_sbom_emitter(tmp_path):
     assert module.main([bad_wheel, "1.0.2", str(tmp_path / "bad.json")]) == 2
     assert module.main([wheel, "9.9.9", str(tmp_path / "mismatch.json")]) == 2
 
+    no_license = meta.replace("License: Apache-2.0 WITH LLVM-exception\n", "")
+    nolic_wheel = str(tmp_path / "nolic-1.0.2-py3-none-any.whl")
+    with zipfile.ZipFile(nolic_wheel, "w") as archive:
+        archive.writestr("mojobpf-1.0.2.dist-info/METADATA", no_license)
+    assert module.main([nolic_wheel, "1.0.2", str(tmp_path / "nolic.json")]) == 2
+    wrong_ext = str(tmp_path / "mojobpf-1.0.2.zip")
+    with zipfile.ZipFile(wrong_ext, "w") as archive:
+        archive.writestr("mojobpf-1.0.2.dist-info/METADATA", meta)
+    assert module.main([wrong_ext, "1.0.2", str(tmp_path / "x.json")]) == 2
+
 
 def test_signing_verifiability():
     with open(os.path.join(REPO_ROOT, "docs", "allowed_signers"), encoding="utf-8") as handle:
@@ -1057,6 +1092,7 @@ def test_signing_verifiability():
         runbook = handle.read()
     assert "SHA256:4SdMsG72+xOBHpyoHX9GDELA30Q9ulAlcRhBlDv/djo" in runbook
     assert "docs/allowed_signers" in runbook and "gpg.format=ssh" in runbook
+    assert "user.signingkey" in runbook, "runbook shows the signing configuration, not just verification"
 
 
 def test_release_checksums_record_format():
