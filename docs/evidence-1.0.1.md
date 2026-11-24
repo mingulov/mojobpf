@@ -102,6 +102,14 @@ same bits:
   exact kernel results through both the direct and the
   standard-runner paths; refusal branches assert cleanup
   and identity.
+* Quickstart: the documented fresh-environment run built
+  the counter from a clean-clone wheel (object byte-identical
+  to the pinned `b74df864`), inspected clean, passed guest
+  load/unload on the TCG and KVM lanes, and counted packets
+  (3 after three runs, 8 after five more) on KVM — with two
+  doc deviations recorded in the T7 rehearsal receipt (cmake
+  flag, lockfile bpftool pin), to be removed by the docs
+  pass and its final re-run.
 
 ## Rerunning
 
