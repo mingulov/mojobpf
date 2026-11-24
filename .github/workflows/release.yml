@@ -54,6 +54,58 @@ jobs:
           /tmp/build-venv/bin/python -m pip wheel . --no-deps --no-build-isolation -w dist
           /tmp/build-venv/bin/python setup.py -q sdist
           ls dist/
+      - name: verify the sdist rebuilds the wheel
+        # The sdist must be self-contained: a wheel built from the
+        # unpacked sdist has byte-identical extracted contents to
+        # the wheel built from the tag tree, or this step fails.
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/sdistcheck && mkdir -p /tmp/sdistcheck
+          tar -xzf dist/mojobpf-*.tar.gz -C /tmp/sdistcheck
+          sdist_root=$(echo /tmp/sdistcheck/mojobpf-*)
+          test -d "$sdist_root"
+          (cd "$sdist_root" && /tmp/build-venv/bin/python -m pip wheel . --no-deps --no-build-isolation -w /tmp/sdistcheck/dist)
+          rm -rf /tmp/sdistwheel && mkdir -p /tmp/sdistwheel
+          python3 -m zipfile -e /tmp/sdistcheck/dist/mojobpf-*.whl /tmp/sdistwheel
+          python3 - > /tmp/sdist-contents.txt <<'PYEOF'
+          import hashlib
+          import os
+          rows = []
+          for root, _, files in os.walk('/tmp/sdistwheel'):
+              for name in files:
+                  path = os.path.join(root, name)
+                  digest = hashlib.sha256()
+                  with open(path, 'rb') as handle:
+                      for chunk in iter(lambda: handle.read(65536), b''):
+                          digest.update(chunk)
+                  rows.append('%s  %s' % (
+                      digest.hexdigest(),
+                      os.path.relpath(path, '/tmp/sdistwheel'),
+                  ))
+          print('\n'.join(sorted(
+              rows, key=lambda row: row.split(None, 1)[1])))
+          PYEOF
+          rm -rf /tmp/directwheel && mkdir -p /tmp/directwheel
+          python3 -m zipfile -e dist/mojobpf-*.whl /tmp/directwheel
+          python3 - > /tmp/direct-contents.txt <<'PYEOF'
+          import hashlib
+          import os
+          rows = []
+          for root, _, files in os.walk('/tmp/directwheel'):
+              for name in files:
+                  path = os.path.join(root, name)
+                  digest = hashlib.sha256()
+                  with open(path, 'rb') as handle:
+                      for chunk in iter(lambda: handle.read(65536), b''):
+                          digest.update(chunk)
+                  rows.append('%s  %s' % (
+                      digest.hexdigest(),
+                      os.path.relpath(path, '/tmp/directwheel'),
+                  ))
+          print('\n'.join(sorted(
+              rows, key=lambda row: row.split(None, 1)[1])))
+          PYEOF
+          diff -u /tmp/direct-contents.txt /tmp/sdist-contents.txt
       - name: verify wheel contents against the checksums record
         # Container bytes vary per build (zip metadata); the
         # extracted contents must match the record exactly.
@@ -91,6 +143,21 @@ jobs:
               rows, key=lambda row: row.split(None, 1)[1])))
           PYEOF
           diff -u /tmp/expected.txt /tmp/contents.txt
+      - name: write SHA256SUMS
+        # Release-asset manifest: container hashes of every
+        # attached artifact plus the versioned records. The SBOM
+        # glob matches nothing until the SBOM step lands; the
+        # wheel+sdist lines are required.
+        run: |
+          set -euo pipefail
+          rm -f dist/SHA256SUMS
+          (cd dist && sha256sum mojobpf-*.whl mojobpf-*.tar.gz > SHA256SUMS)
+          for sbom in dist/*.cyclonedx.json; do
+            [ -e "$sbom" ] || continue
+            (cd dist && sha256sum "$(basename "$sbom")" >> SHA256SUMS)
+          done
+          sha256sum "docs/checksums-${MOJOBPF_RELEASE_VERSION}.md" "docs/evidence-${MOJOBPF_RELEASE_VERSION}.md" >> dist/SHA256SUMS
+          cat dist/SHA256SUMS
       - name: attest the artifacts
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -100,5 +167,8 @@ jobs:
         with:
           draft: true
           prerelease: false
-          files: dist/*
+          files: |
+            dist/*
+            docs/checksums-${{ env.MOJOBPF_RELEASE_VERSION }}.md
+            docs/evidence-${{ env.MOJOBPF_RELEASE_VERSION }}.md
           body_path: docs/release-notes-${{ env.MOJOBPF_RELEASE_VERSION }}.md

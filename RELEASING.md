@@ -90,9 +90,11 @@ patch release, never re-pointed.
 1. Push `main`, then the tag (no force-push; existing tags
    untouched).
 2. The tag-triggered workflow (`.github/workflows/release.yml`)
-   rebuilds from the tag, regenerates checksums, compares
-   against the recorded local build, and opens a DRAFT
-   release with wheel + sdist + checksums + attestation.
+   rebuilds from the tag, proves the sdist rebuilds the
+   same wheel, compares extracted contents against the
+   recorded local build, and opens a DRAFT release with
+   wheel + sdist + SBOMs + SHA256SUMS + checksums record +
+   evidence record + attestation.
    Publish itself is a human click after the checks below.
 3. Verify from a second machine/account view: download per
    the README, verify checksums/signature, build
