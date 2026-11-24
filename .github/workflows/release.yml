@@ -143,6 +143,18 @@ jobs:
               rows, key=lambda row: row.split(None, 1)[1])))
           PYEOF
           diff -u /tmp/expected.txt /tmp/contents.txt
+      - name: generate the SBOM
+        # CycloneDX SBOMs for the wheel and the sdist, emitted by
+        # the committed stdlib-only script (no new pinned inputs).
+        # The script fails closed when the package gains
+        # dependencies or the version mismatches.
+        run: |
+          set -euo pipefail
+          version="${MOJOBPF_RELEASE_VERSION}"
+          python3 ci/release_sbom.py dist/mojobpf-*.whl "$version" "dist/mojobpf-${version}.cyclonedx.json"
+          python3 ci/release_sbom.py dist/mojobpf-*.tar.gz "$version" "dist/mojobpf-${version}-sdist.cyclonedx.json"
+          python3 -m json.tool "dist/mojobpf-${version}.cyclonedx.json" > /dev/null
+          python3 -m json.tool "dist/mojobpf-${version}-sdist.cyclonedx.json" > /dev/null
       - name: write SHA256SUMS
         # Release-asset manifest: container hashes of every
         # attached artifact plus the versioned records. The SBOM
