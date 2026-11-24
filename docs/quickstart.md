@@ -44,7 +44,7 @@ pip wheel . --no-deps --no-build-isolation -w dist
 
 ```text
   Building wheel for mojobpf (pyproject.toml): finished with status 'done'
-  Created wheel for mojobpf: filename=mojobpf-1.0.1-py3-none-any.whl size=520635 sha256=ce51bd108046c54938f9e0dac3d9c5dfb34913d63a2e5e245d6de8359663adc5
+  Created wheel for mojobpf: filename=mojobpf-1.0.2-py3-none-any.whl size=520244 sha256=15d17a35fac3615196a5099044ffed15c936509b565176dbec8bfdf1691fec7e
 Successfully built mojobpf
 ```
 
@@ -88,13 +88,13 @@ From a new, unrelated directory:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install --no-index <path-to>/mojobpf-1.0.1-py3-none-any.whl
+.venv/bin/pip install --no-index <path-to>/mojobpf-1.0.2-py3-none-any.whl
 export PATH="$PWD/.venv/bin:$PATH"
 ```
 
 ```text
 Installing collected packages: mojobpf
-Successfully installed mojobpf-1.0.1
+Successfully installed mojobpf-1.0.2
 ```
 
 ## 3. Check the toolchain
@@ -107,7 +107,7 @@ mojobpf doctor
 mojobpf doctor
 informational discovery only: pins are qualified by check/build with --lockfile, never here
 exit 0 does not mean ready: pass --strict to gate on this report
-mojobpf 1.0.1 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
+mojobpf 1.0.2 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
 platform: linux/x86_64
 tool mojo: present Mojo 1.2.0 (2016d0cd) at <mojo-on-PATH>
 tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>

@@ -1,0 +1,90 @@
+<!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
+
+# MojoBPF 1.0.2 checksums
+
+Stable content hashes for the release. The wheel file itself is
+not byte-reproducible (zip timestamps vary per build), but
+the extracted contents of same-tree rebuilds are byte-identical
+(`diff -r` clean). Verify the contents, not the container.
+
+Reference wheel build (from a clean clone of the release tree;
+the docs carrying this release record do not enter the
+wheel):
+
+```text
+mojobpf-1.0.2-py3-none-any.whl size=520244 sha256=15d17a35fac3615196a5099044ffed15c936509b565176dbec8bfdf1691fec7e
+```
+
+The wheel carries no `docs/` files and no tests;
+`README.md` enters `METADATA` as the long description, so the
+`METADATA` and `RECORD` rows follow the release tree's README
+and every other row equals a build from the matrix commit
+pinned in
+[evidence](evidence-1.0.2.md) (verified by rebuilding from
+the release tree and diffing the extracted contents).
+
+Reproduce it with `pip wheel . --no-deps --no-build-isolation
+-w dist` from the release tree, with `setuptools==80.10.2` as
+the build backend (the `WHEEL` and `METADATA` rows name it),
+and compare the extracted files
+against the table below (SHA-256 per archived path):
+
+```text
+721e0d12697ce6d50ff700612f2bc91e1e77f56f197a8413f1091b7ccd044f44  mojobpf-1.0.2.data/data/share/mojobpf/schemas/artifact.schema.json
+2d5ab6cb8f01fb0a0040420c623ac1b167e2a72240fbba10e496282c311af099  mojobpf-1.0.2.data/data/share/mojobpf/schemas/capability.schema.json
+4db9e5a8bf821077e85896df28e1252e0640f37227e9b1c6063aed3ce4356097  mojobpf-1.0.2.data/data/share/mojobpf/schemas/cost.schema.json
+8e2bb3323e29799823d4c2df3a1b6aa6cc8c868aafdd7d5f45e15084bee59bae  mojobpf-1.0.2.data/data/share/mojobpf/schemas/coverage-ledger.schema.json
+d329b14116322263156dce1b3e2d90eef2c8953cfe9bb8f58408dfea48a752f9  mojobpf-1.0.2.data/data/share/mojobpf/schemas/diagnostics.schema.json
+02cd66291528f41fae900246abd048ad8ec5d5b5481ae088f8b92586140c70d6  mojobpf-1.0.2.data/data/share/mojobpf/schemas/evidence.schema.json
+4f0d007a38b39176d3b6146bebd222bda0f3af772c5ac35f3425190011b27ff2  mojobpf-1.0.2.data/data/share/mojobpf/schemas/fixture.schema.json
+8cd312bb3fa5a108d2d5cf23fea0c510bdd2190f0d41d7361a42ebe1c9609af7  mojobpf-1.0.2.data/data/share/mojobpf/schemas/manifest.schema.json
+222c12563552f5044f4fa6698ac47e304458e969a0b5f26ffa9a93a64983715b  mojobpf-1.0.2.data/data/share/mojobpf/schemas/result.schema.json
+e48385efc38aa27616f36ba002522825718d4daf21205f4fa8ec0247a18f8af3  mojobpf-1.0.2.data/data/share/mojobpf/schemas/run-plan.schema.json
+3e840d7bdf26bd91d8dcea6c3158de7bd3801a97650d4fa11502908ca98d741c  mojobpf-1.0.2.data/data/share/mojobpf/schemas/size-budget.schema.json
+d5b25ab6c67fad351e0828e8918f6f7235babfdb6a2a39d1222c1d9aaa67ba21  mojobpf-1.0.2.data/data/share/mojobpf/schemas/target.schema.json
+fd14e1ece669c92d28cd82307a15cfa942460a88f206de83ff59b6f2c9419a57  mojobpf-1.0.2.dist-info/METADATA
+dd7d20b3defacef13cb48a8e2ca95e2097c4bae9c8a50d3336837a56348c5984  mojobpf-1.0.2.dist-info/RECORD
+c14c80f0e6ae95195b7f032d990b2f367806af140702f90a72f466762ce5262d  mojobpf-1.0.2.dist-info/WHEEL
+da2d8979ab63f4b4934949fb308f344c026f5786d1c61c58571fb5227c87b019  mojobpf-1.0.2.dist-info/entry_points.txt
+4244bc559163163a605d3c3135f3115d04e2bb937a37ab5fb6f13194931db8bf  mojobpf-1.0.2.dist-info/licenses/LICENSE
+03dab56ba90cef041216e442708a79e8cde129f4c35e3097c4de579f5b6c5c09  mojobpf-1.0.2.dist-info/licenses/THIRD_PARTY_NOTICES.md
+45c93ebd92be7696a5a84b824c30dd91063275556c8808065abcb1b8d5025855  mojobpf-1.0.2.dist-info/top_level.txt
+6ebbb48b141ecb28fec2da7034ebaac7476462b3e46e82e10e8599623d1c2188  mojobpf/__init__.py
+e1feb3401fd508de224199fc6adeb306f07119eb11efbd1b578ede9cc90ef451  mojobpf/build.py
+7b48620032dd70cf41200ea38ad32a43fa210bbfe1dc0425dbcb757c7585cb5c  mojobpf/capabilities.py
+b23fc4ea2ba36fbf2636421d3afedb8f0bac02e37012359da2e721bfc618a30a  mojobpf/cli.py
+48d11f8960f87cc48236fdfd9d82444f943e41a65ad71cb56c94486acb0cf618  mojobpf/diagnostics.py
+b54ac9eb3d77c1e3e895ad8245b63bfb8fa3f8aaf82b469d84684b4c9527959f  mojobpf/elf_reader.py
+2428fbaf1c4d8135009ff20f47638a148218f1cce07831a681fe25f351976884  mojobpf/events.py
+ebf871620a68676a47037bb802bc63320155d1055c320fcc49223c04e423c873  mojobpf/evidence.py
+de185bd254c9a6461b036e20a0d50ed90e4908a9c8cb213eda79f06f16070a50  mojobpf/execution.py
+9ee52a53093dd2a5917533e4a4fe84a60b21a5eaa7a6d4870268603615754b16  mojobpf/helpers.py
+88280e0dfae7ea9036b23eaf76ac8a916ad079c335c417e01321d9968907805a  mojobpf/inputs.py
+dd8f3fa4a6862933b038940bc430a2392633c306d6a01dce6f50808307e772fb  mojobpf/inspect.py
+2d8b7881166673bafd7229bbfb507021592efe5bcb51df611342824318335530  mojobpf/manifest.py
+c57e93e0c2d8e5e48af9f36c579442b7980aa0db25c88fc75a5b186b115b03b2  mojobpf/models.py
+284281af90426328304ae425721886bc39e288ddf35fea836302e7afe9636af6  mojobpf/native_adapter.py
+6b4a08d7ec254b07aa0c5e6333b0d30665d1569c75d6c10e9722ed0b3e9372be  mojobpf/process_guardian.py
+4fb20722692eb0df4578e1e9274865c576e0cde4345fbdf79e84fe77e562aeb1  mojobpf/resources/adapter/adapter_service.py
+92c06052b816b60f3c98c0469cd46aefc6c10f0b0161751a1952cabafb0b65d6  mojobpf/resources/adapter/admission.json
+c8849b8ea01d032afdb6c361ff8d59d4aff0bfa988348951bc890d937a4fddab  mojobpf/resources/adapter/audit.py
+dca1c8fd70fc99d41c00a67a2102e1da0ca0e985a8bdee16bd2f2a2df5b5b2c1  mojobpf/resources/adapter/mojo_ir_adapter.py
+388ceed8b94be816e9a88d8da7b4a190fd9da57a492a627530d804a355c437c5  mojobpf/resources/adapter/target_proof_table.json
+c7784e3806b18f5252c67d1affecb3a6febbaa3a97ce64ac56a6c27adf526a21  mojobpf/resources/sdk/mojobpf/checksum.mojo
+d0d231825076babcb282694c1ab0e5083f616e24849e81429dbd4085d2d699d8  mojobpf/resources/sdk/mojobpf/core.mojo
+97ecf6544f6113c3159e01f98c6bcc1691a35b942ec6caa5931d14f06e0b3e62  mojobpf/resources/sdk/mojobpf/events.mojo
+090fd5321ed2dd74fc54014aa32790e8d7269840002818d76a0e5a71f1f9df94  mojobpf/resources/sdk/mojobpf/helpers.mojo
+72dd10fe1c91ae8bf1387636d371779dd904a2892aa7c110d6ceadf1046f076c  mojobpf/resources/sdk/mojobpf/maps.mojo
+8a217bf27911663ecb7e98088ed422eec4c84414c94dc409a8813a8e1e288060  mojobpf/resources/sdk/mojobpf/packet.mojo
+3fa36c595e02159d3afd96b10a0c00b1697303d158784f97357d84d1ed803d9b  mojobpf/resources/sdk/mojobpf/parse.mojo
+5c704956e921147eb58563c62225f07b9350f928f26a6dcb548631e721991ce9  mojobpf/resources/sdk/mojobpf/uprobe.mojo
+ed67edbf5ba196dbc10f9206036b396dfa2f594b4f3fc45ce0cd09c227593cbb  mojobpf/safeio.py
+b7127fb6f6da30b8a21e4f8cf00e42273a952add64d6a7f1b37b206d278be53f  mojobpf/sdk.py
+1ae6c7105b8ac084b94013053d6ef64530f2e10dd80e18917a80273337ededec  mojobpf/sealed_fs.py
+8ae707fd3002679bdb329bf5c44851bab03b3f4e127105d83236f009e9d43815  mojobpf/target_controller.py
+637e7bcff1e3ecef4f8e129ef4968dc26532d42493f8656f4fadd8b81c49de33  mojobpf/toolchain.py
+4b75d0a8f68168c85b7353b482454fc7c662c55f0bce1b51830e6858de3a1883  mojobpf/validation/__init__.py
+a3b86744d6b63eab2cdf3feb768b2464c0d8f4109a3de0ac7306cd9354e038f1  mojobpf/validation/aggregate.py
+fb84c7a2f02644a21936658339f6b6a2d514c9f9957fa7619c94803aac17325f  mojobpf/validation/models.py
+c73f858250a86b8d1a9f0969c02898bb11762524ad8be2be3b27fa53afc476d7  mojobpf/verify.py
+```
