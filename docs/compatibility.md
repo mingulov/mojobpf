@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF compatibility (1.0.1)
+# MojoBPF compatibility (1.0.2)
 
 What this release is proven with, what it is proven to refuse,
 and what it does not claim. Supported here means observed in
@@ -99,7 +99,7 @@ registers 41 suites: the 28 release-matrix suites plus the 12
 (`ci/run_vm_tests.py` `SUITES`,
 `tests/unit/test_portability_locks.py::test_x86_matrix_shape_unchanged`).
 
-Five kernels form the 1.0.1 gating scope: 6.6.0-060600-generic,
+Five kernels form the 1.0.2 gating scope: 6.6.0-060600-generic,
 6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic,
 and the exact 7.4.0-070400rc4-generic build (rc-latest at cut
 time; the claim names that build, never "7.4" generally). A lane
@@ -122,7 +122,7 @@ excluded cells never run, print as `excluded`, and the merge
 refuses any absent cell outside the map. The historical alpha
 and 1.0.0 runs do not qualify the current tree.
 
-MojoBPF 1.0.1 qualifies the program and map shapes its
+MojoBPF 1.0.2 qualifies the program and map shapes its
 28-suite gating board exercises (stable and preview profiles
 alike; only the two stable profiles carry a stability
 promise), with the pinned toolchain, on five exact x86-64 KVM
@@ -539,7 +539,7 @@ kernel-isa-alu` and `--suite kernel-isa-alu32`,
 `tests/kernel/test_alu64_qual.py` and
 `tests/kernel/test_alu32_qual.py`; 7/7 each on the 6.12 KVM
 lane in a non-gating pre-release run. These ISA suites are
-outside the 1.0.1 gating board, and this arithmetic is not
+outside the 1.0.2 gating board, and this arithmetic is not
 re-qualified on the other four lanes in this release). Variable divisors select the DIV/MOD X-form, which
 the audit refuses, as do signed division/remainder, zero
 divisors, and widths outside 8/16/32/64 (`MBPF319`; same

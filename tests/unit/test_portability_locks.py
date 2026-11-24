@@ -1059,6 +1059,21 @@ def test_signing_verifiability():
     assert "docs/allowed_signers" in runbook and "gpg.format=ssh" in runbook
 
 
+def test_release_checksums_record_format():
+    import re
+
+    with open(os.path.join(REPO_ROOT, "docs", "checksums-1.0.2.md"), encoding="utf-8") as handle:
+        text = handle.read()
+    rows = [
+        line
+        for block in re.findall(r"```text\n(.*?)```", text, re.S)
+        for line in block.splitlines()
+        if re.match(r"^[0-9a-f]{64}  ", line)
+    ]
+    assert rows, "no checksum rows for the workflow to parse"
+    assert "vary per build" in text, "containers vary; only extracted contents are pinned"
+
+
 def test_ci_interpreter_install_is_digest_pinned():
     text = _read_workflow()
     assert "setup-python" not in text, (
@@ -1094,7 +1109,7 @@ def test_ci_interpreter_install_is_digest_pinned():
     path_at = _line_of("GITHUB_PATH")
     pip_at = _line_of("pip install")
     # The unit step runs the lane runner (module-per-process),
-    # the declared unit gate anchored in docs/evidence-1.0.1.md:
+    # the declared unit gate anchored in docs/evidence-1.0.2.md:
     # a raw single-process `pytest tests/unit` GC-thrashes past
     # 30 minutes on this suite (measured 2026-11-09), so the
     # workflow cannot run it literally. The lane executes the

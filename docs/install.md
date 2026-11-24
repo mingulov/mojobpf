@@ -49,8 +49,8 @@ a kernel-test runner is available. It changes nothing.
 Two channels, same bits:
 
 * GitHub Release (published at release time): download
-  `mojobpf-1.0.1-py3-none-any.whl` (and the `.tar.gz` source
-  archive) from the `v1.0.1` release page, then install
+  `mojobpf-1.0.2-py3-none-any.whl` (and the `.tar.gz` source
+  archive) from the `v1.0.2` release page, then install
   offline as below.
 * Source checkout: `git clone
   https://github.com/mingulov/mojobpf.git`, then build the
@@ -64,7 +64,7 @@ is reserved for the canonical test interpreter below):
 ```bash
 python3 -m venv install-env
 source install-env/bin/activate
-pip install --no-index mojobpf-1.0.1-py3-none-any.whl
+pip install --no-index mojobpf-1.0.2-py3-none-any.whl
 mojobpf doctor
 ```
 
@@ -77,7 +77,7 @@ package is needed):
 ```bash
 pip install "setuptools>=61"
 pip wheel . --no-deps --no-build-isolation -w dist
-pip install --no-index dist/mojobpf-1.0.1-py3-none-any.whl
+pip install --no-index dist/mojobpf-1.0.2-py3-none-any.whl
 ```
 
 To compare the build against the release checksums record,

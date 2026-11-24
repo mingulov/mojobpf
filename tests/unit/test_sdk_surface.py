@@ -223,7 +223,7 @@ def test_skb_helpers_exported():
 
 
 def test_tool_version_matches_packaging():
-    assert mojobpf.__version__ == "1.0.1"
+    assert mojobpf.__version__ == "1.0.2"
     with open(
         os.path.join(REPO_ROOT, "pyproject.toml"), "rb"
     ) as handle:

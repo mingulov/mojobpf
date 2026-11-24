@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF licensing (1.0.1)
+# MojoBPF licensing (1.0.2)
 
 How licenses flow through the tool: what the project itself
 uses, what user programs must declare, and what the emitted
