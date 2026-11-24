@@ -2,6 +2,7 @@
 
 # MojoBPF 0.3.0a1 checksums
 
+> Historical: describes the 0.3.0a1 alpha scope only; the current release is documented separately.
 Stable content hashes for the alpha. The wheel file itself is
 not byte-reproducible (zip timestamps vary per build), but
 the extracted contents of same-tree rebuilds are byte-identical

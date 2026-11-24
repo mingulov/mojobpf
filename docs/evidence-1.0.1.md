@@ -34,7 +34,7 @@ ISA smoke; 28 suites x 2 lanes (6.6 + 6.12) = 56 cells.
 | Suite | Command | Result |
 |---|---|---|
 | Unit | `pixi run test-unit` | 27/27 modules exit 0 (1931 nodes) |
-| Compiler | `pixi run test-compiler` | 84/84 modules exit 0 (5112 nodes) |
+| Compiler | `pixi run test-compiler` | 84/84 modules exit 0 (5112 nodes); the 1.0.0 module-18 subtests-closure gap shows no in-lane failure in this cut |
 | Package | `pixi run test-package` | 2/2 modules exit 0 (sdist membership + wheel contents) |
 | Smoke | `pixi run test-smoke` | 4/4 modules exit 0 (79 nodes) |
 | VM matrix, 6.6 lane | `python3 ci/run_vm_tests.py --lane v6.6-kvm --suite <each of 28> --out-dir <lane> --consumer-path <independent-toolchain>` | 28/28 pass |

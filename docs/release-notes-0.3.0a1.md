@@ -2,6 +2,7 @@
 
 # MojoBPF 0.3.0a1 release notes
 
+> Historical: describes the 0.3.0a1 alpha scope only; the current release is documented separately.
 Alpha preview. MojoBPF compiles Mojo-authored Linux eBPF
 programs into conventional `EM_BPF` ELF objects loadable by
 unmodified `bpftool`/libbpf. This alpha adds three proven

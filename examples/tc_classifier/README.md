@@ -20,6 +20,25 @@ the SDK's fail-closed guard idiom.
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/tc_classifier/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/tc_classifier.bpf.o \
+    --profile linux-bpfel-v3-net \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 

@@ -25,6 +25,58 @@ no maps: the call shape needs no map or helper vocabulary.
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/subprog_call/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/subprog_decision.bpf.o \
+    --profile linux-bpfel-v3-subprog \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Call discipline
+
+The example demonstrates the only admitted BPF-to-BPF call
+shape: exactly one callee per program, spelled `@export` +
+`@no_inline` with a C ABI and the fixed one-argument scalar
+signature `(UInt64) -> UInt64`, called from an XDP classifier
+entrypoint in either definition order. The callee body is pure
+scalar arithmetic with no calls of its own. A second callee, any
+other arity or argument type, recursion, an indirect call, a
+call inside the callee, a call under `trace_entry`, and map or
+helper calls alongside the callee are all refused before the
+backend runs; under profiles without the subprogram capability
+the object is refused at inspection instead. See
+`docs/supported-subset.md` (subprogram section) for the exact
+codes.
+
+## Measured behavior
+
+In a disposable guest on each supported kernel lane, the base
+board is drop/pass/short = 1/2/2 with distinct actions across
+the two full-size fixtures, the rebuilt mutant boards 2/1/2, and
+the entry-first twin matches the base rule — so the callee
+executes and computes an input-dependent result through the
+call. The verifier log of a successful load shows the
+subprogram (`func#0`/`func#1` with the relocated call and
+caller/callee frames). Every load reports `cleanup_ok`, both
+pins are absent afterwards, and the final program/map listing
+carries none of our names. The kernel suite proving this is
+`tests/kernel/test_subprog_calls.py` (eleven tests: fixture
+bytes, base, mutant, second order, stale, verifier log,
+callee null-load, FD lifecycle, provenance, object hashes,
+license).
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 
@@ -63,36 +115,3 @@ site pass through byte-identical, and the backend lowers the
 static call itself. The resulting object (the callee in `.text`,
 the entrypoint in `xdp`, one `R_BPF_64_32` relocation) loads
 with unmodified libbpf/bpftool.
-
-## Call discipline
-
-The example demonstrates the only admitted BPF-to-BPF call
-shape: exactly one callee per program, spelled `@export` +
-`@no_inline` with a C ABI and the fixed one-argument scalar
-signature `(UInt64) -> UInt64`, called from an XDP classifier
-entrypoint in either definition order. The callee body is pure
-scalar arithmetic with no calls of its own. A second callee, any
-other arity or argument type, recursion, an indirect call, a
-call inside the callee, a call under `trace_entry`, and map or
-helper calls alongside the callee are all refused before the
-backend runs; under profiles without the subprogram capability
-the object is refused at inspection instead. See
-`docs/supported-subset.md` (subprogram section) for the exact
-codes.
-
-## Measured behavior
-
-In a disposable guest on each supported kernel lane, the base
-board is drop/pass/short = 1/2/2 with distinct actions across
-the two full-size fixtures, the rebuilt mutant boards 2/1/2, and
-the entry-first twin matches the base rule — so the callee
-executes and computes an input-dependent result through the
-call. The verifier log of a successful load shows the
-subprogram (`func#0`/`func#1` with the relocated call and
-caller/callee frames). Every load reports `cleanup_ok`, both
-pins are absent afterwards, and the final program/map listing
-carries none of our names. The kernel suite proving this is
-`tests/kernel/test_subprog_calls.py` (eleven tests: fixture
-bytes, base, mutant, second order, stale, verifier log,
-callee null-load, FD lifecycle, provenance, object hashes,
-license).

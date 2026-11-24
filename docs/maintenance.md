@@ -24,10 +24,37 @@ result) stays a non-claim until its own gate passes.
 ## Pin discipline
 
 Toolchain, kernel-lane, and lock updates require a full anchor
-re-proof (fast suites, all five x86 KVM matrix lanes, the two
+re-proof (fast suites, both x86 KVM matrix lanes, the two
 portability lanes, feasibility, quickstart, revision equality)
 before promotion. Investigational lanes and pins never leak
 into the release pins or the release documentation.
+
+## Maintainer lockfile route (not user documentation)
+
+Users pin with the single PATH-resolved recipe in
+[installation](install.md#lockfile-for-your-machine).
+Maintainers refreshing the reviewed locks use the inventory
+probe plus `lock_refresh` generation from the source tree:
+
+```bash
+python3 tests/probes/toolchain_inventory.py --output /tmp/inventory.json
+python3 tools/lock_refresh.py generate --kind toolchains \
+    --inventory /tmp/inventory.json \
+    --pixi-lock pixi.lock --adapter-dir compiler \
+    --out toolchains.local.lock.json --report lock.report.json
+```
+
+The inventory exits nonzero naming what is missing when any of
+`mojo`, `llc`, `bpftool`, `clang`, `llvm-config`, or `python3`
+is absent or fails; generation then refuses rather than
+inventing pins for a missing required tool, records omissions
+of optional tools as limitations notes, and writes neither
+output on failure. The generated lock carries status
+`bootstrap`: builds match its pins like any lock, but it is not
+a reviewed `release-approved` pin. Copy the lock together with
+the `pixi.lock` beside it: the lock's distribution record binds
+that sibling file, and a missing sibling fails the build
+(`MBPF102`) instead of running unpinned.
 
 ## Compatibility
 

@@ -32,6 +32,56 @@ shape (four-entry array plus the one-page ring).
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/tracepoint_events/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/tracepoint_events.bpf.o \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Scope
+
+The filter uses the low 32 bits of the helper-14 word only; both
+sides observe the initial PID namespace, where the helper result
+and `gettid()` agree. The program reads no tracepoint context
+payload fields — the context pointer is accepted but unused, and
+any use is refused before code generation — and attaches only to
+`syscalls:sys_enter_getpid`. This example publishes through the
+copy-output helper only; explicit reservations (reserve, submit,
+discard) are supported under the reservation capability profile
+— see the `ringbuf_reserve` example.
+
+## Measured behavior
+
+In a disposable guest on each supported kernel lane, the producer
+side reconciles attempted = successful + failed and the drained
+records reconcile received = successful on every run: a healthy
+consumer drains the full workload with zero loss and contiguous
+sequences; a stopped consumer on the one-page ring observes
+nonzero explicit loss with the drained records forming the exact
+successful prefix; SIGKILLing the consumer between completed drain
+batches loses no kernel records, and the restarted consumer resumes
+with 2500 contiguous records, failed=0, at byte offset 80000; a TGID
+mutant emits
+nothing while the reloaded base still emits exactly; version-2
+records are produced but rejected by the decoder; and an
+independent C control producer validates the observer. The kernel
+suite proving this is `tests/kernel/test_tracepoint_events.py`
+(six tests: control, healthy, saturation, crash, mutant-plus-stale,
+version gate). The loss accounting above is what the suite checks
+on the forced saturation run with a stopped consumer.
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 
@@ -71,35 +121,3 @@ encoding, and appends the standard map declarations with map BTF
 for both maps; every other body instruction in the adapted IR is
 byte-identical to the frontend output. The resulting object loads
 with unmodified libbpf/bpftool.
-
-## Scope
-
-The filter uses the low 32 bits of the helper-14 word only; both
-sides observe the initial PID namespace, where the helper result
-and `gettid()` agree. The program reads no tracepoint context
-payload fields — the context pointer is accepted but unused, and
-any use is refused before code generation — and attaches only to
-`syscalls:sys_enter_getpid`. This example publishes through the
-copy-output helper only; explicit reservations (reserve, submit,
-discard) are supported under the reservation capability profile
-— see the `ringbuf_reserve` example.
-
-## Measured behavior
-
-In a disposable guest on each supported kernel lane, the producer
-side reconciles attempted = successful + failed and the drained
-records reconcile received = successful on every run: a healthy
-consumer drains the full workload with zero loss and contiguous
-sequences; a stopped consumer on the one-page ring observes
-nonzero explicit loss with the drained records forming the exact
-successful prefix; SIGKILLing the consumer between completed drain
-batches loses no kernel records, and the restarted consumer resumes
-with 2500 contiguous records, failed=0, at byte offset 80000; a TGID
-mutant emits
-nothing while the reloaded base still emits exactly; version-2
-records are produced but rejected by the decoder; and an
-independent C control producer validates the observer. The kernel
-suite proving this is `tests/kernel/test_tracepoint_events.py`
-(six tests: control, healthy, saturation, crash, mutant-plus-stale,
-version gate). The loss accounting above is what the suite checks
-on the forced saturation run with a stopped consumer.

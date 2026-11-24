@@ -17,6 +17,43 @@ invocation count as a `u64`.
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/hash_counter/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/hash_counter.bpf.o \
+    --profile linux-bpfel-v3-hash \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Scope
+
+This program counts invocations unconditionally: its action is a
+constant pass and it never inspects packet bytes. It stays as
+subset documentation for the single-entry hash shape (one address
+reinterpretation, one read-modify-write pair, one hash tag per map
+load, no cross-call packet values). Multi-entry hash shapes (up to
+4 entries) and hash deletion probes build the same way; the
+kernel suite proves insert, lookup, update, delete, and
+userspace-driven iteration at 4 entries with exact bytes,
+an independent consumer proves 2-entry read-modify-write,
+this 1-entry shape is a load/unload proof, and structural
+proofs cover every count at all 24 shapes. The
+update flag stays `BPF_ANY` (create-or-replace);
+`BPF_NOEXIST`/`BPF_EXIST` spellings are refused before the kernel,
+and there is no from-program key-iteration spelling (userspace
+walks live maps with the `bpf()` get-next-key command).
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 
@@ -55,21 +92,3 @@ appends the standard hash map declaration with map BTF; every
 other body instruction in the adapted IR is byte-identical to the
 frontend output. The resulting object loads with unmodified
 libbpf/bpftool.
-
-## Scope
-
-This program counts invocations unconditionally: its action is a
-constant pass and it never inspects packet bytes. It stays as
-subset documentation for the single-entry hash shape (one address
-reinterpretation, one read-modify-write pair, one hash tag per map
-load, no cross-call packet values). Multi-entry hash shapes (up to
-4 entries) and hash deletion probes build the same way; the
-kernel suite proves insert, lookup, update, delete, and
-userspace-driven iteration at 4 entries with exact bytes,
-an independent consumer proves 2-entry read-modify-write,
-this 1-entry shape is a load/unload proof, and structural
-proofs cover every count at all 24 shapes. The
-update flag stays `BPF_ANY` (create-or-replace);
-`BPF_NOEXIST`/`BPF_EXIST` spellings are refused before the kernel,
-and there is no from-program key-iteration spelling (userspace
-walks live maps with the `bpf()` get-next-key command).

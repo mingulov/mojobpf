@@ -25,6 +25,34 @@ sum); both exist for behavior-change proofs.
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/packet_counter/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/packet_counter.bpf.o \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Scope
+
+This program is the packet workload whole: content action plus both
+counters in one Mojo program, proven over the shared packet corpus
+(`examples/packet_classifier/corpus/`) with per-invocation map reads
+and nonzero userspace initializations, so every action and every
+accumulated value is checked exactly. The split demos stay as subset
+documentation: `packet_classifier` classifies without a map and
+`xdp_counter` counts invocations without inspecting bytes.
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 
@@ -52,13 +80,3 @@ pseudo-calls to their standard BPF helper-call encoding, and appends
 the standard two-entry map declaration with map BTF; every other
 body instruction in the adapted IR is byte-identical to the frontend
 output. The resulting object loads with unmodified libbpf/bpftool.
-
-## Scope
-
-This program is the packet workload whole: content action plus both
-counters in one Mojo program, proven over the shared packet corpus
-(`examples/packet_classifier/corpus/`) with per-invocation map reads
-and nonzero userspace initializations, so every action and every
-accumulated value is checked exactly. The split demos stay as subset
-documentation: `packet_classifier` classifies without a map and
-`xdp_counter` counts invocations without inspecting bytes.

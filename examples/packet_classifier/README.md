@@ -22,6 +22,35 @@ bytes; it exists for behavior-change proofs.
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/packet_classifier/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/packet_classifier.bpf.o \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Corpus
+
+`corpus/` holds the 33-frame packet corpus the differential and
+kernel suites run: lengths 14, 15, 18, 30, 64, 127, 128, 512 and 1500
+bytes, a fixed Ethernet header (locally-administered unicast
+addresses, IPv4 ethertype), byte 14 varied across 0, 1, 2 and 255 for
+every length above 14, and the 14-byte header-only frame once. All
+other payload bytes are zero. `corpus/manifest.json` records the rule,
+the header, and the independent expected action plus the SHA-256 of
+every frame: 33 invocations, 16 drops, 17 passes, 9,590 bytes total.
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 
@@ -48,14 +77,3 @@ The adapter only retargets module metadata (triple, data layout, the
 `xdp` section, the license note, entrypoint codegen attributes); every
 body instruction in the adapted IR is byte-identical to the frontend
 output. The resulting object loads with unmodified libbpf/bpftool.
-
-## Corpus
-
-`corpus/` holds the 33-frame packet corpus the differential and
-kernel suites run: lengths 14, 15, 18, 30, 64, 127, 128, 512 and 1500
-bytes, a fixed Ethernet header (locally-administered unicast
-addresses, IPv4 ethertype), byte 14 varied across 0, 1, 2 and 255 for
-every length above 14, and the 14-byte header-only frame once. All
-other payload bytes are zero. `corpus/manifest.json` records the rule,
-the header, and the independent expected action plus the SHA-256 of
-every frame: 33 invocations, 16 drops, 17 passes, 9,590 bytes total.

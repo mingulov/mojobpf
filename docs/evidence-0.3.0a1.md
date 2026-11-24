@@ -2,6 +2,7 @@
 
 # MojoBPF 0.3.0a1 evidence summary
 
+> Historical: describes the 0.3.0a1 alpha scope only; the current release is documented separately.
 The alpha regression anchor: every suite below ran green on
 the release tree, except the four compiler-lane reds that
 reproduce identically on the pristine pre-alpha base and are

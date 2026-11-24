@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF compatibility (1.0.0)
+# MojoBPF compatibility (1.0.1)
 
 What this release is proven with, what it is proven to refuse,
 and what it does not claim. Supported here means observed in
@@ -77,7 +77,7 @@ retained implementation without claiming the kind.
 | Role | Proven identity |
 |---|---|
 | Build/test host | x86-64 Linux; other operating systems are refused with a clear error (`tests/unit/test_build_commands.py::test_cli_refuses_unsupported_platform`); other Linux architectures pass the gate but are unproven — no gate tests them, so builds there are outside the qualified boundary (see [install](install.md)) |
-| Python driver | 3.11 or later (3.14.8 in the current lock); standard library only |
+| Python driver | 3.11.17 canonical gates (unit/compiler/package lanes, matrix driver); stranger rehearsal also passed on 3.14.8 (install, builds, inspects, guest load, packet counting); standard library only |
 | Mojo compiler | 1.2.0 (`2016d0cd`) |
 | Frontend target | canonical `--target-cpu znver4` plus the frozen feature set (`FRONTEND_TARGET_FLAGS` in `src/mojobpf/build.py`); qualifying captures reproduced byte-identical under the pinned environment, other hosts unproven |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
@@ -98,31 +98,34 @@ registers 41 suites: the 28 release-matrix suites plus the 12
 (`ci/run_vm_tests.py` `SUITES`,
 `tests/unit/test_portability_locks.py::test_x86_matrix_shape_unchanged`).
 
-Five kernels are claimed for the 1.2.0 board tree
-(commit 335efbd, the qualified candidate): 6.6.0-060600-generic,
-6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic,
-and 7.4.0-070400rc1-generic. A kernel is claimed only when the
-full 41-suite matrix passes on its lane apart from the ruled
-exclusions following this paragraph; the v1.0 matrix passes
-197/205 cells with 0 red and 0 unexplained (see
-[evidence-1.0.0.md](evidence-1.0.0.md)). The same board re-ran
-green under the pinned Mojo 1.2.0 (197 passed, 8 pinned
-exclusions, 0 red; board commit 335efbd via
-`ci/run_vm_tests.py` per-lane runs plus `--merge`; tally,
-per-lane counts and merged-report sha256 attested in-repo
-via `git log --grep='final board attestation'`). The
-attesting commit is docs-only past the board commit, and
+Two kernels are run green for the 1.0.1 board tree
+(board commit 330226e): 6.6.0-060600-generic and
+6.12.0-061200-generic. A lane passes only when its full
+28-suite gating scope passes (41 registry suites minus the
+`kernel-joint` and `kernel-percpu-hash` exclusions minus the
+11 nightly `kernel-isa-*` suites, including the
+`kernel-isa-cpu` smoke); the v1.0.1 board passes 56/56 cells
+with 0 red and 0 unexplained (see
+[evidence-1.0.1.md](evidence-1.0.1.md)) via
+`ci/run_vm_tests.py` per-lane runs plus a scoped `--merge`.
+The attesting commit is docs-only past the board commit, and
 the doc-consistency suites re-run green on it, so the
-board stands without a fresh full-matrix rerun. Two ruled
-cell groups stay out of
-claim: the joint suite (needs libbpf-mojo inputs,
-labelled experimental) and 7.x task-struct layouts (1.x CO-RE
-work). These rulings are mechanized as `LANE_SUITE_EXCLUSIONS`
+board stands without a fresh full-matrix rerun. Ruled
+out of the gating scope: the joint suite (needs
+libbpf-mojo inputs, labelled experimental),
+`kernel-percpu-hash` (non-gating exclusion), and the 11
+nightly ISA suites (reported outside the tally). The lane
+exclusions are mechanized as `LANE_SUITE_EXCLUSIONS`
 in `ci/run_vm_tests.py` (pinned by
 `tests/unit/test_ci_workflow_contract.py::test_matrix_exclusions_are_pinned_and_valid`):
 excluded cells never run, print as `excluded`, and the merge
 refuses any absent cell outside the map. The historical alpha
-runs do not qualify the current tree.
+and 1.0.0 runs do not qualify the current tree.
+
+> [TBD: scope/claim framing for this section pending O-2
+> owner words. The numbers above are observed; the
+> sentences that turn them into support claims are not
+> written yet.]
 
 Every behavior section below outside the named portability
 lanes records the 0.3.0a1 alpha qualification on the tested
@@ -131,10 +134,10 @@ libbpf 1.6, QEMU 10.2.2, software emulation) in both alpha
 lanes; see [evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the
 anchor board. Those observations stand as the alpha record;
 the v1.0 release matrix re-proved them (see
-[evidence-1.0.0.md](evidence-1.0.0.md)), and the Mojo 1.2.0
-board re-run repeated that proof on its board commit (197
-passed, 8 pinned exclusions, 0 red; board commit 335efbd,
-the qualified candidate — see above).
+[evidence-1.0.0.md](evidence-1.0.0.md)), and the v1.0.1
+board repeated that proof on its board commit (56/56 cells,
+0 red; board commit 330226e — see above and
+[evidence-1.0.1.md](evidence-1.0.1.md)).
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
@@ -233,9 +236,8 @@ at the toolchain gate (`MBPF102`) exactly as designed.
 ## Retired boundary: `loop-sum` on 6.6 (Mojo 1.1.0 era)
 
 The bounded-loop subset case `loop-sum` verifies and runs on
-all five matrix lanes (6.6.0, 6.12.0, 7.0.14, 7.2.0, and 7.4.0-rc1)
-on the 1.2.0 board commit (335efbd, the qualified candidate;
-see above):
+both gating lanes (6.6.0, 6.12.0) on the 1.0.1 board commit
+(330226e; see above):
 test-run actions match the oracle on every lane. (Under the
 retired Mojo 1.1.0 frontend the 6.6 verifier rejected the shape
 at load with `back-edge from insn 18 to 19`; the pinned 1.2.0
@@ -245,16 +247,18 @@ actions.) Every lane verdict stays pinned exactly: the suite
 passes on a lane only when test-run actions match the oracle,
 and any other behavior on any lane fails loudly
 (`tests/verifier/test_subset_kernel.py::test_loop_sum`,
-`docs/supported-subset.md` case table, all five matrix lanes).
+`docs/supported-subset.md` case table, both gating lanes).
 
-One live kernel-version boundary remains: the 7.x lanes
-refuse short test-run inputs with EINVAL where the 6.x lanes
-run them as actions (subset kernel: 6.6.0/6.12.0 report 20/20
-actions; 7.0.14/7.2.0/7.4.0-rc1 report 14 actions + 6 verified
-refusals, one per shape's guard case). Retired per-lane
-boundaries stay pinned as process, not as live constraints:
-a future lane whose verifier rejects a subset shape gets
-its own evidenced verdict instead of inheriting pass.
+One live kernel-version boundary remains outside the gating
+scope: the 7.x lanes refuse short test-run inputs with EINVAL
+where the 6.x lanes run them as actions (subset kernel:
+6.6.0/6.12.0 report 20/20 actions; 7.0.14/7.2.0/7.4.0-rc1
+report 14 actions + 6 verified refusals, one per shape's guard
+case, re-observed in the non-gating appendix board). Retired
+per-lane boundaries stay pinned as process, not as live
+constraints: a future lane whose verifier rejects a subset
+shape gets its own evidenced verdict instead of inheriting
+pass.
 
 ## Measured tracing limitations
 
@@ -643,12 +647,11 @@ host suites, selected-but-refused vectors).
   outside the surface.
 * Per-CPU-hash maps: implemented in-tree but unclaimed (see
   above); the kind is refused under every claimed profile.
-* Kernels outside the five claimed lanes: only 6.6.0, 6.12.0,
-  7.0.14, 7.2.0, and 7.4.0-rc1 are claimed (each by a full
-  41-suite matrix pass on its lane apart from the ruled
-  exclusions, re-run green under Mojo 1.2.0 — see the
-  five-kernel board above); the historical alpha
-  verdicts do not qualify the current tree.
+* Kernels outside the two green lanes: only 6.6.0 and 6.12.0
+  run green (each by a full 28-suite gating-scope pass on its
+  lane — see the two-kernel board above); the historical alpha
+  and 1.0.0 verdicts do not qualify the current tree.
+  [TBD: scope/claim sentence pending O-2 owner words.]
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header
   chains: unproven (see the
@@ -657,11 +660,9 @@ host suites, selected-but-refused vectors).
   acceleration, and the one named TCG fallback lane
   (`v6.12-tcg`) exists solely for the no-KVM-dependence
   spot-proof. The historical alpha matrix ran under software
-  emulation; the release matrix proves the KVM lanes (197/205
-  cells; see [evidence-1.0.0.md](evidence-1.0.0.md)), re-run
-  green under Mojo 1.2.0 (197 passed, 8 pinned exclusions,
-  0 red; board commit 335efbd, the qualified candidate;
-  see above).
+  emulation; the v1.0.1 release matrix proves the KVM lanes
+  (56/56 cells; see [evidence-1.0.1.md](evidence-1.0.1.md);
+  board commit 330226e; see above).
 
 ## Audit boundaries
 

@@ -20,7 +20,12 @@ unprivileged and needs no root.
 * External toolchain, provided by you (never bundled, never
   downloaded by the installer):
   * Mojo 1.2.0 (the pinned compiler; the project's
-    `toolchains.lock.json` records its exact version and hash),
+    `toolchains.lock.json` records its exact version and hash).
+    The supported acquisition route is the project's pixi
+    environment: `pixi install` in the checkout provides the
+    pinned Mojo. Export `MODULAR_HOME` from that environment
+    (the compiler resolves its standard library through it;
+    bare-PATH use fails with "unable to locate module 'std'").
   * LLVM `llc` matching the lockfile (BPF backend, `bpfel`
     triple, `v3` CPU),
   * `bpftool` and libbpf for inspection and kernel runs.
@@ -39,6 +44,18 @@ mojobpf doctor
 required tool with its version, lockfile match status, and whether
 a kernel-test runner is available. It changes nothing.
 
+## Obtain
+
+Two channels, same bits:
+
+* GitHub Release (published at release time): download
+  `mojobpf-1.0.1-py3-none-any.whl` (and the `.tar.gz` source
+  archive) from the `v1.0.1` release page, then install
+  offline as below.
+* Source checkout: `git clone
+  https://github.com/mingulov/mojobpf.git`, then build the
+  wheel from the tree as below.
+
 ## Install
 
 From a wheel file, offline (any directory name works; `.venv`
@@ -47,7 +64,7 @@ is reserved for the canonical test interpreter below):
 ```bash
 python3 -m venv install-env
 source install-env/bin/activate
-pip install --no-index mojobpf-1.0.0-py3-none-any.whl
+pip install --no-index mojobpf-1.0.1-py3-none-any.whl
 mojobpf doctor
 ```
 
@@ -60,7 +77,7 @@ package is needed):
 ```bash
 pip install "setuptools>=61"
 pip wheel . --no-deps --no-build-isolation -w dist
-pip install --no-index dist/mojobpf-1.0.0-py3-none-any.whl
+pip install --no-index dist/mojobpf-1.0.1-py3-none-any.whl
 ```
 
 ## Build the lowering (`mojobpf-lower`)
@@ -168,29 +185,58 @@ lockfile pin (found version '...'); location: <lockfile>: tools.llc;
 remedy: install the pinned llc or re-pin the lockfile deliberately
 ```
 
-Re-pin deliberately with the refresh tooling shipped in the
-source archive — the inventory probe first, then generation:
+Re-pin deliberately with the single documented recipe (the
+same one the [quickstart](quickstart.md) uses): a short script
+that hashes each PATH-resolved tool plus the installed adapter
+service. It pins `mojo`, `llc`, and `bpftool` (builds validate
+all three identically; `bpftool` reports its version with the
+`version` subcommand):
 
 ```bash
-python3 tests/probes/toolchain_inventory.py --output /tmp/inventory.json
-python3 tools/lock_refresh.py generate --kind toolchains \
-    --inventory /tmp/inventory.json \
-    --pixi-lock pixi.lock --adapter-dir compiler \
-    --out toolchains.local.lock.json --report lock.report.json
+python3 - <<'EOF'
+import hashlib, importlib.util, json, os, shutil, subprocess
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(65536), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+tools = {}
+for name, argv in (('mojo', ['--version']), ('llc', ['--version']),
+                  ('bpftool', ['version'])):
+    path = shutil.which(name)
+    real = os.path.realpath(path)
+    out = subprocess.run([path] + argv,
+                         capture_output=True, text=True)
+    text = out.stdout.strip() or out.stderr.strip()
+    tools[name] = {'sha256': sha256_file(real),
+                   'version': text.splitlines()[0].strip()}
+spec = importlib.util.find_spec('mojobpf.resources.adapter')
+adapter_dir = list(spec.submodule_search_locations)[0]
+siblings = {}
+for name in ('admission.json', 'audit.py', 'mojo_ir_adapter.py',
+             'target_proof_table.json'):
+    siblings[name] = sha256_file(os.path.join(adapter_dir, name))
+doc = {'adapter': {
+           'note': 'installed-package pins',
+           'service_sha256': sha256_file(
+               os.path.join(adapter_dir, 'adapter_service.py')),
+           'siblings': siblings},
+       'generated_by': 'install (PATH-resolved pins)',
+       'license': 'Apache-2.0 WITH LLVM-exception',
+       'schema_version': 1, 'tools': tools}
+open('toolchains.local.lock.json', 'w').write(
+    json.dumps(doc, indent=2, sort_keys=True) + '\n')
+EOF
 ```
 
-The inventory exits nonzero naming what is missing when any of
-`mojo`, `llc`, `bpftool`, `clang`, `llvm-config`, or `python3`
-is absent or fails; generation then refuses rather than
-inventing pins for a missing required tool, records omissions
-of optional tools as limitations notes, and writes neither
-output on failure. The
-generated lock carries status `bootstrap`: builds match its pins
-like any lock, but it is not a reviewed `release-approved` pin.
-Copy the lock together with the `pixi.lock` beside it into your
-project: the lock's distribution record binds that sibling file,
-and a missing sibling fails the build (`MBPF102`) instead of
-running unpinned.
+This recipe pins PATH-resolved tools directly, so it needs no
+`pixi.lock` sibling beside the lock. (The maintainer-side
+inventory-plus-`lock_refresh` route, which does bind a
+`pixi.lock` sibling through its distribution record, lives in
+the [maintenance notes](maintenance.md).)
 
 Verify the install from any directory (no checkout paths needed):
 

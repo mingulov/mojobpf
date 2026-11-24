@@ -16,6 +16,41 @@ for behavior-change proofs.
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/xdp_counter/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/xdp_counter.bpf.o \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Scope
+
+This program counts invocations unconditionally: its action is a
+constant pass and it never inspects packet bytes. It stays as
+subset documentation for the single-entry map shape (one address
+reinterpretation, one read-modify-write pair, no cross-call packet
+values). The packet workload whole — content action plus both
+counters in one program — is the `packet_counter` example,
+admitted under the combined count vector; partial combined forms
+that match neither vector stay refused with named diagnostics
+under `tests/compile/counter_*_attempt.mojo`. Content actions
+without a map are demonstrated by the `packet_classifier` example
+instead. The kernel suite runs this counter over that example's
+shared packet corpus (`examples/packet_classifier/corpus/`) with
+per-invocation map reads and a nonzero userspace initialization,
+so every accumulated value is checked exactly.
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 
@@ -43,20 +78,3 @@ pseudo-calls to their standard BPF helper-call encoding, and appends
 the standard map declaration with map BTF; every other body
 instruction in the adapted IR is byte-identical to the frontend
 output. The resulting object loads with unmodified libbpf/bpftool.
-
-## Scope
-
-This program counts invocations unconditionally: its action is a
-constant pass and it never inspects packet bytes. It stays as
-subset documentation for the single-entry map shape (one address
-reinterpretation, one read-modify-write pair, no cross-call packet
-values). The packet workload whole — content action plus both
-counters in one program — is the `packet_counter` example,
-admitted under the combined count vector; partial combined forms
-that match neither vector stay refused with named diagnostics
-under `tests/compile/counter_*_attempt.mojo`. Content actions
-without a map are demonstrated by the `packet_classifier` example
-instead. The kernel suite runs this counter over that example's
-shared packet corpus (`examples/packet_classifier/corpus/`) with
-per-invocation map reads and a nonzero userspace initialization,
-so every accumulated value is checked exactly.

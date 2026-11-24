@@ -18,6 +18,35 @@ proofs.
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/xdp_pass/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/xdp_pass.bpf.o \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Fixtures
+
+| file            | bytes | byte 14 | base action | mutated action |
+| --------------- | ----- | ------- | ----------- | -------------- |
+| `pkt_drop.bin`  | 60    | `0x01`  | `1`         | `2`            |
+| `pkt_pass.bin`  | 60    | `0x00`  | `2`         | `1`            |
+| `pkt_short.bin` | 10    | n/a     | `2`         | `2`            |
+
+All other bytes are zero. Feed a fixture to the kernel test-run entry with
+`--data-in`; never rely on the harness default input for this program.
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so that
 `mojo` resolves:
 
@@ -43,14 +72,3 @@ The adapter only retargets module metadata (triple, data layout, the `xdp`
 section, the license note, entrypoint codegen attributes); every body
 instruction in the adapted IR is byte-identical to the frontend output.
 The resulting object loads with unmodified libbpf/bpftool.
-
-## Fixtures
-
-| file            | bytes | byte 14 | base action | mutated action |
-| --------------- | ----- | ------- | ----------- | -------------- |
-| `pkt_drop.bin`  | 60    | `0x01`  | `1`         | `2`            |
-| `pkt_pass.bin`  | 60    | `0x00`  | `2`         | `1`            |
-| `pkt_short.bin` | 10    | n/a     | `2`         | `2`            |
-
-All other bytes are zero. Feed a fixture to the kernel test-run entry with
-`--data-in`; never rely on the harness default input for this program.

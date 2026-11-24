@@ -2,6 +2,7 @@
 
 # MojoBPF 0.2.0 evidence summary
 
+> Historical: describes the 0.2.0 scope only; the current release is documented separately.
 The release regression anchor: every suite below ran green on
 the release tree. The two-lane matrix ran on commit
 `a6e640a6247d0dec8ea978e3b75ab342136b3671` with a clean tree

@@ -30,45 +30,18 @@ admitted alongside the base helper set.
 
 ## Build
 
-From the repository root, with the project Mojo environment active so
-that `mojo` resolves:
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
 
 ```bash
-mkdir -p out
-mojo build --emit llvm \
-    --target-cpu znver4 \
-    --target-features +adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,+crc32,+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,+xsavec,+xsaveopt,+xsaves \
-    -I src/mojobpf/resources/sdk \
-    -o out/reserve.ll examples/ringbuf_reserve/emitter.mojo
-python3 compiler/mojo_ir_adapter.py --input out/reserve.ll \
-    --output out/reserve.bpf.ll
-llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/reserve.bpf.ll \
-    -o out/reserve.bpf.o
+mojobpf build --manifest examples/ringbuf_reserve/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/ringbuf_reserve.bpf.o \
+    --profile linux-bpfel-v3-reserve \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
 ```
-
-The `--target-cpu`/`--target-features` pair pins the frontend to
-the frozen producer shape the exact-match adapter expects (the
-same flags the `mojobpf build` route passes); without it the
-frontend emits the build machine's CPU and the adapter refuses
-the IR.
-
-or through the installed CLI, which uses its packaged adapter by
-default:
-
-```bash
-mojobpf build \
-    --manifest examples/ringbuf_reserve/mojobpf.toml \
-    --out-dir out/ringbuf-reserve \
-    --lockfile toolchains.lock.json
-```
-
-The adapter retargets module metadata, lowers the thirteen helper
-pseudo-calls (four lookups, three updates, two PID/TID, one clock,
-one CPU, one ring-buffer reserve, one ring-buffer submit) to their
-standard BPF helper-call encoding, and appends the standard map
-declarations with map BTF for both maps; every other body
-instruction in the adapted IR is byte-identical to the frontend
-output. The resulting object loads with unmodified libbpf/bpftool.
 
 ## Reserve vs copy-output
 
@@ -123,3 +96,49 @@ all rejected at load while the well-formed control loads and
 unloads cleanly. The kernel suite proving this is
 `tests/kernel/test_ringbuf_reserve.py` (six tests: submit,
 discard, saturation, adversarial, residue, license).
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
+From the repository root, with the project Mojo environment active so
+that `mojo` resolves:
+
+```bash
+mkdir -p out
+mojo build --emit llvm \
+    --target-cpu znver4 \
+    --target-features +adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,+crc32,+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,+xsavec,+xsaveopt,+xsaves \
+    -I src/mojobpf/resources/sdk \
+    -o out/reserve.ll examples/ringbuf_reserve/emitter.mojo
+python3 compiler/mojo_ir_adapter.py --input out/reserve.ll \
+    --output out/reserve.bpf.ll
+llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/reserve.bpf.ll \
+    -o out/reserve.bpf.o
+```
+
+The `--target-cpu`/`--target-features` pair pins the frontend to
+the frozen producer shape the exact-match adapter expects (the
+same flags the `mojobpf build` route passes); without it the
+frontend emits the build machine's CPU and the adapter refuses
+the IR.
+
+or through the installed CLI, which uses its packaged adapter by
+default:
+
+```bash
+mojobpf build \
+    --manifest examples/ringbuf_reserve/mojobpf.toml \
+    --out-dir out/ringbuf-reserve \
+    --lockfile toolchains.lock.json
+```
+
+The adapter retargets module metadata, lowers the thirteen helper
+pseudo-calls (four lookups, three updates, two PID/TID, one clock,
+one CPU, one ring-buffer reserve, one ring-buffer submit) to their
+standard BPF helper-call encoding, and appends the standard map
+declarations with map BTF for both maps; every other body
+instruction in the adapted IR is byte-identical to the frontend
+output. The resulting object loads with unmodified libbpf/bpftool.

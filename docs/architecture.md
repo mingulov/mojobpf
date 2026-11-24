@@ -423,13 +423,12 @@ below names the current pins. The 0.3.0a1 alpha record (see
 [compatibility](compatibility.md) and
 [evidence-0.3.0a1.md](evidence-0.3.0a1.md)) observed the
 measured behaviors on LLVM 22.1.8 with bpftool 7.6.0 /
-libbpf 1.6 under software emulation; the release matrix
-re-proves them on five KVM lanes (197/205 cells; see
-[evidence-1.0.0.md](evidence-1.0.0.md)), re-run green under
-the pinned Mojo 1.2.0 on its board commit (197 passed, 8
-pinned exclusions, 0 red; board commit 335efbd, the qualified candidate;
-see the compatibility five-kernel board), which
-claims kernels 6.6.0, 6.12.0, 7.0.14, 7.2.0, and 7.4.0-rc1. Other
+libbpf 1.6 under software emulation; the v1.0.1 release
+matrix re-proves them on two KVM lanes (56/56 cells; see
+[evidence-1.0.1.md](evidence-1.0.1.md); board commit
+330226e; see the compatibility two-kernel board), which
+run green on kernels 6.6.0 and 6.12.0 (scope/claim framing
+pending O-2 owner words). Other
 combinations are unproven, not supported. Full binary paths
 and hashes are recorded in `toolchains.lock.json`; rerun
 `tests/probes/toolchain_inventory.py` to re-probe any machine.
@@ -506,17 +505,15 @@ of them is implied by the results above:
   verdicts (see the compatibility documentation); every other
   Mojo/LLVM combination, every `llc` backend version but
   22.1.8, every host architecture but x86-64, and big-endian
-  BPF still need theirs. The claimed x86-64 lanes (6.12.0,
-  6.6.0, 7.0.14, 7.2.0, 7.4.0-rc1, all KVM) are pinned in
-  `ci/kernels.lock.json` and driven by `ci/run_vm_tests.py`,
-  with per-lane loop-shape verdicts pinned (all five lanes
-  pass under the pinned 1.2.0 frontend; see the compatibility
-  documentation); each claimed lane is proven by its full
-  41-suite matrix pass (197/205 cells; see
-  [evidence-1.0.0.md](evidence-1.0.0.md)), re-run green
-  under Mojo 1.2.0 on its board commit (197/8/0, 335efbd,
-  the qualified candidate; see the compatibility
-  five-kernel board). The named
+  BPF still need theirs. The green x86-64 lanes (6.12.0 and
+  6.6.0, both KVM) are pinned in `ci/kernels.lock.json` and
+  driven by `ci/run_vm_tests.py`, with per-lane loop-shape
+  verdicts pinned (both lanes pass under the pinned 1.2.0
+  frontend; see the compatibility documentation); each green
+  lane passes its full 28-suite gating scope (56/56 cells;
+  see
+  [evidence-1.0.1.md](evidence-1.0.1.md); board commit
+  330226e; see the compatibility two-kernel board). The named
   `v6.12-tcg` fallback is a two-suite spot-proof lane
   (kernel-xdp + kernel-map), not a claimed kernel. Each
   proof above names the suite that demonstrates it.
@@ -596,11 +593,10 @@ of them is implied by the results above:
 - The stack-slot and int-to-pointer cast assembly spellings are
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
   lifetime-marker skew, re-qualified under the pinned Mojo 1.2.0
-  (full 41-suite x 5-lane board green: 197 passed, 8 pinned
-  exclusions, 0 red; board commit 335efbd, the qualified candidate —
-  see the compatibility five-kernel board); they must be revisited if
-  a future Mojo emits backend-compatible IR for those
-  constructs.
+  (28-suite x 2-lane board green: 56/56 cells, 0 red; board
+  commit 330226e — see the compatibility two-kernel board);
+  they must be revisited if a future Mojo emits
+  backend-compatible IR for those constructs.
 - Content-derived variable packet offsets (loading one packet byte
   to compute a second packet address) are outside the supported
   subset: the verifier cannot connect a separately computed guard

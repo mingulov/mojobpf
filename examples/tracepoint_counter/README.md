@@ -21,6 +21,50 @@ filter shape: entry 0 is the monitored TID as a zero-extended
 
 ## Build
 
+From the repository root, with the installed `mojobpf`
+tool and a lockfile for your machine (see
+[installation](../../docs/install.md#lockfile-for-your-machine)):
+
+```bash
+mojobpf build --manifest examples/tracepoint_counter/mojobpf.toml --out-dir out \
+    --lockfile <your-lockfile>
+mojobpf inspect --object out/tracepoint_counter.bpf.o \
+    --source-license "Apache-2.0 WITH LLVM-exception" \
+    --kernel-license "Apache-2.0 WITH LLVM-exception"
+```
+
+## Scope
+
+The filter uses the low 32 bits of the helper-14 word only; the
+high 32 bits (the TGID) are never compared, so a thread is never
+confused with its thread group. Both sides observe the initial PID
+namespace, where the helper result and `gettid()` agree. The
+program reads no tracepoint context payload fields — the context
+pointer is accepted but unused, and any use is refused before code
+generation — and attaches only to `syscalls:sys_enter_getpid`;
+other events, other filters, and per-CPU counting are unproven.
+
+## Measured behavior
+
+In a disposable guest on each supported kernel lane, a raw-`getpid`
+workload over a handshake (no fixed sleeps) observes exactly
+N=10000 counts for the monitored thread and 0 for two excluded
+threads issuing 1000 calls each; with the monitored thread idle
+the excluded phase observes 0; a filter naming TID 2147483647
+(which no thread holds) observes 0 as a controlled mismatch; a
+TGID-confused mutant observes 0 while the reloaded base still
+observes N; and attaching to a missing event reports an explicit
+environment-capability failure instead of passing. The kernel
+suite proving this is
+`tests/kernel/test_tracepoint_counter.py` (five tests: excluded,
+exact, unavailability, wrong-filter, mutant-plus-stale).
+
+## Appendix: equivalent manual pipeline (checkout only)
+
+The same object through the manual stages, for checkout
+residents who want to see every step. Prefer the `mojobpf`
+route above; it passes the identical flags.
+
 From the repository root, with the project Mojo environment active so
 that `mojo` resolves:
 
@@ -59,29 +103,3 @@ standard BPF helper-call encoding, and appends the standard map
 declaration with map BTF; every other body instruction in the
 adapted IR is byte-identical to the frontend output. The resulting
 object loads with unmodified libbpf/bpftool.
-
-## Scope
-
-The filter uses the low 32 bits of the helper-14 word only; the
-high 32 bits (the TGID) are never compared, so a thread is never
-confused with its thread group. Both sides observe the initial PID
-namespace, where the helper result and `gettid()` agree. The
-program reads no tracepoint context payload fields — the context
-pointer is accepted but unused, and any use is refused before code
-generation — and attaches only to `syscalls:sys_enter_getpid`;
-other events, other filters, and per-CPU counting are unproven.
-
-## Measured behavior
-
-In a disposable guest on each supported kernel lane, a raw-`getpid`
-workload over a handshake (no fixed sleeps) observes exactly
-N=10000 counts for the monitored thread and 0 for two excluded
-threads issuing 1000 calls each; with the monitored thread idle
-the excluded phase observes 0; a filter naming TID 2147483647
-(which no thread holds) observes 0 as a controlled mismatch; a
-TGID-confused mutant observes 0 while the reloaded base still
-observes N; and attaching to a missing event reports an explicit
-environment-capability failure instead of passing. The kernel
-suite proving this is
-`tests/kernel/test_tracepoint_counter.py` (five tests: excluded,
-exact, unavailability, wrong-filter, mutant-plus-stale).

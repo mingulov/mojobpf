@@ -2,6 +2,7 @@
 
 # MojoBPF 0.2.0 release notes
 
+> Historical: describes the 0.2.0 scope only; the current release is documented separately.
 MojoBPF compiles Mojo-authored Linux eBPF programs into
 conventional `EM_BPF` ELF objects loadable by unmodified
 `bpftool`/libbpf. This release adds a proven tracing slice —

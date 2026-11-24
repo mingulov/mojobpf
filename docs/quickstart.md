@@ -10,7 +10,7 @@ shortened (the working directory to `<qs>`, user tool
 installations to their bare tool names). Absolute paths on
 your machine will differ; versions, exit codes, and result
 lines must match. The reference run below used the pinned
-Mojo 1.2.0 toolchain against a wheel built from the current
+Mojo 1.2.0 toolchain against a wheel built from the candidate
 tree (step 1); the transcribed hashes, versions, and profile
 list all come from that run.
 
@@ -18,8 +18,15 @@ list all come from that run.
 
 * Linux on x86-64.
 * Python 3.11 or later with `venv` and `pip`.
-* Mojo 1.2.0 on `PATH` (see [compatibility](compatibility.md)
-  for the supported toolchain).
+* Mojo 1.2.0 on `PATH` with `MODULAR_HOME` exported (the
+  compiler resolves its standard library through it; bare-PATH
+  use fails with "unable to locate module 'std'"). The
+  supported acquisition route is the project's pixi
+  environment (`pixi install` in the checkout provides the
+  pinned Mojo plus `MODULAR_HOME`; see
+  [installation](install.md)). Check
+  [compatibility](compatibility.md) for the supported
+  toolchain.
 * LLVM `llc` with the BPF backend, `bpftool`, and `vng`
   (virtme-ng) with a cached guest image for the kernel check.
 * A C++ compiler and CMake for the one-time lowering build
@@ -27,7 +34,9 @@ list all come from that run.
 
 ## 1. Build the wheel
 
-From the MojoBPF source directory:
+From the MojoBPF source directory (the candidate tree, with
+the pixi environment installed so the pinned Mojo is on
+`PATH`):
 
 ```bash
 pip wheel . --no-deps --no-build-isolation -w dist
@@ -35,7 +44,7 @@ pip wheel . --no-deps --no-build-isolation -w dist
 
 ```text
   Building wheel for mojobpf (pyproject.toml): finished with status 'done'
-  Created wheel for mojobpf: filename=mojobpf-1.0.0-py3-none-any.whl size=512705 sha256=1b0f16ba0e2b34561a95c3bc1a409abb64c1e09d373b255659b9efa3d6ab5f66
+  Created wheel for mojobpf: filename=mojobpf-1.0.1-py3-none-any.whl size=518328 sha256=45fda8260fbfb998bdd130b060476ac551a2db7a9595917722a1a46049c7a28d
 Successfully built mojobpf
 ```
 
@@ -56,7 +65,7 @@ once from the same source directory (prerequisites and detail:
 [installation](install.md#build-the-lowering-mojobpf-lower)):
 
 ```bash
-cmake -S compiler -B build/lower -DCMAKE_BUILD_TYPE=Release
+cmake -S compiler -B build/lower -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build build/lower -j$(nproc)
 export MOJOBPF_LOWER=$PWD/build/lower/mojobpf-lower
 "$MOJOBPF_LOWER" --version
@@ -79,13 +88,13 @@ From a new, unrelated directory:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install --no-index <path-to>/mojobpf-1.0.0-py3-none-any.whl
+.venv/bin/pip install --no-index <path-to>/mojobpf-1.0.1-py3-none-any.whl
 export PATH="$PWD/.venv/bin:$PATH"
 ```
 
 ```text
 Installing collected packages: mojobpf
-Successfully installed mojobpf-1.0.0
+Successfully installed mojobpf-1.0.1
 ```
 
 ## 3. Check the toolchain
@@ -97,12 +106,13 @@ mojobpf doctor
 ```text
 mojobpf doctor
 informational discovery only: pins are qualified by check/build with --lockfile, never here
-mojobpf 1.0.0 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
+exit 0 does not mean ready: pass --strict to gate on this report
+mojobpf 1.0.1 (sdk 1.8) at <qs>/.venv/lib64/python3.14/site-packages/mojobpf
 platform: linux/x86_64
 tool mojo: present Mojo 1.2.0 (2016d0cd) at <mojo-on-PATH>
 tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>
 tool bpftool: present bpftool v7.6.0 at <bpftool-on-PATH>
-tool python: present Python 3.14.8 at <qs>/.venv/bin/python3
+tool python: present 3.14.8 at <resolved-python-on-PATH>
 target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-lru, linux-bpfel-v3-net, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
 kernel tests: runner available at <vng-on-PATH>
 ```
@@ -179,7 +189,10 @@ def xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
 
 Pin your toolchain the way any user pins theirs (version plus
 SHA-256 of each resolved binary, plus the installed adapter
-service the packaged default build runs):
+service the packaged default build runs). Builds validate
+`bpftool` exactly like the compilers, so the lockfile must
+pin it too; note `bpftool` reports its version with the
+`version` subcommand, not `--version`:
 
 ```bash
 python3 - <<'EOF'
@@ -193,10 +206,11 @@ def sha256_file(path):
     return digest.hexdigest()
 
 tools = {}
-for name in ('mojo', 'llc'):
+for name, argv in (('mojo', ['--version']), ('llc', ['--version']),
+                  ('bpftool', ['version'])):
     path = shutil.which(name)
     real = os.path.realpath(path)
-    out = subprocess.run([path, '--version'],
+    out = subprocess.run([path] + argv,
                          capture_output=True, text=True)
     text = out.stdout.strip() or out.stderr.strip()
     tools[name] = {'sha256': sha256_file(real),

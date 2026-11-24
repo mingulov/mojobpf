@@ -2,6 +2,7 @@
 
 # MojoBPF 1.0.0 release notes
 
+> Historical: describes the 1.0.0 (five-lane board) scope only; the current release is documented separately.
 MojoBPF compiles Mojo-authored Linux eBPF programs into
 conventional `EM_BPF` ELF objects loadable by unmodified
 `bpftool`/libbpf. This is the first stable release: a
