@@ -960,6 +960,17 @@ def test_dependabot_actions_only():
     assert "weekly" in text
 
 
+def test_scorecard_actions_are_pinned():
+    with open(os.path.join(REPO_ROOT, ".github", "workflows", "scorecard.yml"), encoding="utf-8") as handle:
+        text = handle.read()
+    assert "ossf/scorecard-action@23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0" in text, "scorecard.yml: scorecard-action"
+    assert "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2" in text, "scorecard.yml: upload-artifact"
+    assert "github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5" in text, "scorecard.yml: upload-sarif"
+    assert "publish_results: false" in text, "no external publication without an owner call"
+    assert "security-events: write" in text, "SARIF upload needs it or the PR goes red"
+    assert "schedule" not in text and "branch_protection_rule" not in text
+
+
 def test_ci_interpreter_install_is_digest_pinned():
     text = _read_workflow()
     assert "setup-python" not in text, (
