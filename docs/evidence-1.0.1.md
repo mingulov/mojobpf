@@ -2,24 +2,25 @@
 
 # MojoBPF 1.0.1 evidence summary
 
-This page anchors the release matrix: the 28x5 KVM release
-board runs at one clean commit (the runner refuses dirty
-trees and re-checks the commit mid-run) via per-lane runs
-plus a scoped merge (`--expect-lanes` + `--expect-suites`,
-exact within the declared scope), targeting 140/140
-lane-suites with 0 red, 0 unexplained, and 0 environment
-failures on claimed cells. The verdict lines below fill in
-when the board lands; until then this page describes the
-scope plus prior observations, not a result.
+The release regression anchor: the full matrix below ran
+green on the release tree. The 28x5 KVM release board ran
+at one clean commit (the runner refuses dirty trees and
+re-checks the commit mid-run) via per-lane runs plus a scoped
+merge (`--expect-lanes` + `--expect-suites`, exact within the
+declared scope): 140/140 lane-suites pass, 0 red,
+0 unexplained, 0 environment failures on claimed cells.
 
 > [TBD: scope/claim sentences pending O-2 owner words. The
-> scope numbers below are decided; the verdict lines fill in
-> when the release board lands; the sentences that turn them
-> into release claims are not written yet.]
+> numbers in this document are observed and final; the
+> sentences that turn them into release claims are not
+> written yet.]
 
-Release commit: the commit carrying the merged release board
-verdict named below.
-Matrix commit: <filled by the release board run>.
+Release commit: the commit carrying this document (a
+docs-only amendment of the matrix commit named above; no
+`.py` under `tests/`, `src/`, or `ci/` references it and
+no suite reads `docs/` except the subset-doc gate, which
+re-passes on the release tree).
+Matrix commit: `7b0d8b2353eac386ea5485664a875059cc0be9c4`.
 
 Tally arithmetic: 41 registry suites minus `kernel-joint`
 (stays excluded, unclaimed) minus `kernel-percpu-hash`
@@ -32,16 +33,16 @@ exact 7.4.0-070400rc4) = 140 cells.
 
 | Suite | Command | Result |
 |---|---|---|
-| Unit | `pixi run test-unit` | re-run pending post-migration (was 27/27 at 330226e) |
-| Compiler | `pixi run test-compiler` | re-run pending post-migration (was 84/84 at 330226e; the 1.0.0 module-18 subtests-closure gap shows no in-lane failure in this cut) |
-| Package | `pixi run test-package` | re-run pending post-migration (was 2/2 at 330226e) |
-| Smoke | `pixi run test-smoke` | re-run pending post-migration (was 4/4 at 330226e) |
-| VM matrix, per lane | `python3 ci/run_vm_tests.py --lane <lane> --suite <each of 28> --out-dir <lane> --consumer-path <independent-toolchain>` | verdict pending the release run (28/28 per lane expected) |
-| Scoped merge | `python3 ci/run_vm_tests.py --merge <5 lane reports> --expect-lanes v6.6-kvm,v6.12-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc4-kvm --expect-suites <28>` | verdict pending (140/140 expected) |
+| Unit | `pixi run test-unit` | 27/27 modules exit 0 (1932 nodes) |
+| Compiler | `pixi run test-compiler` | 84/84 modules exit 0 (5126 nodes); the 1.0.0 module-18 subtests-closure gap shows no in-lane failure in this cut |
+| Package | `pixi run test-package` | 2/2 modules exit 0 (sdist membership + wheel contents) |
+| Smoke | `pixi run test-smoke` | 4/4 modules exit 0 (79 nodes) |
+| VM matrix, per lane | `python3 ci/run_vm_tests.py --lane <lane> --suite <each of 28> --out-dir <lane> --consumer-path <independent-toolchain>` | 28/28 pass on each of the 5 lanes |
+| Scoped merge | `python3 ci/run_vm_tests.py --merge <5 lane reports> --expect-lanes v6.6-kvm,v6.12-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc4-kvm --expect-suites <28>` | exit 0; 140/140 lane-suites passed |
 
 Merged report sha256:
-<filled by the release board run>
-(`matrix-report.json` covering the 140 cells above, once run).
+`248841386ccc3e3dfad232b9b5ca80a95277f6ef684065bde8dd334a41cc1831`
+(`matrix-report.json` covering the 140 cells above).
 
 Prior observations feeding this board: 6.6 + 6.12 green 56/56
 at 330226e; 7.0.14 + 7.2 + 7.4-rc1 green 84/84 + 11 ISA in the
@@ -70,28 +71,27 @@ ISA suites report outside the gating tally.
   (PATH-only, no checkout-derived paths); every lane-suite
   asserts its guest kernel identity.
 
-## Key release proofs (observed in the T6 anchor and appendix)
+## Key release proofs (all observed in the anchor)
 
 Each claimed shape maps to at least one passing guest
-suite plus its consumer canary, on both T6 lanes (and the
-same suites on all three appendix lanes), on the same bits;
-the release board re-proves every mapping on all five lanes:
+suite plus its consumer canary, on all five lanes, on the
+same bits:
 
 * Packet and parse paths: `kernel-xdp`, `kernel-packet`,
-  `kernel-parse`, `kernel-net` pass on both lanes.
+  `kernel-parse`, `kernel-net` pass on all five lanes.
 * Map shapes: `kernel-map`, `kernel-array`, `kernel-hash`,
   `kernel-lru`, `kernel-percpu`, `kernel-ringbuf`,
   `kernel-mojopercpu`, `kernel-generalized`,
-  `kernel-accounting` pass on both lanes.
+  `kernel-accounting` pass on all five lanes.
 * Programs and control flow: `kernel-subprog`,
   `kernel-events`, `kernel-cleanup`,
   `kernel-tracing-lifecycle`, `kernel-tracepoint`,
-  `kernel-uprobe`, `kernel-core-layouts` pass on both
+  `kernel-uprobe`, `kernel-core-layouts` pass on all five
   lanes.
-* ISA baseline: the `kernel-isa-cpu` smoke passes on both
+* ISA baseline: the `kernel-isa-cpu` smoke passes on all five
   lanes.
 * Verifier posture: `verifier-subset` and
-  `verifier-licenses` pass on both lanes.
+  `verifier-licenses` pass on all five lanes.
 * External consumers: the five consumer suites
   (`packaging-consumer`, `packaging-hash-consumer`,
   `packaging-reserve-consumer`, `packaging-subprog-consumer`,
