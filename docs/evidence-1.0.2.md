@@ -24,8 +24,10 @@ budgets and the remaining capability-inventory work are open,
 and no full-support gate has run.
 
 Release commit: the commit carrying this document
-(supply-chain/CI/docs/version only; no `src/`, `compiler/`,
-or lock changes since the 1.0.1 release commit `807e8ca`).
+(supply-chain/CI/docs/version only; no `src/` logic,
+`compiler/`, or lock changes since the 1.0.1 release commit
+`807e8ca` — the `src/` diff is the `__version__` string
+only).
 Matrix commit: `7b0d8b2353eac386ea5485664a875059cc0be9c4`
 (unchanged from 1.0.1).
 

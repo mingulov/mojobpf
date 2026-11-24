@@ -2,9 +2,11 @@
 # MojoBPF tag-triggered draft release.
 #
 # On tag push (v*.*.*): rebuilds wheel+sdist from the tag,
-# verifies the extracted wheel contents against
-# docs/checksums-<ver>.md, attests the artifacts, and opens a
-# DRAFT GitHub release with wheel + sdist + checksums. Publish
+# proves the sdist rebuilds the same wheel, verifies the
+# extracted wheel contents against docs/checksums-<ver>.md,
+# emits SBOMs, writes SHA256SUMS, attests the artifacts, and
+# opens a DRAFT GitHub release with wheel + sdist + SBOMs +
+# SHA256SUMS + checksums + evidence. Publish
 # itself stays a human click after out-of-band verification
 # (see RELEASING.md). Trust floor: the signed tag (verified
 # with `git verify-tag`) plus this workflow's attestation.
@@ -38,6 +40,8 @@ jobs:
           version="${tag#v}"
           test "$version" != "$tag" || { echo "tag is not v<ver>: $tag"; exit 2; }
           test -f "docs/checksums-${version}.md" || { echo "missing docs/checksums-${version}.md"; exit 2; }
+          test -f "docs/evidence-${version}.md" || { echo "missing docs/evidence-${version}.md"; exit 2; }
+          test -f "docs/release-notes-${version}.md" || { echo "missing docs/release-notes-${version}.md"; exit 2; }
           echo "MOJOBPF_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
       - name: provision the pinned build backend
         # The wheel's WHEEL/METADATA rows name the setuptools
@@ -157,16 +161,18 @@ jobs:
           python3 -m json.tool "dist/mojobpf-${version}-sdist.cyclonedx.json" > /dev/null
       - name: write SHA256SUMS
         # Release-asset manifest: container hashes of every
-        # attached artifact plus the versioned records. The SBOM
-        # glob matches nothing until the SBOM step lands; the
-        # wheel+sdist lines are required.
+        # attached artifact plus the versioned records, all
+        # paths relative to the checkout root so one
+        # `sha256sum -c dist/SHA256SUMS` verifies the manifest.
+        # The SBOM glob matches nothing on trees predating the
+        # SBOM step; the wheel+sdist lines are required.
         run: |
           set -euo pipefail
           rm -f dist/SHA256SUMS
-          (cd dist && sha256sum mojobpf-*.whl mojobpf-*.tar.gz > SHA256SUMS)
+          sha256sum dist/mojobpf-*.whl dist/mojobpf-*.tar.gz > dist/SHA256SUMS
           for sbom in dist/*.cyclonedx.json; do
             [ -e "$sbom" ] || continue
-            (cd dist && sha256sum "$(basename "$sbom")" >> SHA256SUMS)
+            sha256sum "$sbom" >> dist/SHA256SUMS
           done
           sha256sum "docs/checksums-${MOJOBPF_RELEASE_VERSION}.md" "docs/evidence-${MOJOBPF_RELEASE_VERSION}.md" >> dist/SHA256SUMS
           cat dist/SHA256SUMS
@@ -179,6 +185,7 @@ jobs:
         with:
           draft: true
           prerelease: false
+          fail_on_unmatched_files: true
           files: |
             dist/*
             docs/checksums-${{ env.MOJOBPF_RELEASE_VERSION }}.md

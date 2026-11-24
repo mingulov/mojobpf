@@ -76,9 +76,14 @@ wheel-content diff vs the checksums table must be empty.
 ## 5. Tag
 
 The owner creates the signed tag at the final candidate.
-Signing uses SSH (`gpg.format=ssh`) with the owner's key:
+Signing uses SSH (`gpg.format=ssh`) with the owner's key,
+configured once per checkout (values below are the 1.0.1
+cut's):
 
 ```bash
+git config gpg.format ssh
+git config user.signingkey ~/.ssh/id_ed25519.pub
+git config gpg.ssh.allowedSignersFile ~/.config/mojobpf/allowed_signers
 git tag -s v<ver> -m "MojoBPF <ver>"
 git verify-tag v<ver>
 ```
@@ -103,7 +108,10 @@ patch release, never re-pointed.
    same wheel, compares extracted contents against the
    recorded local build, and opens a DRAFT release with
    wheel + sdist + SBOMs + SHA256SUMS + checksums record +
-   evidence record + attestation.
+   evidence record + attestation. The attestation covers
+   `dist/*` only; the two attached docs records ride outside
+   the SLSA subject set (their hashes are pinned inside the
+   attested `SHA256SUMS`).
    Publish itself is a human click after the checks below.
 3. Verify from a second machine/account view: download per
    the README, verify checksums/signature, build

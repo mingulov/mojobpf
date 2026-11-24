@@ -22,7 +22,10 @@ jobs:
   analysis:
     name: scorecard analysis
     runs-on: ubuntu-24.04
+    # Job-level permissions replace (not merge with) the
+    # top-level block, so checkout's read lands here too.
     permissions:
+      contents: read
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
