@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# MojoBPF tag-triggered draft release.
+#
+# On tag push (v*.*.*): rebuilds wheel+sdist from the tag,
+# verifies the extracted wheel contents against
+# docs/checksums-<ver>.md, attests the artifacts, and opens a
+# DRAFT GitHub release with wheel + sdist + checksums. Publish
+# itself stays a human click after out-of-band verification
+# (see RELEASING.md). Trust floor: the signed tag (verified
+# with `git verify-tag`) plus this workflow's attestation.
+#
+# Supply chain: every Action pinned to a full commit SHA (the
+# trailing comment names the major tag it resolves).
+name: release-draft
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  draft:
+    name: build, verify, and draft the release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: derive the version from the tag
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          test "$version" != "$tag" || { echo "tag is not v<ver>: $tag"; exit 2; }
+          test -f "docs/checksums-${version}.md" || { echo "missing docs/checksums-${version}.md"; exit 2; }
+          echo "MOJOBPF_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: build wheel and sdist
+        run: |
+          set -euo pipefail
+          python3 -m pip wheel . --no-deps --no-build-isolation -w dist
+          python3 setup.py -q sdist
+          ls dist/
+      - name: verify wheel contents against the checksums record
+        # Container bytes vary per build (zip metadata); the
+        # extracted contents must match the record exactly.
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/wheelcheck && mkdir -p /tmp/wheelcheck
+          python3 -m zipfile -e dist/mojobpf-*.whl /tmp/wheelcheck
+          python3 - > /tmp/contents.txt <<'PYEOF'
+          import hashlib
+          import os
+          rows = []
+          for root, _, files in os.walk('/tmp/wheelcheck'):
+              for name in files:
+                  path = os.path.join(root, name)
+                  digest = hashlib.sha256()
+                  with open(path, 'rb') as handle:
+                      for chunk in iter(lambda: handle.read(65536), b''):
+                          digest.update(chunk)
+                  rows.append('%s  %s' % (
+                      digest.hexdigest(),
+                      os.path.relpath(path, '/tmp/wheelcheck'),
+                  ))
+          print('\n'.join(sorted(rows)))
+          PYEOF
+          python3 - > /tmp/expected.txt <<'PYEOF'
+          import re
+          text = open('docs/checksums-%s.md' % __import__('os').environ['MOJOBPF_RELEASE_VERSION']).read()
+          rows = []
+          for block in re.findall(r'```text\n(.*?)```', text, re.S):
+              rows += [line for line in block.splitlines()
+                       if re.match(r'^[0-9a-f]{64}  ', line)]
+          assert rows, 'no checksum rows in the record'
+          print('\n'.join(sorted(rows)))
+          PYEOF
+          diff -u /tmp/expected.txt /tmp/contents.txt
+      - name: attest the artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*
+      - name: open the draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          prerelease: false
+          files: dist/*
+          body_path: docs/release-notes-${{ env.MOJOBPF_RELEASE_VERSION }}.md
