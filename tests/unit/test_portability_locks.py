@@ -950,6 +950,16 @@ def test_release_actions_are_pinned():
     assert len(uses) == 3, uses
 
 
+def test_dependabot_actions_only():
+    import re
+
+    with open(os.path.join(REPO_ROOT, ".github", "dependabot.yml"), encoding="utf-8") as handle:
+        text = handle.read()
+    assert 'package-ecosystem: "github-actions"' in text
+    assert len(re.findall(r"package-ecosystem:", text)) == 1, "exactly one ecosystem"
+    assert "weekly" in text
+
+
 def test_ci_interpreter_install_is_digest_pinned():
     text = _read_workflow()
     assert "setup-python" not in text, (
