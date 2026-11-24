@@ -95,7 +95,7 @@ jobs:
       PYTHON_SHA256: "035b0ccfe7f3d38ab3ddab505290d200c6a265b95fbd5fac76c358751d6bb6a8"
       PYTHON_URL: "https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.11.17+20261009-x86_64-unknown-linux-gnu-install_only.tar.gz"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the pinned interpreter
         run: |
           set -euo pipefail
@@ -215,7 +215,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: unit
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pytest into a venv
         # The runner's system Python refuses ambient installs
         # (PEP 668); the venv holds the hashed closure only.
@@ -279,7 +279,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: unit
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pytest into a venv
         run: |
           set -euo pipefail
@@ -343,7 +343,7 @@ jobs:
           - v7.4-rc4-kvm
           - v6.12-tcg
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: check the worktree is clean
         run: |
           test -z "$(git status --short)" || {
@@ -399,7 +399,7 @@ jobs:
         # Tolerant cat: a setup failure exits before any report
         # exists, and the board must not mask that exit.
         run: cat matrix-out-${{ matrix.lane }}/matrix-report.json 2>/dev/null || echo "no shard board (see the shard step above)"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: vm-matrix-shard-${{ matrix.lane }}
@@ -412,8 +412,8 @@ jobs:
     runs-on: ubuntu-24.04
     needs: vm-matrix
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: vm-matrix-shard-*
           path: shards
@@ -430,7 +430,7 @@ jobs:
       - name: show the merged board
         if: always()
         run: cat matrix-out/matrix-report.json 2>/dev/null || echo "no merged board (see the merge step above)"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: vm-matrix-report
