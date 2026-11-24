@@ -67,7 +67,8 @@ jobs:
                       digest.hexdigest(),
                       os.path.relpath(path, '/tmp/wheelcheck'),
                   ))
-          print('\n'.join(sorted(rows)))
+          print('\n'.join(sorted(
+              rows, key=lambda row: row.split(None, 1)[1])))
           PYEOF
           python3 - > /tmp/expected.txt <<'PYEOF'
           import re
@@ -77,7 +78,8 @@ jobs:
               rows += [line for line in block.splitlines()
                        if re.match(r'^[0-9a-f]{64}  ', line)]
           assert rows, 'no checksum rows in the record'
-          print('\n'.join(sorted(rows)))
+          print('\n'.join(sorted(
+              rows, key=lambda row: row.split(None, 1)[1])))
           PYEOF
           diff -u /tmp/expected.txt /tmp/contents.txt
       - name: attest the artifacts

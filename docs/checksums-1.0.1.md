@@ -12,7 +12,7 @@ the docs carrying this release record do not enter the
 wheel):
 
 ```text
-mojobpf-1.0.1-py3-none-any.whl size=519639 sha256=a7dd8b83aa744b895874fc9f1edc28268b167cae83b715ea92ac8609b0dd942c
+mojobpf-1.0.1-py3-none-any.whl size=519650 sha256=7dfc8e02b559b126fba4fb1d1f5faf7e6527f1b387d0d1626cf5087cfeab04f4
 ```
 
 The wheel carries no docs and no tests, so these contents
@@ -40,8 +40,8 @@ d5b25ab6c67fad351e0828e8918f6f7235babfdb6a2a39d1222c1d9aaa67ba21   mojobpf-1.0.1
 da2d8979ab63f4b4934949fb308f344c026f5786d1c61c58571fb5227c87b019   mojobpf-1.0.1.dist-info/entry_points.txt
 4244bc559163163a605d3c3135f3115d04e2bb937a37ab5fb6f13194931db8bf   mojobpf-1.0.1.dist-info/licenses/LICENSE
 03dab56ba90cef041216e442708a79e8cde129f4c35e3097c4de579f5b6c5c09   mojobpf-1.0.1.dist-info/licenses/THIRD_PARTY_NOTICES.md
-300297aa1b5da8b064df9f8872a480a199763869563ad027db794a24cc7dc3d2   mojobpf-1.0.1.dist-info/METADATA
-88e7db6a9e650c90f464babbe051ee2cdf16ca840551b30eb822ad88bc6f53c3   mojobpf-1.0.1.dist-info/RECORD
+465c401d2c2cc8ed545e686348b87f0ebe22ae13583af5c3d7790e3dea466349   mojobpf-1.0.1.dist-info/METADATA
+9f48f7e2f6cb4340be9ca8ac06bda2cf2785f00522a093f3e522f25e2fe92f9e   mojobpf-1.0.1.dist-info/RECORD
 45c93ebd92be7696a5a84b824c30dd91063275556c8808065abcb1b8d5025855   mojobpf-1.0.1.dist-info/top_level.txt
 c14c80f0e6ae95195b7f032d990b2f367806af140702f90a72f466762ce5262d   mojobpf-1.0.1.dist-info/WHEEL
 e1feb3401fd508de224199fc6adeb306f07119eb11efbd1b578ede9cc90ef451   mojobpf/build.py
