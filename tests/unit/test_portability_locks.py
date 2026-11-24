@@ -987,6 +987,66 @@ def test_release_verify_steps():
     assert "docs/checksums-${{ env.MOJOBPF_RELEASE_VERSION }}.md" in text
     assert "docs/evidence-${{ env.MOJOBPF_RELEASE_VERSION }}.md" in text
     assert text.count("set -euo pipefail") >= 5, "every new run block fails closed"
+    assert "generate the SBOM" in text, "release.yml step: generate the SBOM"
+    assert _at("verify the sdist rebuilds the wheel") < _at("generate the SBOM") < _at("write SHA256SUMS"), (
+        "SBOM lands between the sdist proof and the manifest"
+    )
+    assert "ci/release_sbom.py" in text and "cyclonedx" in text
+    assert "python3 -m json.tool" in text
+
+
+def test_release_sbom_emitter(tmp_path):
+    import hashlib
+    import importlib.util
+    import json
+    import tarfile
+    import zipfile
+
+    script = os.path.join(REPO_ROOT, "ci", "release_sbom.py")
+    spec = importlib.util.spec_from_file_location("release_sbom_probe", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    meta = (
+        "Metadata-Version: 2.4\n"
+        "Name: mojobpf\n"
+        "Version: 1.0.2\n"
+        "License: Apache-2.0 WITH LLVM-exception\n"
+    )
+    wheel = str(tmp_path / "mojobpf-1.0.2-py3-none-any.whl")
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("mojobpf-1.0.2.dist-info/METADATA", meta)
+    out = str(tmp_path / "wheel.cyclonedx.json")
+    assert module.main([wheel, "1.0.2", out]) == 0
+    with open(out, encoding="utf-8") as handle:
+        doc = json.load(handle)
+    assert doc["bomFormat"] == "CycloneDX"
+    assert doc["specVersion"] == "1.6"
+    assert doc["components"] == []
+    subject = doc["metadata"]["component"]
+    assert (subject["name"], subject["version"]) == ("mojobpf", "1.0.2")
+    assert subject["purl"] == "pkg:pypi/mojobpf@1.0.2"
+    with open(wheel, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    assert {"alg": "SHA-256", "content": digest} in subject["hashes"]
+
+    sdist = str(tmp_path / "mojobpf-1.0.2.tar.gz")
+    pkginfo = str(tmp_path / "PKG-INFO")
+    with open(pkginfo, "w", encoding="utf-8") as handle:
+        handle.write(meta)
+    with tarfile.open(sdist, "w:gz") as archive:
+        archive.add(pkginfo, arcname="mojobpf-1.0.2/PKG-INFO")
+    out_sdist = str(tmp_path / "sdist.cyclonedx.json")
+    assert module.main([sdist, "1.0.2", out_sdist]) == 0
+    with open(out_sdist, encoding="utf-8") as handle:
+        assert json.load(handle)["metadata"]["component"]["version"] == "1.0.2"
+
+    bad_meta = meta + "Requires-Dist: something (>=1)\n"
+    bad_wheel = str(tmp_path / "bad-1.0.2-py3-none-any.whl")
+    with zipfile.ZipFile(bad_wheel, "w") as archive:
+        archive.writestr("mojobpf-1.0.2.dist-info/METADATA", bad_meta)
+    assert module.main([bad_wheel, "1.0.2", str(tmp_path / "bad.json")]) == 2
+    assert module.main([wheel, "9.9.9", str(tmp_path / "mismatch.json")]) == 2
 
 
 def test_ci_interpreter_install_is_digest_pinned():
