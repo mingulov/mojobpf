@@ -1049,6 +1049,16 @@ def test_release_sbom_emitter(tmp_path):
     assert module.main([wheel, "9.9.9", str(tmp_path / "mismatch.json")]) == 2
 
 
+def test_signing_verifiability():
+    with open(os.path.join(REPO_ROOT, "docs", "allowed_signers"), encoding="utf-8") as handle:
+        signers = handle.read()
+    assert signers.startswith("denis@mingulov.com namespaces=\"git\" ssh-ed25519 "), "principal + keytype"
+    with open(os.path.join(REPO_ROOT, "RELEASING.md"), encoding="utf-8") as handle:
+        runbook = handle.read()
+    assert "SHA256:4SdMsG72+xOBHpyoHX9GDELA30Q9ulAlcRhBlDv/djo" in runbook
+    assert "docs/allowed_signers" in runbook and "gpg.format=ssh" in runbook
+
+
 def test_ci_interpreter_install_is_digest_pinned():
     text = _read_workflow()
     assert "setup-python" not in text, (

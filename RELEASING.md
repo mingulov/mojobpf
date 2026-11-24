@@ -75,11 +75,20 @@ wheel-content diff vs the checksums table must be empty.
 
 ## 5. Tag
 
-The owner creates the signed tag at the final candidate:
+The owner creates the signed tag at the final candidate.
+Signing uses SSH (`gpg.format=ssh`) with the owner's key:
 
 ```bash
 git tag -s v<ver> -m "MojoBPF <ver>"
 git verify-tag v<ver>
+```
+
+Anyone can check a tag against the committed
+`docs/allowed_signers` (principal `denis@mingulov.com`,
+ED25519 key `SHA256:4SdMsG72+xOBHpyoHX9GDELA30Q9ulAlcRhBlDv/djo`):
+
+```bash
+git -c gpg.ssh.allowedSignersFile=docs/allowed_signers verify-tag v<ver>
 ```
 
 Tags are never moved. A wrong tag is superseded by a new
