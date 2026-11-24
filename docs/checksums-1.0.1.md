@@ -15,8 +15,11 @@ wheel):
 mojobpf-1.0.1-py3-none-any.whl size=519974 sha256=66802f14a28c816f323861255bc72ae28f9378136ed975380d8c5cf8da99f720
 ```
 
-The wheel carries no docs and no tests, so these contents
-equal a build from the matrix commit pinned in
+The wheel carries no `docs/` files and no tests;
+`README.md` enters `METADATA` as the long description, so the
+`METADATA` and `RECORD` rows follow the release tree's README
+and every other row equals a build from the matrix commit
+pinned in
 [evidence](evidence-1.0.1.md) (verified by rebuilding from
 the release tree and diffing the extracted contents).
 

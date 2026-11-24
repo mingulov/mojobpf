@@ -10,16 +10,25 @@ merge (`--expect-lanes` + `--expect-suites`, exact within the
 declared scope): 140/140 lane-suites pass, 0 red,
 0 unexplained, 0 environment failures on claimed cells.
 
-> [TBD: scope/claim sentences pending O-2 owner words. The
-> numbers in this document are observed and final; the
-> sentences that turn them into release claims are not
-> written yet.]
+MojoBPF 1.0.1 qualifies the program and map shapes its
+28-suite gating board exercises (stable and preview profiles
+alike; only the two stable profiles carry a stability
+promise), with the pinned toolchain, on five exact x86-64 KVM
+guest builds: `6.6.0-060600-generic`, `6.12.0-061200-generic`,
+`7.0.14-070014-generic`, `7.2.0-070200-generic`, and
+`7.4.0-070400rc4-generic`; other kernels, including other 7.4
+builds, are outside the support claim.
+This Beta release qualifies that bounded subset only. The
+broader full-support assessment remains on hold: performance
+budgets and the remaining capability-inventory work are open,
+and no full-support gate has run.
 
 Release commit: the commit carrying this document (a
-docs-only amendment of the matrix commit named above; no
-`.py` under `tests/`, `src/`, or `ci/` references it and
-no suite reads `docs/` except the subset-doc gate, which
-re-passes on the release tree).
+docs-and-release-workflow amendment of the matrix commit
+named below; no product code changes). The doc-reading host
+tests (subset table, target-proof evidence pin, compatibility
+and install strings, SDK doc) re-pass on the release tree in
+the host lanes below.
 Matrix commit: `7b0d8b2353eac386ea5485664a875059cc0be9c4`.
 
 Tally arithmetic: 41 registry suites minus `kernel-joint`
@@ -44,16 +53,19 @@ Merged report sha256:
 `248841386ccc3e3dfad232b9b5ca80a95277f6ef684065bde8dd334a41cc1831`
 (`matrix-report.json` covering the 140 cells above).
 
-Prior observations feeding this board: 6.6 + 6.12 green 56/56
+Earlier observations (not part of the merged verdict): 6.6 + 6.12 green 56/56
 at 330226e; 7.0.14 + 7.2 + 7.4-rc1 green 84/84 + 11 ISA in the
 appendix board at 59ec93d; the rc4 lane re-pinned from rc1
 with re-observed fixtures.
 
-> [TBD: exact-build rc4 scope sentence pending owner wording
-> approval.]
+The 7.4 entry names exactly the `7.4.0-070400rc4-generic`
+build pinned by hash in `ci/kernels.lock.json`, the latest
+release candidate at cut time. It is not a promise for any
+other 7.4 release candidate or for the 7.4 final; each needs
+its own qualifying run.
 
-The `kernel-joint` suite stays unclaimed; its historical
-workspace receipts are retired, not cited. The 11 nightly
+The `kernel-joint` suite stays unclaimed; its earlier results
+are retired, not cited. The 11 nightly
 ISA suites report outside the gating tally.
 
 ## Toolchain the anchor ran
@@ -64,8 +76,9 @@ ISA suites report outside the gating tally.
   libbpf 1.6, virtme-ng 1.41, QEMU 10.2.2, KVM hardware
   acceleration on x86-64.
 * Guest lanes (pinned by hash in `ci/kernels.lock.json`):
-  6.6.0-060600-generic, 6.12.0-061200-generic
-  (Ubuntu mainline builds).
+  6.6.0-060600-generic, 6.12.0-061200-generic,
+  7.0.14-070014-generic, 7.2.0-070200-generic, and the exact
+  7.4.0-070400rc4-generic build (Ubuntu mainline builds).
 * The consumer suites in every run resolve Mojo 1.2.0 from
   an independently installed toolchain outside the checkout
   (PATH-only, no checkout-derived paths); every lane-suite
@@ -74,7 +87,8 @@ ISA suites report outside the gating tally.
 ## Key release proofs (all observed in the anchor)
 
 Each claimed shape maps to at least one passing guest
-suite plus its consumer canary, on all five lanes, on the
+suite plus, where one exists, its consumer canary, on all
+five lanes, on the
 same bits:
 
 * Packet and parse paths: `kernel-xdp`, `kernel-packet`,
@@ -104,10 +118,11 @@ same bits:
   the counter from a clean-clone wheel (object byte-identical
   to the pinned `b74df864`), inspected clean, passed guest
   load/unload on the TCG and KVM lanes, and counted packets
-  (3 after three runs, 8 after five more) on KVM — with two
-  doc deviations recorded in the T7 rehearsal receipt (cmake
-  flag, lockfile bpftool pin), to be removed by the docs
-  pass and its final re-run.
+  (3 after three runs, 8 after five more) on KVM. The first
+  rehearsal recorded eight doc findings (among them the cmake
+  flag, the lockfile bpftool pin, and doctor transcript
+  drift); all were fixed in the docs, and two later
+  clean-clone re-runs passed verbatim with zero deviations.
 
 ## Rerunning
 
@@ -119,6 +134,7 @@ with the toolchain above on `PATH`
 pixi run test-unit
 pixi run test-compiler
 pixi run test-package
+pixi run test-smoke
 python3 ci/run_vm_tests.py --lane <lane> \
     --suite <s1> --suite <s2> ... --suite <s28> \
     --out-dir lane-<lane> --consumer-path <independent-toolchain>

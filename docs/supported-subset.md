@@ -193,7 +193,7 @@ plus genuine compiled attempts), the driver pipeline suite
 (both orders end to end, base-profile refusal), the subprogram
 ELF structure suite (object pins plus the inspection gate), and
 the subprogram kernel suite (input-dependent boards through the
-call on both x86 lanes, the call-free mutant board, the
+call on all five x86 lanes, the call-free mutant board, the
 verifier-log subprogram markers, FD lifecycle, and residue).
 The public example with its rule, fixtures, and mutant lives in
 `examples/subprog_call/README.md`.

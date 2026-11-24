@@ -157,8 +157,8 @@ demonstrated in a Linux guest; each bullet names its proof.
 - One subprogram decision: the classifier rule above with the bit
   test computed in a single `(i64) -> i64` callee reached
   through one static call. Both definition orders build and
-  execute with input-dependent boards through the call on both
-  x86 lanes, the call-free inverted mutant shows a different
+  execute with input-dependent boards through the call on all
+  five x86 lanes, the call-free inverted mutant shows a different
   board, and the verifier log shows the subprogram (`func#0` /
   `func#1` with caller/callee frames)
   (`tests/kernel/test_subprog_calls.py`,
@@ -425,11 +425,12 @@ below names the current pins. The 0.3.0a1 alpha record (see
 measured behaviors on LLVM 22.1.8 with bpftool 7.6.0 /
 libbpf 1.6 under software emulation; the v1.0.1 release
 matrix boards them on five KVM lanes (28-suite x 5-lane
-gating scope; verdict pending in
+gating scope; 140/140 green in
 [evidence-1.0.1.md](evidence-1.0.1.md); see the compatibility
 five-lane board description), covering kernels 6.6.0, 6.12.0,
-7.0.14, 7.2.0, and the exact 7.4.0-070400rc4 build
-(scope/claim framing pending O-2 owner words). Other
+7.0.14, 7.2.0, and the exact 7.4.0-070400rc4 build (that
+build only, not other 7.4 release candidates or the 7.4
+final). Other
 combinations are unproven, not supported. Full binary paths
 and hashes are recorded in `toolchains.lock.json`; rerun
 `tests/probes/toolchain_inventory.py` to re-probe any machine.
@@ -512,7 +513,7 @@ of them is implied by the results above:
   `ci/run_vm_tests.py`, with per-lane loop-shape verdicts
   pinned under the pinned 1.2.0 frontend (see the
   compatibility documentation); each gating lane must pass
-  its full 28-suite scope, with the merged verdict pending in
+  its full 28-suite scope; the merged verdict (140/140) is in
   [evidence-1.0.1.md](evidence-1.0.1.md) (see the
   compatibility five-lane board description). The named
   `v6.12-tcg` fallback is a two-suite spot-proof lane
@@ -595,8 +596,8 @@ of them is implied by the results above:
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
   lifetime-marker skew, qualified under the pinned Mojo 1.2.0
   on the prior boards; the 28-suite x 5-lane release board
-  will re-prove them (verdict pending in the evidence record —
-  see the compatibility five-lane board description);
+  re-proved them (140/140 in the evidence record — see the
+  compatibility five-lane board description);
   they must be revisited if a future Mojo emits
   backend-compatible IR for those constructs.
 - Content-derived variable packet offsets (loading one packet byte

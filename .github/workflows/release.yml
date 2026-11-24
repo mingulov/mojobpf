@@ -39,11 +39,20 @@ jobs:
           test "$version" != "$tag" || { echo "tag is not v<ver>: $tag"; exit 2; }
           test -f "docs/checksums-${version}.md" || { echo "missing docs/checksums-${version}.md"; exit 2; }
           echo "MOJOBPF_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: provision the pinned build backend
+        # The wheel's WHEEL/METADATA rows name the setuptools
+        # version that built them, so the backend is pinned by
+        # hash to the one the checksums record was built with.
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/build-venv
+          printf '%s\n' 'setuptools==80.10.2 --hash=sha256:95b30ddfb717250edb492926c92b5221f7ef3fbcc2b07579bcd4a27da21d0173' > /tmp/build-requirements.txt
+          /tmp/build-venv/bin/python -m pip install --require-hashes --no-deps -r /tmp/build-requirements.txt
       - name: build wheel and sdist
         run: |
           set -euo pipefail
-          python3 -m pip wheel . --no-deps --no-build-isolation -w dist
-          python3 setup.py -q sdist
+          /tmp/build-venv/bin/python -m pip wheel . --no-deps --no-build-isolation -w dist
+          /tmp/build-venv/bin/python setup.py -q sdist
           ls dist/
       - name: verify wheel contents against the checksums record
         # Container bytes vary per build (zip metadata); the
