@@ -40,10 +40,10 @@ exact 7.4.0-070400rc4) = 140 cells.
 
 | Suite | Command | Result |
 |---|---|---|
-| Unit | `pixi run test-unit` | 27/27 modules exit 0 (TBD nodes) |
-| Compiler | `pixi run test-compiler` | 84/84 modules exit 0 (TBD nodes); the 1.0.0 module-18 subtests-closure gap shows no in-lane failure in this cut |
+| Unit | `pixi run test-unit` | 27/27 modules exit 0 (1932 nodes) |
+| Compiler | `pixi run test-compiler` | 84/84 modules exit 0 (5133 nodes); the 1.0.0 module-18 subtests-closure gap shows no in-lane failure in this cut |
 | Package | `pixi run test-package` | 2/2 modules exit 0 (sdist membership + wheel contents) |
-| Smoke | `pixi run test-smoke` | 4/4 modules exit 0 (TBD nodes) |
+| Smoke | `pixi run test-smoke` | 4/4 modules exit 0 (79 nodes) |
 | VM matrix, per lane | `python3 ci/run_vm_tests.py --lane <lane> --suite <each of 28> --out-dir <lane> --consumer-path <independent-toolchain>` | 28/28 pass on each of the 5 lanes, unchanged (run detail in [evidence-1.0.1.md](evidence-1.0.1.md)) |
 | Scoped merge | `python3 ci/run_vm_tests.py --merge <5 lane reports> --expect-lanes v6.6-kvm,v6.12-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc4-kvm --expect-suites <28>` | exit 0; 140/140 lane-suites passed, unchanged |
 
@@ -113,8 +113,10 @@ same bits (run detail in
 * Quickstart: the 1.0.1 clean-clone rehearsals stand (three
   verbatim passes, zero deviations; no product path
   changed). 1.0.2 re-observed the oracle from the candidate
-  wheel: `xdp_counter` builds to `b74df864` (TBD full hash
-  at T8), and the transcripts carry the new wheel identity.
+  wheel: `xdp_counter` builds to
+  `b74df864b37aaf41b1f7628b36859fe035e27cff7bf853f1e325ce9b6dae946e`
+  (3480 bytes, identical to 1.0.1), and the transcripts carry
+  the new wheel identity.
 
 ## Rerunning
 
