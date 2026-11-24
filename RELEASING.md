@@ -48,7 +48,10 @@ breaks a later packaging run — tests first, artifacts after):
 
 1. `pixi install` (reproduces the pinned toolchain
    hash-identically), then the package lane against the clone.
-2. `pip wheel . --no-deps --no-build-isolation -w dist`,
+2. `pip wheel . --no-deps --no-build-isolation -w dist` with
+   `setuptools==80.10.2` as the build backend (the `WHEEL` and
+   `METADATA` checksum rows name it; the release workflow pins
+   it by hash),
    `python3 setup.py -q sdist`, and the lowering build
    (`cmake -S compiler -B build/lower -DCMAKE_BUILD_TYPE=Release
    -DBUILD_TESTING=OFF && cmake --build build/lower -j$(nproc)`).

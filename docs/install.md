@@ -80,6 +80,11 @@ pip wheel . --no-deps --no-build-isolation -w dist
 pip install --no-index dist/mojobpf-1.0.1-py3-none-any.whl
 ```
 
+To compare the build against the release checksums record,
+use `setuptools==80.10.2` as the backend: the `WHEEL` and
+`METADATA` rows name the backend version, so any other version
+changes those two rows.
+
 ## Build the lowering (`mojobpf-lower`)
 
 Parsed-route builds lower Mojo-emitted LLVM IR through the

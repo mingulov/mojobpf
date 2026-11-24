@@ -150,7 +150,9 @@ the v1.0 release matrix re-proved them (see
 [evidence-1.0.0.md](evidence-1.0.0.md)), and the v1.0.1
 release board re-proved them on all five lanes (140/140 cells
 at board commit 7b0d8b2; see above and
-[evidence-1.0.1.md](evidence-1.0.1.md)).
+[evidence-1.0.1.md](evidence-1.0.1.md)), except the arithmetic
+ISA suites, which sit outside the gating board (see
+[Measured arithmetic behavior](#measured-arithmetic-behavior)).
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host

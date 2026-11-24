@@ -24,7 +24,9 @@ pinned in
 the release tree and diffing the extracted contents).
 
 Reproduce it with `pip wheel . --no-deps --no-build-isolation
--w dist` from the release tree and compare the extracted files
+-w dist` from the release tree, with `setuptools==80.10.2` as
+the build backend (the `WHEEL` and `METADATA` rows name it),
+and compare the extracted files
 against the table below (SHA-256 per archived path):
 
 ```text
