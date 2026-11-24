@@ -3099,13 +3099,99 @@ def _first_error_line(stderr: str) -> str | None:
         line = raw.strip()
         if not line:
             continue
-        if (
-            line.startswith("error:")
-            or line.startswith("LLVM ERROR")
-            or _ERROR_LOCATION_RE.search(line)
-        ):
+        if _is_error_line(line):
             return line
     return None
+
+
+def _is_error_line(line):
+    """Whether a stripped stderr line is a tool error message."""
+    return (
+        line.startswith("error:")
+        or line.startswith("LLVM ERROR")
+        or _ERROR_LOCATION_RE.search(line) is not None
+    )
+
+
+# The pinned mojo emits standard-library loss as TWO column-0 error
+# diagnostics sharing one `.mojo` location (verified on the pinned
+# 1.2.0), with these EXACT message texts. The remedy requires both
+# texts at one shared location: exactness is what separates the
+# diagnostic from quotations (a static assertion quoting the
+# words has a different message), and the location parse is what
+# separates it from echoes (column-0, UNstripped lines, so
+# indented echoes never match; the FIRST `:line:col:` triplet
+# sets the severity, so a warning quoting an error never
+# matches). The location itself admits every path character.
+# The pair spans adjacent lines under a multi-megabyte capture
+# cap, so truncation cannot realistically split it; the scan is
+# a single linear pass (first A index, then first B index past
+# it); any other shape keeps the generic remedy (fail closed).
+_STD_LOCATION_RE = re.compile(
+    r"^(?P<loc>[^\s].*?\.mojo):(?P<line>\d+):(?P<col>\d+): "
+    r"(?P<sev>[A-Za-z]+):\s*(?P<msg>.*)$"
+)
+_STD_MESSAGE_A = "unable to locate module 'std'"
+_STD_MESSAGE_B = "'std' is required for all normal mojo compiles."
+
+
+def _std_pair_present(messages):
+    """Whether same-location messages hold the exact A/B pair.
+
+    Linear scan (first A index, then first B index past it):
+    a nested scan took seconds on flood input, so the cost is
+    pinned by test (comparison counting, no wall clock).
+    """
+    try:
+        first = next(
+            index
+            for index, message in enumerate(messages)
+            if message == _STD_MESSAGE_A
+        )
+    except StopIteration:
+        return False
+    return any(
+        index != first and message == _STD_MESSAGE_B
+        for index, message in enumerate(messages)
+    )
+
+
+def _step_remedy(step, stderr):
+    """Return the step-failure remedy, naming env activation on std loss.
+
+    A frontend that cannot find the Mojo standard library (bare-PATH
+    `mojo` without its environment) fails with the standard-library
+    diagnostic pair below; the generic "fix the reported error"
+    remedy would strand the user, so the remedy names `MODULAR_HOME`
+    activation instead. Both exact message texts must appear as
+    same-location error messages: anything less is
+    indistinguishable from echoed source, warnings, quotations, or
+    filenames quoting the words, and keeps the generic remedy.
+    Every other failure keeps it too.
+    """
+    if step == "frontend":
+        seen = {}
+        for line in stderr.splitlines():
+            if not line.strip():
+                continue
+            matched = _STD_LOCATION_RE.match(line)
+            if matched is None or matched.group("sev") != "error":
+                continue
+            key = (
+                matched.group("loc"),
+                matched.group("line"),
+                matched.group("col"),
+            )
+            seen.setdefault(key, []).append(matched.group("msg"))
+        for messages in seen.values():
+            if _std_pair_present(messages):
+                return (
+                    "export MODULAR_HOME from the Mojo "
+                    "environment (pixi: the environment's "
+                    "share/max) and retry; bare-PATH mojo "
+                    "cannot find its standard library"
+                )
+    return "fix the reported error; the log excerpt names it"
 
 
 def _step_outcome(
@@ -3159,14 +3245,14 @@ def _step_outcome(
             "%s step exited %d: %s"
             % (step, record.exit_code, " ".join(record.argv)),
             _first_error_line(stderr) or expected_path,
-            "fix the reported error; the log excerpt names it",
+            _step_remedy(step, stderr),
         )
     if saw_marker or marker.lower() in stderr.lower():
         return _step_failure(
             record.stage,
             "%s step reported errors: %s" % (step, " ".join(record.argv)),
             _first_error_line(stderr) or expected_path,
-            "fix the reported error; the log excerpt names it",
+            _step_remedy(step, stderr),
         )
     if not os.path.isfile(expected_path):
         return _step_failure(

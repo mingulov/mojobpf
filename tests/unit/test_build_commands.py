@@ -121,6 +121,31 @@ def main(argv):
     if mode == "crash":
         sys.stderr.write("fixture frontend boom\\n")
         return 3
+    if mode == "no-std":
+        sys.stderr.write(
+            "main.mojo:1:1: error: unable to locate module 'std'\\n"
+            "main.mojo:1:1: error: 'std' is required for all normal"
+            " mojo compiles.\\n"
+        )
+        return 1
+    if mode == "std-echo":
+        sys.stderr.write(
+            "main.mojo:2:5: error: use of unknown declaration"
+            " 'unknown_name'\\n"
+            "    unknown_name() # 'std' is required\\n"
+            "    ^\\n"
+        )
+        return 1
+    if mode == "std-smuggle":
+        sys.stderr.write(
+            "main.mojo:2:5: error: use of unknown declaration"
+            " 'unknown_name'\\n"
+            "    unknown_name() # ref.mojo:1:1: error: unable to"
+            " locate module 'std'\\n"
+            "project/'std' is required/main.mojo:2:5: error: use of"
+            " unknown declaration 'unknown_name'\\n"
+        )
+        return 1
     if mode == "loud-crash":
         sys.stderr.write("E" * 100000 + "\\n")
         return 3
@@ -1692,6 +1717,218 @@ def test_compiler_crash_is_captured():
     assert result.artifacts == ()
     assert result.provenance is not None
     assert not os.path.exists(out_dir) or os.listdir(out_dir) == []
+
+
+def test_frontend_std_lookup_names_env_activation():
+    # Bare-PATH mojo fails with the standard-library marker; the
+    # generic "fix the reported error" remedy would strand the
+    # user, so MBPF106 names MODULAR_HOME activation instead.
+    # The marker branch (exit 0 + marker) shares the remedy.
+    parent = tempfile.mkdtemp(prefix="build-nostd-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_MOJO="no-std"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.stage == "build.frontend"
+    assert "MODULAR_HOME" in diagnostic.remedy, diagnostic.remedy
+    assert "bare-PATH" in diagnostic.remedy, diagnostic.remedy
+    assert result.artifacts == ()
+
+
+def test_frontend_std_echo_keeps_generic_remedy():
+    # Echoed source quoting the standard-library words is not a
+    # missing standard library: the marker only counts on tool
+    # error lines, so this ordinary failure keeps the generic
+    # remedy and still points at the real error.
+    parent = tempfile.mkdtemp(prefix="build-stdecho-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_MOJO="std-echo"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.stage == "build.frontend"
+    assert diagnostic.remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), diagnostic.remedy
+    assert "unknown declaration" in diagnostic.location, diagnostic
+    assert result.artifacts == ()
+
+
+def test_frontend_std_smuggle_keeps_generic_remedy():
+    # A fake error header smuggled into echoed source, and marker
+    # words smuggled into a filename, must not misdiagnose: only
+    # the message portion of a parsed header counts.
+    parent = tempfile.mkdtemp(prefix="build-stdsmuggle-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_MOJO="std-smuggle"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.stage == "build.frontend"
+    assert diagnostic.remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), diagnostic.remedy
+    assert "unknown declaration" in diagnostic.location, diagnostic
+    assert result.artifacts == ()
+
+
+def test_step_remedy_matches_supported_path_shapes():
+    # Spaced and non-ASCII source paths are supported (see
+    # test_spaces_and_nonnascii_paths_build): the genuine
+    # marker pair on such a header still names env activation.
+    remedy = build_module._step_remedy(
+        "frontend",
+        "/proc/self/fd/7/source files (draft)/main.mojo:1:1: "
+        "error: unable to locate module 'std'\n"
+        "/proc/self/fd/7/source files (draft)/main.mojo:1:1: "
+        "error: 'std' is required for all normal mojo compiles.\n"
+        "s rc/mödüle file.mojo:2:5: error: unable to locate "
+        "module 'std'\n"
+        "s rc/mödüle file.mojo:2:5: error: 'std' is required"
+        " for all normal mojo compiles.\n",
+    )
+    assert "MODULAR_HOME" in remedy, remedy
+
+
+def test_step_remedy_warning_quote_keeps_generic_remedy():
+    # The FIRST triplet sets the severity: a warning quoting a
+    # fake error never matches, even when the quoted text carries
+    # a marker.
+    remedy = build_module._step_remedy(
+        "frontend",
+        "main.mojo:1:1: warning: quoted ref.mojo:2:1: error: "
+        "unable to locate module 'std'\n"
+        "main.mojo:2:5: error: unexpected expression\n",
+    )
+    assert remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), remedy
+
+
+def test_step_remedy_pair_order_independent():
+    # Either marker may come first; the pair matches regardless
+    # of diagnostic order.
+    remedy = build_module._step_remedy(
+        "frontend",
+        "main.mojo:1:1: error: 'std' is required for all normal "
+        "mojo compiles.\n"
+        "main.mojo:1:1: error: unable to locate module 'std'\n",
+    )
+    assert "MODULAR_HOME" in remedy, remedy
+
+
+def test_step_remedy_lone_marker_keeps_generic_remedy():
+    # A single marker line is indistinguishable from echoed
+    # source, warnings, or filenames quoting the words: only
+    # the pair at a shared location names env activation.
+    remedy = build_module._step_remedy(
+        "frontend",
+        "/proc/self/fd/7/source files (draft)/main.mojo:1:1: "
+        "error: unable to locate module 'std'\n",
+    )
+    assert remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), remedy
+
+
+def test_step_remedy_single_message_pair_quote_keeps_generic():
+    # One message quoting both markers is a quotation, not the
+    # diagnostic pair: two DISTINCT same-location messages must
+    # carry one marker each.
+    remedy = build_module._step_remedy(
+        "frontend",
+        "main.mojo:1:1: error: static assertion failed: "
+        "\"unable to locate module 'std'; 'std' is required\"\n",
+    )
+    assert remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), remedy
+
+
+def test_step_remedy_bare_pair_keeps_generic_remedy():
+    # Locationless lines never count: the pinned frontend always
+    # cites a `.mojo` location for these diagnostics.
+    remedy = build_module._step_remedy(
+        "frontend",
+        "error: unable to locate module 'std'\n"
+        "LLVM ERROR: 'std' is required for all normal mojo "
+        "compiles.\n",
+    )
+    assert remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), remedy
+
+
+class _CountingStr(str):
+    """A string counting every == probe (deterministic cost pin)."""
+
+    probes = 0
+
+    def __eq__(self, other):
+        type(self).probes += 1
+        return super().__eq__(other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return super().__hash__()
+
+
+def test_step_remedy_flood_cost_is_linear():
+    # Twenty thousand lone markers (within the capture cap) must
+    # cost O(n) comparisons, not O(n^2): a nested scan took 6.7s
+    # on this shape. Counted deterministically through the real
+    # helper (no wall clock, so scheduling cannot flake it); the
+    # lower bound forces the helper to actually compare.
+    _CountingStr.probes = 0
+    flood = [
+        _CountingStr("unable to locate module 'std'")
+        for _ in range(20000)
+    ]
+    assert build_module._std_pair_present(flood) is False
+    assert 0 < _CountingStr.probes <= 4 * len(flood), (
+        _CountingStr.probes,
+    )
+
+
+def test_step_remedy_delegates_pair_search(monkeypatch):
+    # The linear-cost pin above guards the helper; this guards
+    # the wiring so the remedy cannot silently bypass it.
+    calls = []
+    real = build_module._std_pair_present
+
+    def spy(messages):
+        calls.append(list(messages))
+        return real(messages)
+
+    monkeypatch.setattr(build_module, "_std_pair_present", spy)
+    remedy = build_module._step_remedy(
+        "frontend",
+        "main.mojo:1:1: error: unable to locate module 'std'\n",
+    )
+    assert remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), remedy
+    assert calls == [["unable to locate module 'std'"]], calls
+
+
+def test_step_remedy_rejects_indented_echo():
+    # Diagnostics start at column 0; an indented echo shaped
+    # like a header must not impersonate one.
+    remedy = build_module._step_remedy(
+        "frontend",
+        "main.mojo:2:5: error: unexpected expression\n"
+        "    ref.mojo:1:1: error: unable to locate module 'std'\n"
+        "    ^\n",
+    )
+    assert remedy == (
+        "fix the reported error; the log excerpt names it"
+    ), remedy
 
 
 def test_backend_crash_is_captured():
@@ -6828,6 +7065,19 @@ def test_test_kernel_require_executed_passes():
         path=bindir,
     )
     assert code == 0, out
+
+
+def test_test_help_states_checkout_corpus():
+    # O-11: the corpus ships with the checkout, never the
+    # installed package; --suite-path names an alternate tree.
+    # Pin the annotation so the help cannot promise an
+    # installed corpus again.
+    code, out, _ = run_cli(["test", "--help"])
+    assert code == 0
+    text = " ".join(out.split())
+    assert "ships with the checkout" in text, text
+    assert "not the installed package" in text, text
+    assert "--suite-path" in text, text
 
 
 def test_test_require_kernel_help_matches_behavior():

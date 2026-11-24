@@ -953,7 +953,7 @@ def test_ci_interpreter_install_is_digest_pinned():
     path_at = _line_of("GITHUB_PATH")
     pip_at = _line_of("pip install")
     # The unit step runs the lane runner (module-per-process),
-    # the declared unit gate anchored in docs/evidence-1.0.0.md:
+    # the declared unit gate anchored in docs/evidence-1.0.1.md:
     # a raw single-process `pytest tests/unit` GC-thrashes past
     # 30 minutes on this suite (measured 2026-11-09), so the
     # workflow cannot run it literally. The lane executes the

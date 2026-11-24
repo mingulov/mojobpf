@@ -1106,7 +1106,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.set_defaults(func=_command_verify)
 
     test = sub.add_parser(
-        "test", help="run a project test suite (developer command)"
+        "test",
+        help="run a project test suite (developer command)",
+        description="run a project test suite (developer command): "
+        "the test corpus ships with the checkout, not the "
+        "installed package; see --suite-path",
     )
     test.add_argument(
         "--suite", required=True, help="suite name (e.g. compile, kernel)"

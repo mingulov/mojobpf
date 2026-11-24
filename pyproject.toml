@@ -5,22 +5,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mojobpf"
-version = "1.0.0"
+version = "1.0.1"
 description = "Mojo-authored Linux eBPF programs compiled to standard BPF ELF"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0 WITH LLVM-exception" }
 keywords = ["bpf", "ebpf", "mojo", "xdp"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: System :: Operating System Kernels :: Linux",
     "Topic :: Software Development :: Compilers",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mingulov/mojobpf"
+Repository = "https://github.com/mingulov/mojobpf"
 
 [project.scripts]
 mojobpf = "mojobpf.cli:main"
