@@ -38,6 +38,9 @@ RELEASE_LOCK = os.path.join(REPO_ROOT, "toolchains.lock.json")
 VM_MATRIX = os.path.join(
     REPO_ROOT, ".github", "workflows", "vm-matrix.yml"
 )
+RELEASE_WORKFLOW = os.path.join(
+    REPO_ROOT, ".github", "workflows", "release.yml"
+)
 HARNESS_PATH = os.path.join(
     REPO_ROOT, "tests", "harness", "bpf_test_run.py"
 )
@@ -882,6 +885,11 @@ def _read_workflow():
         return handle.read()
 
 
+def _read_release_workflow():
+    with open(RELEASE_WORKFLOW, encoding="utf-8") as handle:
+        return handle.read()
+
+
 def test_ci_actions_are_pinned():
     import re
 
@@ -899,23 +907,47 @@ def test_ci_actions_are_pinned():
         r"uses:\s*actions/([a-z0-9-]+)@([0-9a-f]{40})\s+#\s*(v[\d.]+)",
         text,
     )
-    assert ("checkout", "11d5960a326750d5838078e36cf38b85af677262", "v4.4.0") in pinned
+    assert ("checkout", "3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1") in pinned, "vm-matrix.yml: checkout"
     assert (
         "upload-artifact",
-        "ea165f8d65b6e75b540449e92b4886f43607fa02",
-        "v4.6.2",
-    ) in pinned
+        "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+        "v7.0.2",
+    ) in pinned, "vm-matrix.yml: upload-artifact"
     assert (
         "download-artifact",
-        "d3f86a106a0bac45b974a628896c90dbdf5c8093",
-        "v4.3.0",
-    ) in pinned
+        "9000827ccba6bdab643e8b6fd33ac0654aef8333",
+        "v8.0.2",
+    ) in pinned, "vm-matrix.yml: download-artifact"
     uses = re.findall(r"uses:\s*(\S+)", text)
     assert len(uses) == 8, uses
     for reference in uses:
         _action, _, revision = reference.partition("@")
         assert len(revision) == 40, reference
         int(revision, 16)
+
+
+def test_release_actions_are_pinned():
+    import re
+
+    text = _read_release_workflow()
+    assert re.search(r"[a-z0-9-]+/[a-z0-9-]+@v\d", text) is None, (
+        "release.yml: floating major"
+    )
+    pinned = re.findall(
+        r"uses:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})\s+#\s*(v[\d.]+)",
+        text,
+    )
+    assert ("actions/checkout", "3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1") in pinned, (
+        "release.yml: checkout"
+    )
+    assert ("actions/attest-build-provenance", "4d101475d8b20a2381f78447822ac1eab6504dd8", "v4.2.2") in pinned, (
+        "release.yml: attest"
+    )
+    assert ("softprops/action-gh-release", "8a0cd651e5b2365bd640854a3fa5dfc70e4875f3", "v3.0.4") in pinned, (
+        "release.yml: gh-release"
+    )
+    uses = re.findall(r"uses:\s*(\S+)", text)
+    assert len(uses) == 3, uses
 
 
 def test_ci_interpreter_install_is_digest_pinned():
