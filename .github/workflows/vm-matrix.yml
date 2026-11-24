@@ -4,7 +4,7 @@
 # Job map (every lane-owned module executes in exactly one job,
 # except the deferred arm64 portability suite, which runs in none
 # yet -- see below):
-# unit runs the unit lane through the lane runner (26 modules,
+# unit runs the unit lane through the lane runner (27 modules,
 # anywhere); compiler runs --lane compiler (84 modules:
 # compiler/tests,
 # tests/elf|ir|compile|differential, tests/core, codegen_cost,
@@ -449,6 +449,9 @@ jobs:
         # skip counts only when the VM gate variable is off (a
         # needs-failure skip with the variable on is a failure).
         # The provisioning hint prints only for gate-off skips.
+        # Gate-off skips render as NOT RUN (neutral) in the job
+        # summary: the commit status stays green for branch
+        # protection, but the summary never claims executed lanes.
         run: |
           echo "unit=${{ needs.unit.result }} compiler=${{ needs.compiler.result }} package=${{ needs.package.result }} vm-matrix=${{ needs.vm-matrix.result }} vm-merge=${{ needs.vm-merge.result }}"
           fail=0
@@ -463,6 +466,21 @@ jobs:
               *) fail=1 ;;
             esac
           done
+          {
+            echo "## VM matrix status"
+            echo ""
+            echo "unit: ${{ needs.unit.result }}"
+            echo "compiler: ${{ needs.compiler.result }}"
+            echo "package: ${{ needs.package.result }}"
+            echo "vm-matrix: ${{ needs.vm-matrix.result }}"
+            echo "vm-merge: ${{ needs.vm-merge.result }}"
+            echo ""
+            if [ "${{ needs.compiler.result }}" = "skipped" ] && [ "${{ vars.MOJOBPF_VM_RUNNER }}" != "true" ]; then
+              echo "compiler/package/VM: NOT RUN (runner not provisioned)"
+              echo ""
+              echo "Only the unit lane executed on GitHub-hosted runners. Provision the mojobpf-vm self-hosted runner and set repo variable MOJOBPF_VM_RUNNER=true (see workflow header) to run the remaining lanes."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
           if [ "$fail" != "0" ]; then
             echo "CI failed: see the job results above"
             exit 1

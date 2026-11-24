@@ -86,6 +86,18 @@ def test_workflow_status_asserts_every_job():
         assert ('needs.%s.result' % job) in text, job
 
 
+def test_workflow_status_reports_not_run_summary():
+    # Gate-off skips must render as NOT RUN in the job summary
+    # (neutral): the commit status may stay green, but the summary
+    # never claims executed lanes. Pin the exact sentence.
+    text = _workflow_text()
+    assert 'GITHUB_STEP_SUMMARY' in text
+    assert (
+        'compiler/package/VM: NOT RUN (runner not provisioned)'
+    ) in text
+    assert 'Only the unit lane executed' in text
+
+
 def test_workflow_matrix_requires_a_provisioned_target_lease():
     # The matrix never synthesizes a lease: the shard must fail
     # fast when the runner exports none.
