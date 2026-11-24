@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Keep the SHA-pinned Actions in .github/workflows/ fresh with update
+# PRs. Actions only: every other input stays deliberately pinned.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
