@@ -18,9 +18,9 @@ count bound to its scope.
 
 * 6-verb CLI (`build`, `check`, `doctor`, `inspect`,
   `verify`, `test`); SDK surface 1.8 (eight Mojo modules);
-  8 target profiles (`linux-bpfel-v3` base plus `-core`,
-  `-hash`, `-lru`, `-net`, `-reserve`, `-subprog`,
-  `-uprobe`); 12 examples.
+  2 stable target profiles (`linux-bpfel-v3` base plus
+  `-hash`) with 6 preview profiles (`-core`, `-lru`, `-net`,
+  `-reserve`, `-subprog`, `-uprobe`); 12 examples.
 * Guest board 56/56: 28 gating suites (41 registry minus
   `kernel-joint`, `kernel-percpu-hash`, and 11 nightly
   `kernel-isa-*`, including the `kernel-isa-cpu` smoke) on
@@ -34,6 +34,9 @@ count bound to its scope.
 
 ## Preview set
 
+* Six preview profiles (`-core`, `-lru`, `-net`, `-reserve`,
+  `-subprog`, `-uprobe`): present and tested, no stability
+  promise; promotion needs a gating board plus a label change.
 * 7.x lanes (7.0.14, 7.2, 7.4-rc1 pins) and the 11 nightly
   ISA suites: run green in the non-gating appendix board
   (84/84 + 11 cells), reported outside the claim tally.

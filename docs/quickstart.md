@@ -44,7 +44,7 @@ pip wheel . --no-deps --no-build-isolation -w dist
 
 ```text
   Building wheel for mojobpf (pyproject.toml): finished with status 'done'
-  Created wheel for mojobpf: filename=mojobpf-1.0.1-py3-none-any.whl size=519650 sha256=7dfc8e02b559b126fba4fb1d1f5faf7e6527f1b387d0d1626cf5087cfeab04f4
+  Created wheel for mojobpf: filename=mojobpf-1.0.1-py3-none-any.whl size=519944 sha256=b18f0ba463400c4b4999462b302aa3a8f8a10158540845e38d8d9a1d37d39670
 Successfully built mojobpf
 ```
 
@@ -113,16 +113,17 @@ tool mojo: present Mojo 1.2.0 (2016d0cd) at <mojo-on-PATH>
 tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>
 tool bpftool: present bpftool v7.6.0 at <bpftool-on-PATH>
 tool python: present 3.14.8 at <resolved-python-on-PATH>
-target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-lru, linux-bpfel-v3-net, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
+target candidates: linux-bpfel-v3, linux-bpfel-v3-core (preview), linux-bpfel-v3-hash, linux-bpfel-v3-lru (preview), linux-bpfel-v3-net (preview), linux-bpfel-v3-reserve (preview), linux-bpfel-v3-subprog (preview), linux-bpfel-v3-uprobe (preview)
 kernel tests: runner available at <vng-on-PATH>
 ```
 
 `doctor` changes nothing. Every tool must read `present`; a
 missing tool is reported, never silently worked around. The
-candidate list names every admitted profile: eight are
-supported. `linux-bpfel-v3-percpu-hash` is refused at the
-admission layer; its kernel suite stays in-tree as a refusal
-guard (see [compatibility](compatibility.md)).
+candidate list names every admitted profile with its tier:
+two are stable, six are preview. `linux-bpfel-v3-percpu-hash`
+is refused at the admission layer; its kernel suite stays
+in-tree as a refusal guard (see
+[compatibility](compatibility.md)).
 
 ## 4. Write the counter project
 

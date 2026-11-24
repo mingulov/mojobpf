@@ -47,9 +47,9 @@ Merged report sha256:
 
 7.x lanes (7.0.14, 7.2, 7.4-rc1 pins still in
 `ci/kernels.lock.json`) were not part of this board; the
-non-gating appendix board is pending runner time and its
-results will be published as an appendix, never merged
-into the claim tally.
+non-gating appendix board ran green after it (84/84 cells
+plus 11/11 ISA cells) and its results are published as an
+appendix, never merged into the claim tally.
 
 > [TBD: 7.4 RC correction sentence pending owner wording
 > approval.]

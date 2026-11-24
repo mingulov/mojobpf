@@ -9,16 +9,17 @@ proof.
 
 ## Supported profiles
 
-Eight target profiles are supported: `linux-bpfel-v3`
-(little-endian BPF, CPU v3, XDP programs plus the
-`syscalls:sys_enter_getpid` tracepoint counter and event
+Two target profiles are stable in this release:
+`linux-bpfel-v3` (little-endian BPF, CPU v3, XDP programs plus
+the `syscalls:sys_enter_getpid` tracepoint counter and event
 programs, `core_supported = false`, `subprog_supported =
-false`), `linux-bpfel-v3-core` (everything the base profile
-admits, plus the 4096-byte opaque core map value and
-validated CO-RE relocation records, `core_supported =
-true`), `linux-bpfel-v3-hash` (everything the base profile
+false`) and `linux-bpfel-v3-hash` (everything the base profile
 admits, plus hash maps with `u32` keys and `u64` values in
-1-4 entries, `core_supported = false`),
+1-4 entries, `core_supported = false`). Six further profiles
+ship as preview (present and tested, no stability promise):
+`linux-bpfel-v3-core` (everything the base profile admits,
+plus the 4096-byte opaque core map value and validated CO-RE
+relocation records, `core_supported = true`),
 `linux-bpfel-v3-lru` (everything the base profile admits, plus
 LRU hash maps with `u32` keys and `u64` values in 1-4 entries,
 reusing the lookup/update/delete helpers, `core_supported =
@@ -83,7 +84,7 @@ retained implementation without claiming the kind.
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
 | Loader/observer | `bpftool` 7.6.0 with libbpf 1.6, unmodified |
 | Guest runner | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration on x86-64; one named TCG fallback lane (`v6.12-tcg`) for the no-KVM spot-proof only |
-| Guest kernels | five claimed (see below). Lanes in `ci/kernels.lock.json`: 6.12.0-061200-generic, 6.6.0-060600-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc1-generic (Ubuntu mainline builds, pinned by hash) |
+| Guest kernels | two green (see below); 7.x lanes observed in the appendix only. Lanes in `ci/kernels.lock.json`: 6.12.0-061200-generic, 6.6.0-060600-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc1-generic (Ubuntu mainline builds, pinned by hash) |
 
 Full binary hashes live in `toolchains.lock.json` (host tools)
 and `ci/kernels.lock.json` (guest runner plus the pinned

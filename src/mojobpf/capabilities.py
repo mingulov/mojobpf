@@ -338,6 +338,18 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
 
 SUPPORTED_PROFILE_IDS = tuple(SUPPORTED_PROFILES)
 
+# Release tiering (O-4): base + hash are stable; every other
+# supported profile ships as preview (present and tested, no
+# stability promise). `reserve` joins stable only if a claimed
+# events example requires it (it does not: the claimed events
+# example targets the base profile). Promotion needs a gating
+# board plus a label change; this tuple is the single source
+# for user-facing tier labels.
+STABLE_PROFILE_IDS = (
+    "linux-bpfel-v3",
+    "linux-bpfel-v3-hash",
+)
+
 # Generated admission descriptor (see
 # ``tools/generate_adapter_resources.py``): the runtime admission
 # artifact derived from ``SUPPORTED_PROFILES`` and shipped

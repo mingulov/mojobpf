@@ -110,6 +110,7 @@ from .execution import filter_spawn_ambient
 from .inspect import InspectionError, inspect_object, verify_object
 from .manifest import (
     SUPPORTED_PROFILE_IDS,
+    STABLE_PROFILE_IDS,
     ManifestError,
     ProfileError,
     lookup_profile,
@@ -501,7 +502,13 @@ def _command_doctor(args) -> int:
             % (lockfile, report.lockfile_status, qualifier)
         )
     sys.stdout.write(
-        "target candidates: %s\n" % ", ".join(SUPPORTED_PROFILE_IDS)
+        "target candidates: %s\n"
+        % ", ".join(
+            profile_id
+            if profile_id in STABLE_PROFILE_IDS
+            else "%s (preview)" % profile_id
+            for profile_id in SUPPORTED_PROFILE_IDS
+        )
     )
     if kernel_capable:
         sys.stdout.write(

@@ -4516,6 +4516,44 @@ def test_doctor_is_informational_discovery():
         shutil.rmtree(parent, ignore_errors=True)
 
 
+def test_doctor_labels_preview_profiles():
+    """O-4: base + hash render bare; every other supported
+    profile renders with a (preview) marker. The stable set is
+    a subset of the supported set by construction."""
+    from mojobpf.manifest import (
+        STABLE_PROFILE_IDS,
+        SUPPORTED_PROFILE_IDS,
+    )
+
+    assert set(STABLE_PROFILE_IDS) < set(SUPPORTED_PROFILE_IDS)
+    assert set(STABLE_PROFILE_IDS) == {
+        "linux-bpfel-v3",
+        "linux-bpfel-v3-hash",
+    }
+    parent = tempfile.mkdtemp(prefix="cli-doctor-tiers-")
+    try:
+        empty = tempfile.mkdtemp(prefix="empty-path-", dir=parent)
+        code, out, _ = _run_cli(["doctor"], path=empty)
+        assert code == 0, out
+        line = next(
+            text for text in out.splitlines() if "target candidates:" in text
+        )
+        # Exact token comparison: base is a prefix of every other
+        # id, so substring checks would pass with base dropped.
+        rendered = [
+            token.strip()
+            for token in line.split("target candidates:")[1].split(",")
+        ]
+        assert rendered == [
+            profile_id
+            if profile_id in STABLE_PROFILE_IDS
+            else "%s (preview)" % profile_id
+            for profile_id in SUPPORTED_PROFILE_IDS
+        ], line
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def test_check_without_lockfile_reports_unvalidated():
     """F-031: check without --lockfile reports discovery and fails
     (exit 3), saying the pins are not validated. F-031 permits

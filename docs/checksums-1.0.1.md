@@ -12,7 +12,7 @@ the docs carrying this release record do not enter the
 wheel):
 
 ```text
-mojobpf-1.0.1-py3-none-any.whl size=519650 sha256=7dfc8e02b559b126fba4fb1d1f5faf7e6527f1b387d0d1626cf5087cfeab04f4
+mojobpf-1.0.1-py3-none-any.whl size=519944 sha256=b18f0ba463400c4b4999462b302aa3a8f8a10158540845e38d8d9a1d37d39670
 ```
 
 The wheel carries no docs and no tests, so these contents
@@ -37,8 +37,8 @@ d329b14116322263156dce1b3e2d90eef2c8953cfe9bb8f58408dfea48a752f9  mojobpf-1.0.1.
 e48385efc38aa27616f36ba002522825718d4daf21205f4fa8ec0247a18f8af3  mojobpf-1.0.1.data/data/share/mojobpf/schemas/run-plan.schema.json
 3e840d7bdf26bd91d8dcea6c3158de7bd3801a97650d4fa11502908ca98d741c  mojobpf-1.0.1.data/data/share/mojobpf/schemas/size-budget.schema.json
 d5b25ab6c67fad351e0828e8918f6f7235babfdb6a2a39d1222c1d9aaa67ba21  mojobpf-1.0.1.data/data/share/mojobpf/schemas/target.schema.json
-465c401d2c2cc8ed545e686348b87f0ebe22ae13583af5c3d7790e3dea466349  mojobpf-1.0.1.dist-info/METADATA
-9f48f7e2f6cb4340be9ca8ac06bda2cf2785f00522a093f3e522f25e2fe92f9e  mojobpf-1.0.1.dist-info/RECORD
+a3b8b668b8ef28f4ec22e82a4acd72cffaeb0b506f3e1e3716334d7291651572  mojobpf-1.0.1.dist-info/METADATA
+9d969848d04caa6fb9dd143c1f079076a0a284276074284ee4df2ff850448c0c  mojobpf-1.0.1.dist-info/RECORD
 c14c80f0e6ae95195b7f032d990b2f367806af140702f90a72f466762ce5262d  mojobpf-1.0.1.dist-info/WHEEL
 da2d8979ab63f4b4934949fb308f344c026f5786d1c61c58571fb5227c87b019  mojobpf-1.0.1.dist-info/entry_points.txt
 4244bc559163163a605d3c3135f3115d04e2bb937a37ab5fb6f13194931db8bf  mojobpf-1.0.1.dist-info/licenses/LICENSE
@@ -46,8 +46,8 @@ da2d8979ab63f4b4934949fb308f344c026f5786d1c61c58571fb5227c87b019  mojobpf-1.0.1.
 45c93ebd92be7696a5a84b824c30dd91063275556c8808065abcb1b8d5025855  mojobpf-1.0.1.dist-info/top_level.txt
 07cb3652eeb2497b8df73cb2ccf1b904a0d9550ea6c2d27af5b0419fd5e51f84  mojobpf/__init__.py
 e1feb3401fd508de224199fc6adeb306f07119eb11efbd1b578ede9cc90ef451  mojobpf/build.py
-1b43647aa74d1f1919e70b71c5a08d7bbed80ac67ccab798f8f3164cf0a98441  mojobpf/capabilities.py
-7161f16c013cfdcc1cfda27ec0dc9cf4512072b5d001fad294dc0e1a15ada27b  mojobpf/cli.py
+7b48620032dd70cf41200ea38ad32a43fa210bbfe1dc0425dbcb757c7585cb5c  mojobpf/capabilities.py
+b23fc4ea2ba36fbf2636421d3afedb8f0bac02e37012359da2e721bfc618a30a  mojobpf/cli.py
 48d11f8960f87cc48236fdfd9d82444f943e41a65ad71cb56c94486acb0cf618  mojobpf/diagnostics.py
 b54ac9eb3d77c1e3e895ad8245b63bfb8fa3f8aaf82b469d84684b4c9527959f  mojobpf/elf_reader.py
 2428fbaf1c4d8135009ff20f47638a148218f1cce07831a681fe25f351976884  mojobpf/events.py
@@ -56,7 +56,7 @@ de185bd254c9a6461b036e20a0d50ed90e4908a9c8cb213eda79f06f16070a50  mojobpf/execut
 9ee52a53093dd2a5917533e4a4fe84a60b21a5eaa7a6d4870268603615754b16  mojobpf/helpers.py
 88280e0dfae7ea9036b23eaf76ac8a916ad079c335c417e01321d9968907805a  mojobpf/inputs.py
 dd8f3fa4a6862933b038940bc430a2392633c306d6a01dce6f50808307e772fb  mojobpf/inspect.py
-1034e26d410242d41b7a3b0a95c05377a7422508a11b4e65156f2023a458ce0a  mojobpf/manifest.py
+2d8b7881166673bafd7229bbfb507021592efe5bcb51df611342824318335530  mojobpf/manifest.py
 c57e93e0c2d8e5e48af9f36c579442b7980aa0db25c88fc75a5b186b115b03b2  mojobpf/models.py
 284281af90426328304ae425721886bc39e288ddf35fea836302e7afe9636af6  mojobpf/native_adapter.py
 6b4a08d7ec254b07aa0c5e6333b0d30665d1569c75d6c10e9722ed0b3e9372be  mojobpf/process_guardian.py

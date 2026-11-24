@@ -40,6 +40,7 @@ from pathlib import Path
 from .capabilities import (
     SUPPORTED_PROFILE_IDS,
     SUPPORTED_PROFILES,
+    STABLE_PROFILE_IDS,
     ProfileError,
     TargetProfile,
     lookup_profile,
@@ -75,10 +76,11 @@ class ManifestError(MojobpfError):
 
 
 # The target-profile registry (ProfileError, TargetProfile,
-# SUPPORTED_PROFILES, SUPPORTED_PROFILE_IDS, profile_digest,
-# lookup_profile) lives in :mod:`mojobpf.capabilities` and is
-# re-exported here (see the import above) so existing
-# ``mojobpf.manifest`` importers keep working.
+# SUPPORTED_PROFILES, SUPPORTED_PROFILE_IDS,
+# STABLE_PROFILE_IDS, profile_digest, lookup_profile) lives in
+# :mod:`mojobpf.capabilities` and is re-exported here (see the
+# import above) so existing ``mojobpf.manifest`` importers keep
+# working.
 
 
 @dataclass(frozen=True)
