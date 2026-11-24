@@ -48,9 +48,9 @@ its own qualifying run.
   [evidence](evidence-1.0.2.md)).
 * Capability registry: 147 IMPLEMENTED of 1451 records
   (1304 PLANNED) at the candidate tree.
-* Host lanes: unit 27/27 modules (TBD nodes), compiler
-  84/84 modules (TBD nodes), package 2/2 modules, smoke 4/4
-  modules (TBD nodes), re-run green on the release commit
+* Host lanes: unit 27/27 modules (1932 nodes), compiler
+  84/84 modules (5133 nodes), package 2/2 modules, smoke 4/4
+  modules (79 nodes), re-run green on the release commit
   (see [evidence](evidence-1.0.2.md)).
 
 ## What changed in 1.0.2
@@ -101,7 +101,7 @@ its own qualifying run.
 ## Known issues
 
 * The 1.0.0 module-18 subtests-closure gap shows no in-lane
-  failure in this cut (compiler TBD (T8)); kept listed until
+  failure in this cut (compiler 84/84); kept listed until
   the mechanism is independently closed.
 * CI executes the unit lane only on hosted runners
   (compiler/package/VM: NOT RUN until a runner is
