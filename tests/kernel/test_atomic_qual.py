@@ -118,7 +118,7 @@ ACQREL_LANE = {
     "v6.6": "refuse",
     "v7.0.14": "accept",
     "v7.2": "accept",
-    "v7.4-rc1": "accept",
+    "v7.4-rc4": "accept",
 }
 
 

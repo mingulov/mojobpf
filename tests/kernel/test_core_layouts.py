@@ -13,7 +13,7 @@ that lane's kernel BTF. Run once per lane directly::
     MOJOBPF_VNG_RELEASE=v6.6 python3 tests/kernel/test_core_layouts.py
     MOJOBPF_VNG_RELEASE=v7.0.14 python3 tests/kernel/test_core_layouts.py
     MOJOBPF_VNG_RELEASE=v7.2 python3 tests/kernel/test_core_layouts.py
-    MOJOBPF_VNG_RELEASE=v7.4-rc1 python3 tests/kernel/test_core_layouts.py
+    MOJOBPF_VNG_RELEASE=v7.4-rc4 python3 tests/kernel/test_core_layouts.py
 
 Route-equivalence runs rebuild the probe parsed::
 
@@ -128,9 +128,9 @@ LANE_MARKERS = {
     "v6.12": MARKER_612,
     "v7.0.14": MARKER_70,
     "v7.2": MARKER_72,
-    "v7.4-rc1": MARKER_74,
+    "v7.4-rc4": MARKER_74,
 }
-LANES = ("v6.6", "v6.12", "v7.0.14", "v7.2", "v7.4-rc1")
+LANES = ("v6.6", "v6.12", "v7.0.14", "v7.2", "v7.4-rc4")
 
 # Mutant provenance: (tag, [(old, new, expected_count)], pinned log text).
 # Counts are asserted so silent IR drift fails the build loudly.
@@ -623,7 +623,7 @@ def guest_run():
         off612=facts["v6.12"]["pid_off"],
         off70=facts["v7.0.14"]["pid_off"],
         off72=facts["v7.2"]["pid_off"],
-        off74=facts["v7.4-rc1"]["pid_off"],
+        off74=facts["v7.4-rc4"]["pid_off"],
         m66=MARKER_66,
         m612=MARKER_612,
         m70=MARKER_70,
@@ -732,32 +732,32 @@ def test_lane_layout_facts():
     assert facts["v6.12"]["pid_off"] == 2752, "v6.12 pid offset must be 2752"
     assert facts["v7.0.14"]["pid_off"] == 2800, "v7.0.14 pid offset must be 2800"
     assert facts["v7.2"]["pid_off"] == 2872, "v7.2 pid offset must be 2872"
-    assert facts["v7.4-rc1"]["pid_off"] == 2936, "v7.4-rc1 pid offset must be 2936"
+    assert facts["v7.4-rc4"]["pid_off"] == 2936, "v7.4-rc4 pid offset must be 2936"
     assert facts["v6.6"]["scx"] is False, "v6.6 must lack task_struct.scx"
     assert facts["v6.12"]["scx"] is True, "v6.12 must have task_struct.scx"
     assert facts["v7.0.14"]["scx"] is True, "v7.0.14 must have task_struct.scx"
     assert facts["v7.2"]["scx"] is True, "v7.2 must have task_struct.scx"
-    assert facts["v7.4-rc1"]["scx"] is True, "v7.4-rc1 must have task_struct.scx"
+    assert facts["v7.4-rc4"]["scx"] is True, "v7.4-rc4 must have task_struct.scx"
     assert facts["v6.6"]["blocked_on"] is False, "v6.6 must lack blocked_on"
     assert facts["v6.12"]["blocked_on"] is False, "v6.12 must lack blocked_on"
     assert facts["v7.0.14"]["blocked_on"] is True, "v7.0.14 must have blocked_on"
     assert facts["v7.2"]["blocked_on"] is True, "v7.2 must have blocked_on"
-    assert facts["v7.4-rc1"]["blocked_on"] is True, "v7.4-rc1 must have blocked_on"
+    assert facts["v7.4-rc4"]["blocked_on"] is True, "v7.4-rc4 must have blocked_on"
     assert facts["v6.6"]["futex"] is False, "v6.6 must lack futex"
     assert facts["v6.12"]["futex"] is False, "v6.12 must lack futex"
     assert facts["v7.0.14"]["futex"] is False, "v7.0.14 must lack futex"
     assert facts["v7.2"]["futex"] is True, "v7.2 must have futex"
-    assert facts["v7.4-rc1"]["futex"] is True, "v7.4-rc1 must have futex"
+    assert facts["v7.4-rc4"]["futex"] is True, "v7.4-rc4 must have futex"
     assert facts["v6.6"]["ipi_mask"] is False, "v6.6 must lack ipi_mask"
     assert facts["v6.12"]["ipi_mask"] is False, "v6.12 must lack ipi_mask"
     assert facts["v7.0.14"]["ipi_mask"] is False, "v7.0.14 must lack ipi_mask"
     assert facts["v7.2"]["ipi_mask"] is False, "v7.2 must lack ipi_mask"
-    assert facts["v7.4-rc1"]["ipi_mask"] is True, "v7.4-rc1 must have ipi_mask"
+    assert facts["v7.4-rc4"]["ipi_mask"] is True, "v7.4-rc4 must have ipi_mask"
     assert facts["v6.6"]["count"] == 260, "v6.6 member count must be 260"
     assert facts["v6.12"]["count"] == 270, "v6.12 member count must be 270"
     assert facts["v7.0.14"]["count"] == 272, "v7.0.14 member count must be 272"
     assert facts["v7.2"]["count"] == 273, "v7.2 member count must be 273"
-    assert facts["v7.4-rc1"]["count"] == 276, "v7.4-rc1 member count must be 276"
+    assert facts["v7.4-rc4"]["count"] == 277, "v7.4-rc4 member count must be 277"
 
 
 def test_reader_relocations():

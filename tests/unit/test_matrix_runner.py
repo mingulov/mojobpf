@@ -643,7 +643,7 @@ def test_load_lock_accepts_the_committed_lock():
     )
     assert [lane["id"] for lane in lock["lanes"]] == [
         "v6.12-kvm", "v6.6-kvm", "v7.0.14-kvm",
-        "v7.2-kvm", "v7.4-rc1-kvm", "v6.12-tcg",
+        "v7.2-kvm", "v7.4-rc4-kvm", "v6.12-tcg",
     ]
 
 

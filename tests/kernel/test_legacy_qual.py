@@ -70,7 +70,7 @@ MSH_MESSAGE_LANE = {
     "v6.6": MSH_MESSAGE,
     "v7.0.14": MSH_MESSAGE,
     "v7.2": "unknown opcode b1",
-    "v7.4-rc1": "unknown opcode b1",
+    "v7.4-rc4": "unknown opcode b1",
 }
 
 

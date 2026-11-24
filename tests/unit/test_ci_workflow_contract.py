@@ -134,7 +134,7 @@ def test_matrix_exclusions_are_pinned_and_valid():
         'v6.6-kvm': ('kernel-joint', 'kernel-percpu-hash'),
         'v7.0.14-kvm': ('kernel-joint', 'kernel-percpu-hash'),
         'v7.2-kvm': ('kernel-joint', 'kernel-percpu-hash'),
-        'v7.4-rc1-kvm': ('kernel-joint', 'kernel-percpu-hash'),
+        'v7.4-rc4-kvm': ('kernel-joint', 'kernel-percpu-hash'),
         'v6.12-tcg': ('kernel-joint', 'kernel-percpu-hash'),
     }
     lock = json.loads(

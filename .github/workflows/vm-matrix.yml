@@ -340,7 +340,7 @@ jobs:
           - v6.6-kvm
           - v7.0.14-kvm
           - v7.2-kvm
-          - v7.4-rc1-kvm
+          - v7.4-rc4-kvm
           - v6.12-tcg
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -425,7 +425,7 @@ jobs:
         run: >-
           python3 ci/run_vm_tests.py --merge
           shards/*/matrix-report.json
-          --expect-lanes v6.12-kvm,v6.6-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc1-kvm,v6.12-tcg
+          --expect-lanes v6.12-kvm,v6.6-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc4-kvm,v6.12-tcg
           --out-dir matrix-out
       - name: show the merged board
         if: always()

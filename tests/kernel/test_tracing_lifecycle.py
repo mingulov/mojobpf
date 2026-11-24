@@ -139,7 +139,7 @@ SPLIT_MAP_LANE = {
     "v6.6": False,
     "v7.0.14": True,
     "v7.2": True,
-    "v7.4-rc1": True,
+    "v7.4-rc4": True,
 }
 
 GUEST_TIMEOUT = 900

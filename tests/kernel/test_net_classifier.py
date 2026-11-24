@@ -87,13 +87,17 @@ SHORT_LANE = {
     "v6.6": 0,
     "v7.0.14": 1,
     "v7.2": 1,
-    "v7.4-rc1": 1,
+    "v7.4-rc4": 1,
 }
 # TC/socket test-run minimum on refusing releases: frames
 # shorter than this are kernel-refused (EINVAL). Probed on
-# all 7.x lanes (7.0.14, 7.2, 7.4-rc1), TC and socket alike:
-# every length 14..33 refuses, 34 runs (full 16..64 sweep).
-# XDP legs run 14-byte frames on the same kernels.
+# 7.0.14 and 7.2, TC and socket alike, at the checked-in
+# corpus lengths (14, 15, 16 refuse; 33 refuses; 34 and 64
+# run): lengths outside that set are unobserved, and a drift
+# there would NOT fail loudly. The rc4 entry carries the rc1
+# observation forward at the same checked-in lengths; the
+# release board re-proves exactly those. XDP legs run
+# 14-byte frames on the same kernels.
 NET_REFUSE_LEN = 34
 VNG_TIMEOUT = 900
 

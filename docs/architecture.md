@@ -424,11 +424,12 @@ below names the current pins. The 0.3.0a1 alpha record (see
 [evidence-0.3.0a1.md](evidence-0.3.0a1.md)) observed the
 measured behaviors on LLVM 22.1.8 with bpftool 7.6.0 /
 libbpf 1.6 under software emulation; the v1.0.1 release
-matrix re-proves them on two KVM lanes (56/56 cells; see
-[evidence-1.0.1.md](evidence-1.0.1.md); board commit
-330226e; see the compatibility two-kernel board), which
-run green on kernels 6.6.0 and 6.12.0 (scope/claim framing
-pending O-2 owner words). Other
+matrix boards them on five KVM lanes (28-suite x 5-lane
+gating scope; verdict pending in
+[evidence-1.0.1.md](evidence-1.0.1.md); see the compatibility
+five-lane board description), covering kernels 6.6.0, 6.12.0,
+7.0.14, 7.2.0, and the exact 7.4.0-070400rc4 build
+(scope/claim framing pending O-2 owner words). Other
 combinations are unproven, not supported. Full binary paths
 and hashes are recorded in `toolchains.lock.json`; rerun
 `tests/probes/toolchain_inventory.py` to re-probe any machine.
@@ -438,7 +439,7 @@ and hashes are recorded in `toolchains.lock.json`; rerun
 | Mojo compiler | 1.2.0 (`2016d0cd`), pixi-pinned from the Modular channel |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, cpu `v3` |
 | Loader/observer | bpftool 7.6.0 with libbpf 1.6, unmodified |
-| Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; claimed kernels 6.12.0, 6.6.0, 7.0.14, 7.2.0, 7.4.0-rc1 plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
+| Guest lanes | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration; gating lanes 6.12.0, 6.6.0, 7.0.14, 7.2.0, 7.4.0-rc4-exact plus the named `v6.12-tcg` fallback for the no-KVM spot-proof |
 | Host drivers | Python 3.11+ (3.14.8 observed), pixi-managed Mojo environment, standard library only |
 | C reference | Clang 22.1.8 builds the independent C controls and fixtures in `tests/reference_c/` (XDP controls, ring-buffer controls, license witness pair, map references) |
 
@@ -505,15 +506,15 @@ of them is implied by the results above:
   verdicts (see the compatibility documentation); every other
   Mojo/LLVM combination, every `llc` backend version but
   22.1.8, every host architecture but x86-64, and big-endian
-  BPF still need theirs. The green x86-64 lanes (6.12.0 and
-  6.6.0, both KVM) are pinned in `ci/kernels.lock.json` and
-  driven by `ci/run_vm_tests.py`, with per-lane loop-shape
-  verdicts pinned (both lanes pass under the pinned 1.2.0
-  frontend; see the compatibility documentation); each green
-  lane passes its full 28-suite gating scope (56/56 cells;
-  see
-  [evidence-1.0.1.md](evidence-1.0.1.md); board commit
-  330226e; see the compatibility two-kernel board). The named
+  BPF still need theirs. The five gating x86-64 lanes (6.12.0,
+  6.6.0, 7.0.14, 7.2.0, and exact 7.4.0-070400rc4, all KVM)
+  are pinned in `ci/kernels.lock.json` and driven by
+  `ci/run_vm_tests.py`, with per-lane loop-shape verdicts
+  pinned under the pinned 1.2.0 frontend (see the
+  compatibility documentation); each gating lane must pass
+  its full 28-suite scope, with the merged verdict pending in
+  [evidence-1.0.1.md](evidence-1.0.1.md) (see the
+  compatibility five-lane board description). The named
   `v6.12-tcg` fallback is a two-suite spot-proof lane
   (kernel-xdp + kernel-map), not a claimed kernel. Each
   proof above names the suite that demonstrates it.
@@ -592,9 +593,10 @@ of them is implied by the results above:
   absence (`compiler/audit.py`).
 - The stack-slot and int-to-pointer cast assembly spellings are
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
-  lifetime-marker skew, re-qualified under the pinned Mojo 1.2.0
-  (28-suite x 2-lane board green: 56/56 cells, 0 red; board
-  commit 330226e — see the compatibility two-kernel board);
+  lifetime-marker skew, qualified under the pinned Mojo 1.2.0
+  on the prior boards; the 28-suite x 5-lane release board
+  will re-prove them (verdict pending in the evidence record —
+  see the compatibility five-lane board description);
   they must be revisited if a future Mojo emits
   backend-compatible IR for those constructs.
 - Content-derived variable packet offsets (loading one packet byte

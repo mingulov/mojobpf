@@ -171,7 +171,7 @@ SUITES = (
 # suite runs per-suite with the env and rejoins when CI
 # provisions it. kernel-core-layouts needs recorded
 # task_struct layouts, which now exist for all five
-# KVM lanes (v6.6/v6.12/v7.0.14/v7.2/v7.4-rc1).
+# KVM lanes (v6.6/v6.12/v7.0.14/v7.2/v7.4-rc4).
 # kernel-percpu-hash is excluded everywhere: no profile admits
 # the per-CPU-hash kind (MBPF101 at inspection/preflight), so the
 # suite has no parsed-route proof (its parsed route refuses by
@@ -182,7 +182,7 @@ LANE_SUITE_EXCLUSIONS = {
     "v6.6-kvm": ("kernel-joint", "kernel-percpu-hash"),
     "v7.0.14-kvm": ("kernel-joint", "kernel-percpu-hash"),
     "v7.2-kvm": ("kernel-joint", "kernel-percpu-hash"),
-    "v7.4-rc1-kvm": ("kernel-joint", "kernel-percpu-hash"),
+    "v7.4-rc4-kvm": ("kernel-joint", "kernel-percpu-hash"),
     "v6.12-tcg": ("kernel-joint", "kernel-percpu-hash"),
 }
 
@@ -896,7 +896,7 @@ SUITE_DENIAL_OVERRIDES = {
             "test_atomic_mutation_aborts", "RUNTIME"
         ),
     },
-    ("kernel-isa-atomic", "v7.4-rc1"): {
+    ("kernel-isa-atomic", "v7.4-rc4"): {
         "test_atomic_stale_object_fails": (
             "test_atomic_mutation_aborts", "RUNTIME"
         ),

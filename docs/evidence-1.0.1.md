@@ -2,56 +2,53 @@
 
 # MojoBPF 1.0.1 evidence summary
 
-The release regression anchor: the full matrix below ran
-green on the release tree. The 28x2 KVM board ran at
-`330226eeab2d309093595b1eb4b631c727884dca` with a clean
-tree (the runner refuses dirty trees and re-checks the
-commit mid-run) via per-lane runs plus a scoped merge
-(`--expect-lanes` + `--expect-suites`, exact within the
-declared scope): 56/56 lane-suites pass, 0 red,
-0 unexplained, 0 environment failures on claimed cells.
+This page anchors the release matrix: the 28x5 KVM release
+board runs at one clean commit (the runner refuses dirty
+trees and re-checks the commit mid-run) via per-lane runs
+plus a scoped merge (`--expect-lanes` + `--expect-suites`,
+exact within the declared scope), targeting 140/140
+lane-suites with 0 red, 0 unexplained, and 0 environment
+failures on claimed cells. The verdict lines below fill in
+when the board lands; until then this page describes the
+scope plus prior observations, not a result.
 
 > [TBD: scope/claim sentences pending O-2 owner words. The
-> numbers in this document are observed and final; the
-> sentences that turn them into release claims are not
-> written yet.]
+> scope numbers below are decided; the verdict lines fill in
+> when the release board lands; the sentences that turn them
+> into release claims are not written yet.]
 
-Release commit: the commit carrying this document (a
-docs-only amendment of the matrix commit named above; no
-`.py` under `tests/`, `src/`, or `ci/` references it and
-no suite reads `docs/` except the subset-doc gate, which
-re-passes on the release tree).
-Matrix commit: `330226eeab2d309093595b1eb4b631c727884dca`.
+Release commit: the commit carrying the merged release board
+verdict named below.
+Matrix commit: <filled by the release board run>.
 
 Tally arithmetic: 41 registry suites minus `kernel-joint`
 (stays excluded, unclaimed) minus `kernel-percpu-hash`
 (non-gating exclusion) minus the 11 nightly `kernel-isa-*`
 suites = 28 gating suites, including the `kernel-isa-cpu`
-ISA smoke; 28 suites x 2 lanes (6.6 + 6.12) = 56 cells.
+ISA smoke; 28 suites x 5 lanes (6.6 + 6.12 + 7.0.14 + 7.2 +
+exact 7.4.0-070400rc4) = 140 cells.
 
 ## Anchor board
 
 | Suite | Command | Result |
 |---|---|---|
-| Unit | `pixi run test-unit` | 27/27 modules exit 0 (1931 nodes) |
-| Compiler | `pixi run test-compiler` | 84/84 modules exit 0 (5112 nodes); the 1.0.0 module-18 subtests-closure gap shows no in-lane failure in this cut |
-| Package | `pixi run test-package` | 2/2 modules exit 0 (sdist membership + wheel contents) |
-| Smoke | `pixi run test-smoke` | 4/4 modules exit 0 (79 nodes) |
-| VM matrix, 6.6 lane | `python3 ci/run_vm_tests.py --lane v6.6-kvm --suite <each of 28> --out-dir <lane> --consumer-path <independent-toolchain>` | 28/28 pass |
-| VM matrix, 6.12 lane | (same per-suite runs) | 28/28 pass |
-| Scoped merge | `python3 ci/run_vm_tests.py --merge <lane-6.6> <lane-6.12> --expect-lanes v6.6-kvm,v6.12-kvm --expect-suites <28>` | exit 0; 56/56 lane-suites passed |
+| Unit | `pixi run test-unit` | re-run pending post-migration (was 27/27 at 330226e) |
+| Compiler | `pixi run test-compiler` | re-run pending post-migration (was 84/84 at 330226e; the 1.0.0 module-18 subtests-closure gap shows no in-lane failure in this cut) |
+| Package | `pixi run test-package` | re-run pending post-migration (was 2/2 at 330226e) |
+| Smoke | `pixi run test-smoke` | re-run pending post-migration (was 4/4 at 330226e) |
+| VM matrix, per lane | `python3 ci/run_vm_tests.py --lane <lane> --suite <each of 28> --out-dir <lane> --consumer-path <independent-toolchain>` | verdict pending the release run (28/28 per lane expected) |
+| Scoped merge | `python3 ci/run_vm_tests.py --merge <5 lane reports> --expect-lanes v6.6-kvm,v6.12-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc4-kvm --expect-suites <28>` | verdict pending (140/140 expected) |
 
 Merged report sha256:
-`7ea61e99975735f05e3ad06982e447fcf817a9fa82d1bca2ee9a516a7284a526`
-(`matrix-report.json` covering the 56 cells above).
+<filled by the release board run>
+(`matrix-report.json` covering the 140 cells above, once run).
 
-7.x lanes (7.0.14, 7.2, 7.4-rc1 pins still in
-`ci/kernels.lock.json`) were not part of this board; the
-non-gating appendix board ran green after it (84/84 cells
-plus 11/11 ISA cells) and its results are published as an
-appendix, never merged into the claim tally.
+Prior observations feeding this board: 6.6 + 6.12 green 56/56
+at 330226e; 7.0.14 + 7.2 + 7.4-rc1 green 84/84 + 11 ISA in the
+appendix board at 59ec93d; the rc4 lane re-pinned from rc1
+with re-observed fixtures.
 
-> [TBD: 7.4 RC correction sentence pending owner wording
+> [TBD: exact-build rc4 scope sentence pending owner wording
 > approval.]
 
 The `kernel-joint` suite stays unclaimed; its historical
@@ -73,11 +70,12 @@ ISA suites report outside the gating tally.
   (PATH-only, no checkout-derived paths); every lane-suite
   asserts its guest kernel identity.
 
-## Key release proofs (all observed in the anchor)
+## Key release proofs (observed in the T6 anchor and appendix)
 
 Each claimed shape maps to at least one passing guest
-suite plus its consumer canary, on both lanes, on the
-same bits:
+suite plus its consumer canary, on both T6 lanes (and the
+same suites on all three appendix lanes), on the same bits;
+the release board re-proves every mapping on all five lanes:
 
 * Packet and parse paths: `kernel-xdp`, `kernel-packet`,
   `kernel-parse`, `kernel-net` pass on both lanes.
@@ -121,12 +119,23 @@ with the toolchain above on `PATH`
 pixi run test-unit
 pixi run test-compiler
 pixi run test-package
-python3 ci/run_vm_tests.py --lane <lane> --suite <suite> \
-    --out-dir lane-out --consumer-path <independent-toolchain>
-python3 ci/run_vm_tests.py --merge <lane-6.6-report> <lane-6.12-report> \
-    --out-dir board --expect-lanes v6.6-kvm,v6.12-kvm \
+python3 ci/run_vm_tests.py --lane <lane> \
+    --suite <s1> --suite <s2> ... --suite <s28> \
+    --out-dir lane-<lane> --consumer-path <independent-toolchain>
+python3 ci/run_vm_tests.py --merge \
+    lane-v6.6-kvm/matrix-report.json \
+    lane-v6.12-kvm/matrix-report.json \
+    lane-v7.0.14-kvm/matrix-report.json \
+    lane-v7.2-kvm/matrix-report.json \
+    lane-v7.4-rc4-kvm/matrix-report.json \
+    --out-dir board \
+    --expect-lanes v6.6-kvm,v6.12-kvm,v7.0.14-kvm,v7.2-kvm,v7.4-rc4-kvm \
     --expect-suites <the 28 gating suites>
 ```
+
+(One invocation per lane with all 28 `--suite` flags into its
+own directory: the merge consumes exactly one report per
+lane.)
 
 Guest-backed suites take tens of seconds per suite
 under KVM (two concurrent guests). A missing tool, guest

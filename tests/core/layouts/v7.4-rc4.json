@@ -2,36 +2,36 @@
   "blocked_on_present": true,
   "futex_present": true,
   "ipi_mask_present": true,
-  "kernel_deb_sha256": "5cba6ee87fbd2e326256fadadfd70048245d33cc244dca9daecd7e8b3e8ea29b",
-  "kernel_release": "7.4.0-070400rc1-generic",
-  "kernel_version": "7.4.0-070400rc1.202611012313",
-  "lane": "v7.4-rc1",
+  "kernel_deb_sha256": "26354ac0758c8b642f7218db02ba5dd9a37c5ee219c4e0a9797071d5e9e6b5a9",
+  "kernel_release": "7.4.0-070400rc4-generic",
+  "kernel_version": "7.4.0-070400rc4.202611230029",
+  "lane": "v7.4-rc4",
   "layout": "task_struct",
-  "member_count": 276,
+  "member_count": 277,
   "members": {
     "__mce_reserved": {
       "bits_offset": 77954,
-      "type_id": 91970
+      "type_id": 92031
     },
     "__pad": {
       "bits_offset": 440,
-      "type_id": 167373
+      "type_id": 167498
     },
     "__state": {
       "bits_offset": 192,
-      "type_id": 168273
+      "type_id": 168400
     },
     "acct_rss_mem1": {
       "bits_offset": 31808,
-      "type_id": 167369
+      "type_id": 167494
     },
     "acct_timexpd": {
       "bits_offset": 31936,
-      "type_id": 167369
+      "type_id": 167494
     },
     "acct_vm_mem1": {
       "bits_offset": 31872,
-      "type_id": 167369
+      "type_id": 167494
     },
     "active_memcg": {
       "bits_offset": 76480,
@@ -43,11 +43,11 @@
     },
     "alloc_lock": {
       "bits_offset": 30080,
-      "type_id": 158830
+      "type_id": 158952
     },
     "atomic_flags": {
       "bits_offset": 22976,
-      "type_id": 134689
+      "type_id": 134796
     },
     "audit_context": {
       "bits_offset": 29440,
@@ -59,7 +59,7 @@
     },
     "blocked": {
       "bits_offset": 28800,
-      "type_id": 157178
+      "type_id": 157300
     },
     "blocked_donor": {
       "bits_offset": 30592,
@@ -67,7 +67,7 @@
     },
     "blocked_lock": {
       "bits_offset": 30528,
-      "type_id": 149112
+      "type_id": 149223
     },
     "blocked_on": {
       "bits_offset": 30464,
@@ -75,7 +75,7 @@
     },
     "blocker": {
       "bits_offset": 30656,
-      "type_id": 134689
+      "type_id": 134796
     },
     "bpf_ctx": {
       "bits_offset": 77632,
@@ -91,11 +91,11 @@
     },
     "btrace_seq": {
       "bits_offset": 11840,
-      "type_id": 168273
+      "type_id": 168400
     },
     "cache_work": {
       "bits_offset": 35584,
-      "type_id": 105004
+      "type_id": 105081
     },
     "cached_requested_key": {
       "bits_offset": 27712,
@@ -107,7 +107,7 @@
     },
     "cg_list": {
       "bits_offset": 33152,
-      "type_id": 134359
+      "type_id": 134466
     },
     "cgroups": {
       "bits_offset": 33088,
@@ -115,7 +115,7 @@
     },
     "children": {
       "bits_offset": 23744,
-      "type_id": 134359
+      "type_id": 134466
     },
     "clear_child_tid": {
       "bits_offset": 25152,
@@ -123,7 +123,7 @@
     },
     "closid": {
       "bits_offset": 33280,
-      "type_id": 167364
+      "type_id": 167489
     },
     "comm": {
       "bits_offset": 27776,
@@ -131,19 +131,19 @@
     },
     "core_cookie": {
       "bits_offset": 8640,
-      "type_id": 134689
+      "type_id": 134796
     },
     "core_node": {
       "bits_offset": 8448,
-      "type_id": 149175
+      "type_id": 149286
     },
     "core_occupation": {
       "bits_offset": 8704,
-      "type_id": 168273
+      "type_id": 168400
     },
     "cpus_mask": {
       "bits_offset": 12160,
-      "type_id": 108382
+      "type_id": 108464
     },
     "cpus_ptr": {
       "bits_offset": 12032,
@@ -151,7 +151,7 @@
     },
     "cpuset_mem_spread_rotor": {
       "bits_offset": 33056,
-      "type_id": 128654
+      "type_id": 128755
     },
     "cred": {
       "bits_offset": 27648,
@@ -159,15 +159,15 @@
     },
     "curr_ret_depth": {
       "bits_offset": 76064,
-      "type_id": 128654
+      "type_id": 128755
     },
     "curr_ret_stack": {
       "bits_offset": 76032,
-      "type_id": 128654
+      "type_id": 128755
     },
     "default_timer_slack_ns": {
       "bits_offset": 75968,
-      "type_id": 167369
+      "type_id": 167494
     },
     "delays": {
       "bits_offset": 44928,
@@ -175,11 +175,11 @@
     },
     "dirty_paused_when": {
       "bits_offset": 45056,
-      "type_id": 134689
+      "type_id": 134796
     },
     "dl": {
       "bits_offset": 3968,
-      "type_id": 153106
+      "type_id": 153219
     },
     "dl_server": {
       "bits_offset": 6144,
@@ -191,15 +191,15 @@
     },
     "exit_code": {
       "bits_offset": 22688,
-      "type_id": 128654
+      "type_id": 128755
     },
     "exit_signal": {
       "bits_offset": 22720,
-      "type_id": 128654
+      "type_id": 128755
     },
     "exit_state": {
       "bits_offset": 22656,
-      "type_id": 128654
+      "type_id": 128755
     },
     "files": {
       "bits_offset": 28416,
@@ -207,11 +207,11 @@
     },
     "flags": {
       "bits_offset": 352,
-      "type_id": 168273
+      "type_id": 168400
     },
     "frozen": {
       "bits_offset": 22919,
-      "type_id": 168273
+      "type_id": 168400
     },
     "fs": {
       "bits_offset": 28352,
@@ -219,15 +219,15 @@
     },
     "ftrace_sleeptime": {
       "bits_offset": 76224,
-      "type_id": 134688
+      "type_id": 134795
     },
     "ftrace_timestamp": {
       "bits_offset": 76160,
-      "type_id": 134688
+      "type_id": 134795
     },
     "futex": {
       "bits_offset": 33344,
-      "type_id": 123421
+      "type_id": 123515
     },
     "group_leader": {
       "bits_offset": 24000,
@@ -235,47 +235,47 @@
     },
     "gtime": {
       "bits_offset": 25408,
-      "type_id": 167369
+      "type_id": 167494
     },
     "il_prev": {
       "bits_offset": 34560,
-      "type_id": 156758
+      "type_id": 156880
     },
     "il_weight": {
       "bits_offset": 34576,
-      "type_id": 167373
+      "type_id": 167498
     },
     "in_eventfd": {
       "bits_offset": 22922,
-      "type_id": 168273
+      "type_id": 168400
     },
     "in_execve": {
       "bits_offset": 22914,
-      "type_id": 168273
+      "type_id": 168400
     },
     "in_iowait": {
       "bits_offset": 22915,
-      "type_id": 168273
+      "type_id": 168400
     },
     "in_lru_fault": {
       "bits_offset": 22917,
-      "type_id": 168273
+      "type_id": 168400
     },
     "in_memstall": {
       "bits_offset": 22921,
-      "type_id": 168273
+      "type_id": 168400
     },
     "in_nf_duplicate": {
       "bits_offset": 22926,
-      "type_id": 168273
+      "type_id": 168400
     },
     "in_thrashing": {
       "bits_offset": 22925,
-      "type_id": 168273
+      "type_id": 168400
     },
     "in_ubsan": {
       "bits_offset": 30720,
-      "type_id": 168273
+      "type_id": 168400
     },
     "io_context": {
       "bits_offset": 31040,
@@ -291,19 +291,23 @@
     },
     "ioac": {
       "bits_offset": 31296,
-      "type_id": 160551
+      "type_id": 160674
+    },
+    "iowait_cpu": {
+      "bits_offset": 832,
+      "type_id": 128755
     },
     "ipi_mask": {
       "bits_offset": 34432,
-      "type_id": 160552
+      "type_id": 160675
     },
     "is_blocked": {
       "bits_offset": 432,
-      "type_id": 167373
+      "type_id": 167498
     },
     "jobctl": {
       "bits_offset": 22784,
-      "type_id": 134689
+      "type_id": 134796
     },
     "journal_info": {
       "bits_offset": 30784,
@@ -311,15 +315,15 @@
     },
     "kmap_ctrl": {
       "bits_offset": 76800,
-      "type_id": 133312
+      "type_id": 133416
     },
     "kretprobe_instances": {
       "bits_offset": 78208,
-      "type_id": 134480
+      "type_id": 134587
     },
     "l1d_flush_kill": {
       "bits_offset": 78336,
-      "type_id": 105004
+      "type_id": 105081
     },
     "last_siginfo": {
       "bits_offset": 31232,
@@ -327,19 +331,19 @@
     },
     "last_sum_exec_runtime": {
       "bits_offset": 34944,
-      "type_id": 167369
+      "type_id": 167494
     },
     "last_switch_count": {
       "bits_offset": 28160,
-      "type_id": 134689
+      "type_id": 134796
     },
     "last_switch_time": {
       "bits_offset": 28224,
-      "type_id": 134689
+      "type_id": 134796
     },
     "last_task_numa_placement": {
       "bits_offset": 34880,
-      "type_id": 167369
+      "type_id": 167494
     },
     "last_wakee": {
       "bits_offset": 704,
@@ -351,43 +355,43 @@
     },
     "latency_record_count": {
       "bits_offset": 45120,
-      "type_id": 128654
+      "type_id": 128755
     },
     "lazy_mmu_state": {
       "bits_offset": 44864,
-      "type_id": 134014
+      "type_id": 134120
     },
     "loginuid": {
       "bits_offset": 29504,
-      "type_id": 133743
+      "type_id": 133847
     },
     "maj_flt": {
       "bits_offset": 26432,
-      "type_id": 134689
+      "type_id": 134796
     },
     "max_allowed_capacity": {
       "bits_offset": 11904,
-      "type_id": 134689
+      "type_id": 134796
     },
     "mce_addr": {
       "bits_offset": 77888,
-      "type_id": 167369
+      "type_id": 167494
     },
     "mce_count": {
       "bits_offset": 78144,
-      "type_id": 128654
+      "type_id": 128755
     },
     "mce_kflags": {
       "bits_offset": 77824,
-      "type_id": 91970
+      "type_id": 92031
     },
     "mce_kill_me": {
       "bits_offset": 78016,
-      "type_id": 105004
+      "type_id": 105081
     },
     "mce_ripv": {
       "bits_offset": 77952,
-      "type_id": 91970
+      "type_id": 92031
     },
     "mce_vaddr": {
       "bits_offset": 77760,
@@ -395,11 +399,11 @@
     },
     "mce_whole_page": {
       "bits_offset": 77953,
-      "type_id": 91970
+      "type_id": 92031
     },
     "memcg_nr_pages_over_high": {
       "bits_offset": 76416,
-      "type_id": 168273
+      "type_id": 168400
     },
     "mempolicy": {
       "bits_offset": 34496,
@@ -407,19 +411,19 @@
     },
     "mems_allowed": {
       "bits_offset": 32000,
-      "type_id": 140623
+      "type_id": 140731
     },
     "mems_allowed_seq": {
       "bits_offset": 33024,
-      "type_id": 155490
+      "type_id": 155609
     },
     "migration_disabled": {
       "bits_offset": 20416,
-      "type_id": 156759
+      "type_id": 156881
     },
     "migration_flags": {
       "bits_offset": 20432,
-      "type_id": 156759
+      "type_id": 156881
     },
     "migration_pending": {
       "bits_offset": 20352,
@@ -427,7 +431,7 @@
     },
     "min_flt": {
       "bits_offset": 26368,
-      "type_id": 134689
+      "type_id": 134796
     },
     "mm": {
       "bits_offset": 22464,
@@ -435,7 +439,7 @@
     },
     "mm_cid": {
       "bits_offset": 36160,
-      "type_id": 153216
+      "type_id": 153330
     },
     "nameidata": {
       "bits_offset": 27904,
@@ -443,31 +447,31 @@
     },
     "nivcsw": {
       "bits_offset": 26176,
-      "type_id": 134689
+      "type_id": 134796
     },
     "no_cgroup_migration": {
       "bits_offset": 22918,
-      "type_id": 168273
+      "type_id": 168400
     },
     "node_stamp": {
       "bits_offset": 34816,
-      "type_id": 167369
+      "type_id": 167494
     },
     "normal_prio": {
-      "bits_offset": 896,
-      "type_id": 128654
+      "bits_offset": 928,
+      "type_id": 128755
     },
     "nr_cpus_allowed": {
       "bits_offset": 11968,
-      "type_id": 128654
+      "type_id": 128755
     },
     "nr_dirtied": {
       "bits_offset": 44992,
-      "type_id": 128654
+      "type_id": 128755
     },
     "nr_dirtied_pause": {
       "bits_offset": 45024,
-      "type_id": 128654
+      "type_id": 128755
     },
     "nsproxy": {
       "bits_offset": 28608,
@@ -487,35 +491,35 @@
     },
     "numa_migrate_retry": {
       "bits_offset": 34752,
-      "type_id": 134689
+      "type_id": 134796
     },
     "numa_pages_migrated": {
       "bits_offset": 35520,
-      "type_id": 134689
+      "type_id": 134796
     },
     "numa_preferred_nid": {
       "bits_offset": 34720,
-      "type_id": 128654
+      "type_id": 128755
     },
     "numa_scan_period": {
       "bits_offset": 34656,
-      "type_id": 168273
+      "type_id": 168400
     },
     "numa_scan_period_max": {
       "bits_offset": 34688,
-      "type_id": 168273
+      "type_id": 168400
     },
     "numa_scan_seq": {
       "bits_offset": 34624,
-      "type_id": 128654
+      "type_id": 128755
     },
     "numa_work": {
       "bits_offset": 35008,
-      "type_id": 105004
+      "type_id": 105081
     },
     "nvcsw": {
       "bits_offset": 26112,
-      "type_id": 134689
+      "type_id": 134796
     },
     "objcg": {
       "bits_offset": 76544,
@@ -523,11 +527,11 @@
     },
     "on_cpu": {
       "bits_offset": 416,
-      "type_id": 167373
+      "type_id": 167498
     },
     "on_rq": {
       "bits_offset": 424,
-      "type_id": 167373
+      "type_id": 167498
     },
     "oom_reaper_list": {
       "bits_offset": 76992,
@@ -535,11 +539,11 @@
     },
     "oom_reaper_timer": {
       "bits_offset": 77056,
-      "type_id": 162115
+      "type_id": 162241
     },
     "pagefault_disabled": {
       "bits_offset": 76960,
-      "type_id": 128654
+      "type_id": 128755
     },
     "parent": {
       "bits_offset": 23680,
@@ -547,23 +551,23 @@
     },
     "parent_exec_id": {
       "bits_offset": 29952,
-      "type_id": 167369
+      "type_id": 167494
     },
     "pasid_activated": {
       "bits_offset": 22923,
-      "type_id": 168273
+      "type_id": 168400
     },
     "patch_state": {
       "bits_offset": 77472,
-      "type_id": 128654
+      "type_id": 128755
     },
     "pdeath_signal": {
       "bits_offset": 22752,
-      "type_id": 128654
+      "type_id": 128755
     },
     "pending": {
       "bits_offset": 28992,
-      "type_id": 157174
+      "type_id": 157296
     },
     "perf_ctx_data": {
       "bits_offset": 34368,
@@ -575,11 +579,11 @@
     },
     "perf_event_list": {
       "bits_offset": 34240,
-      "type_id": 134359
+      "type_id": 134466
     },
     "perf_event_mutex": {
       "bits_offset": 34048,
-      "type_id": 138632
+      "type_id": 138740
     },
     "perf_recursion": {
       "bits_offset": 33920,
@@ -587,7 +591,7 @@
     },
     "personality": {
       "bits_offset": 22848,
-      "type_id": 168273
+      "type_id": 168400
     },
     "pi_blocked_on": {
       "bits_offset": 30400,
@@ -595,7 +599,7 @@
     },
     "pi_lock": {
       "bits_offset": 30112,
-      "type_id": 149112
+      "type_id": 149223
     },
     "pi_top_task": {
       "bits_offset": 30336,
@@ -603,11 +607,11 @@
     },
     "pi_waiters": {
       "bits_offset": 30208,
-      "type_id": 149185
+      "type_id": 149296
     },
     "pid": {
       "bits_offset": 23488,
-      "type_id": 145373
+      "type_id": 145479
     },
     "pid_links": {
       "bits_offset": 24384,
@@ -619,59 +623,59 @@
     },
     "policy": {
       "bits_offset": 11872,
-      "type_id": 168273
+      "type_id": 168400
     },
     "posix_cputimers": {
       "bits_offset": 26496,
-      "type_id": 146515
+      "type_id": 146621
     },
     "posix_cputimers_work": {
       "bits_offset": 27136,
-      "type_id": 146518
+      "type_id": 146624
     },
     "preempt_notifiers": {
       "bits_offset": 11776,
-      "type_id": 125401
+      "type_id": 125495
     },
     "pref_llc_queued": {
       "bits_offset": 35808,
-      "type_id": 128654
+      "type_id": 128755
     },
     "pref_node_fork": {
       "bits_offset": 34592,
-      "type_id": 156758
+      "type_id": 156880
     },
     "preferred_llc": {
       "bits_offset": 35776,
-      "type_id": 128654
+      "type_id": 128755
     },
     "prev_cputime": {
       "bits_offset": 25472,
-      "type_id": 146957
+      "type_id": 147063
     },
     "prio": {
-      "bits_offset": 832,
-      "type_id": 128654
+      "bits_offset": 864,
+      "type_id": 128755
     },
     "psi_flags": {
       "bits_offset": 31744,
-      "type_id": 168273
+      "type_id": 168400
     },
     "ptrace": {
       "bits_offset": 384,
-      "type_id": 168273
+      "type_id": 168400
     },
     "ptrace_entry": {
       "bits_offset": 24192,
-      "type_id": 134359
+      "type_id": 134466
     },
     "ptrace_message": {
       "bits_offset": 31168,
-      "type_id": 134689
+      "type_id": 134796
     },
     "ptraced": {
       "bits_offset": 24064,
-      "type_id": 134359
+      "type_id": 134466
     },
     "ptracer_cred": {
       "bits_offset": 27520,
@@ -679,15 +683,15 @@
     },
     "pushable_dl_tasks": {
       "bits_offset": 22272,
-      "type_id": 149175
+      "type_id": 149286
     },
     "pushable_tasks": {
       "bits_offset": 21952,
-      "type_id": 145900
+      "type_id": 146006
     },
     "rcu": {
       "bits_offset": 76800,
-      "type_id": 105004
+      "type_id": 105081
     },
     "rcu_blocked_node": {
       "bits_offset": 20672,
@@ -695,51 +699,51 @@
     },
     "rcu_node_entry": {
       "bits_offset": 20544,
-      "type_id": 134359
+      "type_id": 134466
     },
     "rcu_read_lock_nesting": {
       "bits_offset": 20448,
-      "type_id": 128654
+      "type_id": 128755
     },
     "rcu_read_unlock_special": {
       "bits_offset": 20480,
-      "type_id": 149403
+      "type_id": 149514
     },
     "rcu_tasks_exit_cpu": {
       "bits_offset": 20992,
-      "type_id": 128654
+      "type_id": 128755
     },
     "rcu_tasks_exit_list": {
       "bits_offset": 21056,
-      "type_id": 134359
+      "type_id": 134466
     },
     "rcu_tasks_holdout": {
       "bits_offset": 20800,
-      "type_id": 167373
+      "type_id": 167498
     },
     "rcu_tasks_holdout_list": {
       "bits_offset": 20864,
-      "type_id": 134359
+      "type_id": 134466
     },
     "rcu_tasks_idle_cpu": {
       "bits_offset": 20832,
-      "type_id": 128654
+      "type_id": 128755
     },
     "rcu_tasks_idx": {
       "bits_offset": 20808,
-      "type_id": 167373
+      "type_id": 167498
     },
     "rcu_tasks_nvcsw": {
       "bits_offset": 20736,
-      "type_id": 134689
+      "type_id": 134796
     },
     "rcu_users": {
       "bits_offset": 76928,
-      "type_id": 149843
+      "type_id": 149954
     },
     "real_blocked": {
       "bits_offset": 28864,
-      "type_id": 157178
+      "type_id": 157300
     },
     "real_cred": {
       "bits_offset": 27584,
@@ -755,7 +759,7 @@
     },
     "recent_used_cpu": {
       "bits_offset": 768,
-      "type_id": 128654
+      "type_id": 128755
     },
     "reclaim_state": {
       "bits_offset": 30976,
@@ -763,15 +767,15 @@
     },
     "reported_split_lock": {
       "bits_offset": 22924,
-      "type_id": 168273
+      "type_id": 168400
     },
     "restart_block": {
       "bits_offset": 23040,
-      "type_id": 151020
+      "type_id": 151133
     },
     "restore_sigmask": {
       "bits_offset": 22916,
-      "type_id": 168273
+      "type_id": 168400
     },
     "ret_stack": {
       "bits_offset": 76096,
@@ -779,23 +783,23 @@
     },
     "rethooks": {
       "bits_offset": 78272,
-      "type_id": 134480
+      "type_id": 134587
     },
     "rmid": {
       "bits_offset": 33312,
-      "type_id": 167364
+      "type_id": 167489
     },
     "rseq": {
       "bits_offset": 35840,
-      "type_id": 151831
+      "type_id": 151943
     },
     "rt": {
       "bits_offset": 3584,
-      "type_id": 153241
+      "type_id": 153356
     },
     "rt_priority": {
-      "bits_offset": 928,
-      "type_id": 168273
+      "bits_offset": 960,
+      "type_id": 168400
     },
     "rv": {
       "bits_offset": 78464,
@@ -803,23 +807,23 @@
     },
     "sas_ss_flags": {
       "bits_offset": 29312,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sas_ss_size": {
       "bits_offset": 29248,
-      "type_id": 157343
+      "type_id": 157465
     },
     "sas_ss_sp": {
       "bits_offset": 29184,
-      "type_id": 134689
+      "type_id": 134796
     },
     "saved_sigmask": {
       "bits_offset": 28928,
-      "type_id": 157178
+      "type_id": 157300
     },
     "saved_state": {
       "bits_offset": 224,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sched_cache_grp": {
       "bits_offset": 35712,
@@ -831,27 +835,27 @@
     },
     "sched_contributes_to_load": {
       "bits_offset": 22881,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sched_info": {
       "bits_offset": 21312,
-      "type_id": 153206
+      "type_id": 153320
     },
     "sched_migrated": {
       "bits_offset": 22882,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sched_remote_wakeup": {
       "bits_offset": 22912,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sched_reset_on_fork": {
       "bits_offset": 22880,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sched_rt_mutex": {
       "bits_offset": 22913,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sched_task_group": {
       "bits_offset": 8768,
@@ -859,23 +863,23 @@
     },
     "sched_task_hot": {
       "bits_offset": 22883,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sched_throttle_work": {
       "bits_offset": 8832,
-      "type_id": 105004
+      "type_id": 105081
     },
     "scx": {
       "bits_offset": 6208,
-      "type_id": 153132
+      "type_id": 153245
     },
     "se": {
       "bits_offset": 1024,
-      "type_id": 153129
+      "type_id": 153242
     },
     "seccomp": {
       "bits_offset": 29568,
-      "type_id": 154430
+      "type_id": 154547
     },
     "security": {
       "bits_offset": 77504,
@@ -883,19 +887,19 @@
     },
     "self_exec_id": {
       "bits_offset": 30016,
-      "type_id": 167369
+      "type_id": 167494
     },
     "sequential_io": {
       "bits_offset": 76736,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sequential_io_avg": {
       "bits_offset": 76768,
-      "type_id": 168273
+      "type_id": 168400
     },
     "sessionid": {
       "bits_offset": 29536,
-      "type_id": 168273
+      "type_id": 168400
     },
     "set_child_tid": {
       "bits_offset": 25088,
@@ -903,7 +907,7 @@
     },
     "sibling": {
       "bits_offset": 23872,
-      "type_id": 134359
+      "type_id": 134466
     },
     "sighand": {
       "bits_offset": 28736,
@@ -923,11 +927,11 @@
     },
     "stack_canary": {
       "bits_offset": 23552,
-      "type_id": 134689
+      "type_id": 134796
     },
     "stack_refcount": {
       "bits_offset": 77440,
-      "type_id": 149843
+      "type_id": 149954
     },
     "stack_vm_area": {
       "bits_offset": 77376,
@@ -935,39 +939,39 @@
     },
     "start_boottime": {
       "bits_offset": 26304,
-      "type_id": 167369
+      "type_id": 167494
     },
     "start_time": {
       "bits_offset": 26240,
-      "type_id": 167369
+      "type_id": 167494
     },
     "static_prio": {
-      "bits_offset": 864,
-      "type_id": 128654
+      "bits_offset": 896,
+      "type_id": 128755
     },
     "stats": {
       "bits_offset": 9728,
-      "type_id": 153268
+      "type_id": 153383
     },
     "stime": {
       "bits_offset": 25344,
-      "type_id": 167369
+      "type_id": 167494
     },
     "syscall_dispatch": {
       "bits_offset": 29696,
-      "type_id": 160190
+      "type_id": 160313
     },
     "sysvsem": {
       "bits_offset": 27968,
-      "type_id": 160422
+      "type_id": 160545
     },
     "sysvshm": {
       "bits_offset": 28032,
-      "type_id": 160423
+      "type_id": 160546
     },
     "task_frag": {
       "bits_offset": 44736,
-      "type_id": 141700
+      "type_id": 141806
     },
     "task_works": {
       "bits_offset": 29376,
@@ -975,23 +979,23 @@
     },
     "tasks": {
       "bits_offset": 21824,
-      "type_id": 134359
+      "type_id": 134466
     },
     "tgid": {
       "bits_offset": 23520,
-      "type_id": 145373
+      "type_id": 145479
     },
     "thread": {
       "bits_offset": 80384,
-      "type_id": 161877
+      "type_id": 162003
     },
     "thread_info": {
       "bits_offset": 0,
-      "type_id": 161871
+      "type_id": 161997
     },
     "thread_node": {
       "bits_offset": 24896,
-      "type_id": 134359
+      "type_id": 134466
     },
     "thread_pid": {
       "bits_offset": 24320,
@@ -1003,43 +1007,43 @@
     },
     "throttle_node": {
       "bits_offset": 8960,
-      "type_id": 134359
+      "type_id": 134466
     },
     "throttled": {
       "bits_offset": 9088,
-      "type_id": 100047
+      "type_id": 100117
     },
     "tick_dep_mask": {
       "bits_offset": 26048,
-      "type_id": 98346
+      "type_id": 98414
     },
     "timer_slack_ns": {
       "bits_offset": 75904,
-      "type_id": 167369
+      "type_id": 167494
     },
     "tlb_ubc": {
       "bits_offset": 36352,
-      "type_id": 162236
+      "type_id": 162361
     },
     "total_numa_faults": {
       "bits_offset": 35264,
-      "type_id": 134689
+      "type_id": 134796
     },
     "trace_overrun": {
       "bits_offset": 76288,
-      "type_id": 98346
+      "type_id": 98414
     },
     "trace_recursion": {
       "bits_offset": 76352,
-      "type_id": 134689
+      "type_id": 134796
     },
     "tracing_graph_pause": {
       "bits_offset": 76320,
-      "type_id": 98346
+      "type_id": 98414
     },
     "trc_reader_nesting": {
       "bits_offset": 21184,
-      "type_id": 128654
+      "type_id": 128755
     },
     "trc_reader_scp": {
       "bits_offset": 21248,
@@ -1055,15 +1059,15 @@
     },
     "unwind_info": {
       "bits_offset": 80064,
-      "type_id": 168303
+      "type_id": 168430
     },
     "usage": {
       "bits_offset": 320,
-      "type_id": 149843
+      "type_id": 149954
     },
     "use_memdelay": {
       "bits_offset": 22920,
-      "type_id": 168273
+      "type_id": 168400
     },
     "user_cpus_ptr": {
       "bits_offset": 12096,
@@ -1079,7 +1083,7 @@
     },
     "utime": {
       "bits_offset": 25280,
-      "type_id": 167369
+      "type_id": 167494
     },
     "vfork_done": {
       "bits_offset": 25024,
@@ -1087,27 +1091,27 @@
     },
     "vtime": {
       "bits_offset": 25664,
-      "type_id": 171163
+      "type_id": 171294
     },
     "wake_cpu": {
       "bits_offset": 800,
-      "type_id": 128654
+      "type_id": 128755
     },
     "wake_entry": {
       "bits_offset": 448,
-      "type_id": 86290
+      "type_id": 86354
     },
     "wake_q": {
       "bits_offset": 30144,
-      "type_id": 171256
+      "type_id": 171387
     },
     "wakee_flip_decay_ts": {
       "bits_offset": 640,
-      "type_id": 134689
+      "type_id": 134796
     },
     "wakee_flips": {
       "bits_offset": 576,
-      "type_id": 168273
+      "type_id": 168400
     },
     "worker_private": {
       "bits_offset": 25216,
@@ -1116,6 +1120,6 @@
   },
   "pid_bits_offset": 23488,
   "pid_byte_offset": 2936,
-  "provenance": "Member table extracted from /sys/kernel/btf/vmlinux inside a disposable virtme-ng guest running the pinned kernel deb (see ci/kernels.lock.json), via `bpftool btf dump file /sys/kernel/btf/vmlinux format raw` on 2026-11-21. Offsets are facts about that build, recorded here for the CO-RE oracle; they are not kernel source.",
+  "provenance": "Member table extracted from /sys/kernel/btf/vmlinux inside a disposable virtme-ng guest running the pinned kernel deb (see ci/kernels.lock.json), via `bpftool btf dump file /sys/kernel/btf/vmlinux format raw` on 2026-11-24. Offsets are facts about that build, recorded here for the CO-RE oracle; they are not kernel source.",
   "scx_present": true
 }

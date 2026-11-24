@@ -113,7 +113,7 @@ ADVCTX_MARKER_LANE = {
     "v6.6": "dereference of modified ctx ptr R1 off=112000 disallowed",
     "v7.0.14": "dereference of modified ctx ptr R1 off=112000 disallowed",
     "v7.2": "invalid bpf_context access off=112000 size=8",
-    "v7.4-rc1": "invalid bpf_context access off=112000 size=8",
+    "v7.4-rc4": "invalid bpf_context access off=112000 size=8",
 }
 VLOG_INSNS_LANE = {
     ("parsed", "v6.12"): 33,
@@ -127,7 +127,7 @@ VLOG_INSNS_LANE = {
     ("lane-a", "v6.6"): 42,
     ("lane-a", "v7.0.14"): 41,
     ("lane-a", "v7.2"): 41,
-    ("lane-a", "v7.4-rc1"): 41,
+    ("lane-a", "v7.4-rc4"): 41,
 }
 
 
@@ -157,7 +157,7 @@ STACK_DEPTH_LANE = {
     "v6.6": "stack depth 16",
     "v7.0.14": "stack depth 16",
     "v7.2": "stack depth 16",
-    "v7.4-rc1": "stack depth max 16",
+    "v7.4-rc4": "stack depth max 16",
 }
 
 
@@ -1142,7 +1142,7 @@ def test_vlog_captured():
     # the parsed backend emits tighter code than Lane-A on
     # 6.x; 7.x Lane-A verifiers process 41. The pinned load,
     # the single function, and the stack depth value agree;
-    # only the 7.4-rc1 depth wording differs.
+    # only the 7.4-rc4 depth wording differs.
     want_insns = "processed %d insns" % vlog_want_insns()
     assert want_insns in output, output[-2000:]
     want_depth = stack_depth_line()

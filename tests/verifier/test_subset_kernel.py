@@ -90,7 +90,7 @@ SHORT_LANE = {
     "v6.6": 0,
     "v7.0.14": 1,
     "v7.2": 1,
-    "v7.4-rc1": 1,
+    "v7.4-rc4": 1,
 }
 
 
@@ -124,7 +124,7 @@ LOOP_SUM_LANE = {
     "v6.6": "pass",
     "v7.0.14": "pass",
     "v7.2": "pass",
-    "v7.4-rc1": "pass",
+    "v7.4-rc4": "pass",
 }
 LOOP_SUM_REJECT_LOG = "back-edge from insn 18 to 19"
 

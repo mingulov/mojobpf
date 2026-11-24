@@ -84,7 +84,7 @@ retained implementation without claiming the kind.
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
 | Loader/observer | `bpftool` 7.6.0 with libbpf 1.6, unmodified |
 | Guest runner | virtme-ng 1.41, QEMU 10.2.2, KVM hardware acceleration on x86-64; one named TCG fallback lane (`v6.12-tcg`) for the no-KVM spot-proof only |
-| Guest kernels | two green (see below); 7.x lanes observed in the appendix only. Lanes in `ci/kernels.lock.json`: 6.12.0-061200-generic, 6.6.0-060600-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc1-generic (Ubuntu mainline builds, pinned by hash) |
+| Guest kernels | five in the gating scope (see below). Lanes in `ci/kernels.lock.json`: 6.12.0-061200-generic, 6.6.0-060600-generic, 7.0.14-070014-generic, 7.2.0-070200-generic, 7.4.0-070400rc4-generic (Ubuntu mainline builds, pinned by hash) |
 
 Full binary hashes live in `toolchains.lock.json` (host tools)
 and `ci/kernels.lock.json` (guest runner plus the pinned
@@ -99,19 +99,21 @@ registers 41 suites: the 28 release-matrix suites plus the 12
 (`ci/run_vm_tests.py` `SUITES`,
 `tests/unit/test_portability_locks.py::test_x86_matrix_shape_unchanged`).
 
-Two kernels are run green for the 1.0.1 board tree
-(board commit 330226e): 6.6.0-060600-generic and
-6.12.0-061200-generic. A lane passes only when its full
-28-suite gating scope passes (41 registry suites minus the
-`kernel-joint` and `kernel-percpu-hash` exclusions minus the
-11 nightly `kernel-isa-*` suites, including the
-`kernel-isa-cpu` smoke); the v1.0.1 board passes 56/56 cells
-with 0 red and 0 unexplained (see
-[evidence-1.0.1.md](evidence-1.0.1.md)) via
-`ci/run_vm_tests.py` per-lane runs plus a scoped `--merge`.
-The attesting commit is docs-only past the board commit, and
-the doc-consistency suites re-run green on it, so the
-board stands without a fresh full-matrix rerun. Ruled
+Five kernels form the 1.0.1 gating scope: 6.6.0-060600-generic,
+6.12.0-061200-generic, 7.0.14-070014-generic, 7.2.0-070200-generic,
+and the exact 7.4.0-070400rc4-generic build (rc-latest at cut
+time; the claim names that build, never "7.4" generally). A lane
+passes only when its full 28-suite gating scope passes (41
+registry suites minus the `kernel-joint` and `kernel-percpu-hash`
+exclusions minus the 11 nightly `kernel-isa-*` suites, including
+the `kernel-isa-cpu` smoke): 28 suites x 5 lanes = 140 cells
+via `ci/run_vm_tests.py` per-lane runs plus a scoped `--merge`.
+Observed so far: 6.6 + 6.12 green 56/56 at board commit 330226e
+(see [evidence-1.0.1.md](evidence-1.0.1.md)); 7.0.14 + 7.2 +
+7.4-rc1 green 84/84 + 11 ISA in the appendix board; the rc4
+lane (re-pinned from rc1 with re-observed fixtures) boards
+with the release run. The merged release verdict lands in the
+evidence record with the board commit. Ruled
 out of the gating scope: the joint suite (needs
 libbpf-mojo inputs, labelled experimental),
 `kernel-percpu-hash` (non-gating exclusion), and the 11
@@ -124,9 +126,9 @@ refuses any absent cell outside the map. The historical alpha
 and 1.0.0 runs do not qualify the current tree.
 
 > [TBD: scope/claim framing for this section pending O-2
-> owner words. The numbers above are observed; the
-> sentences that turn them into support claims are not
-> written yet.]
+> owner words. The scope above is decided (owner B+C
+> direction); the sentences that turn it into support claims
+> are not written yet.]
 
 Every behavior section below outside the named portability
 lanes records the 0.3.0a1 alpha qualification on the tested
@@ -135,10 +137,11 @@ libbpf 1.6, QEMU 10.2.2, software emulation) in both alpha
 lanes; see [evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the
 anchor board. Those observations stand as the alpha record;
 the v1.0 release matrix re-proved them (see
-[evidence-1.0.0.md](evidence-1.0.0.md)), and the v1.0.1
-board repeated that proof on its board commit (56/56 cells,
-0 red; board commit 330226e — see above and
-[evidence-1.0.1.md](evidence-1.0.1.md)).
+[evidence-1.0.0.md](evidence-1.0.0.md)), the v1.0.1 T6 board
+repeated that proof on two lanes (56/56 cells, 0 red; board
+commit 330226e — see above and
+[evidence-1.0.1.md](evidence-1.0.1.md)), and the release
+board re-proves it on all five lanes.
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
@@ -237,9 +240,10 @@ at the toolchain gate (`MBPF102`) exactly as designed.
 ## Retired boundary: `loop-sum` on 6.6 (Mojo 1.1.0 era)
 
 The bounded-loop subset case `loop-sum` verifies and runs on
-both gating lanes (6.6.0, 6.12.0) on the 1.0.1 board commit
-(330226e; see above):
-test-run actions match the oracle on every lane. (Under the
+the T6 lanes (6.6.0, 6.12.0) at board commit 330226e (see
+above); the release board re-proves it on all five lanes
+(test-run actions must match the oracle on every lane).
+(Under the
 retired Mojo 1.1.0 frontend the 6.6 verifier rejected the shape
 at load with `back-edge from insn 18 to 19`; the pinned 1.2.0
 frontend emits a loop the 6.6 verifier accepts, and the lane
@@ -250,12 +254,13 @@ and any other behavior on any lane fails loudly
 (`tests/verifier/test_subset_kernel.py::test_loop_sum`,
 `docs/supported-subset.md` case table, both gating lanes).
 
-One live kernel-version boundary remains outside the gating
+One live kernel-version boundary stays pinned in the gating
 scope: the 7.x lanes refuse short test-run inputs with EINVAL
 where the 6.x lanes run them as actions (subset kernel:
-6.6.0/6.12.0 report 20/20 actions; 7.0.14/7.2.0/7.4.0-rc1
-report 14 actions + 6 verified refusals, one per shape's guard
-case, re-observed in the non-gating appendix board). Retired
+6.6.0/6.12.0 report 20/20 actions; 7.0.14/7.2.0 report 14
+actions + 6 verified refusals, one per shape's guard case, in
+the appendix board; the rc4 lane re-proves its split in the
+release run via the `verifier-subset` guard cases). Retired
 per-lane boundaries stay pinned as process, not as live
 constraints: a future lane whose verifier rejects a subset
 shape gets its own evidenced verdict instead of inheriting
@@ -648,10 +653,10 @@ host suites, selected-but-refused vectors).
   outside the surface.
 * Per-CPU-hash maps: implemented in-tree but unclaimed (see
   above); the kind is refused under every claimed profile.
-* Kernels outside the two green lanes: only 6.6.0 and 6.12.0
-  run green (each by a full 28-suite gating-scope pass on its
-  lane — see the two-kernel board above); the historical alpha
-  and 1.0.0 verdicts do not qualify the current tree.
+* Kernels outside the five gating lanes (6.6.0, 6.12.0,
+  7.0.14, 7.2.0, 7.4.0-rc4-exact — see the board above); the
+  historical alpha and 1.0.0 verdicts do not qualify the
+  current tree.
   [TBD: scope/claim sentence pending O-2 owner words.]
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header
@@ -661,9 +666,10 @@ host suites, selected-but-refused vectors).
   acceleration, and the one named TCG fallback lane
   (`v6.12-tcg`) exists solely for the no-KVM-dependence
   spot-proof. The historical alpha matrix ran under software
-  emulation; the v1.0.1 release matrix proves the KVM lanes
-  (56/56 cells; see [evidence-1.0.1.md](evidence-1.0.1.md);
-  board commit 330226e; see above).
+  emulation; the T6 board proved two KVM lanes (56/56 cells;
+  board commit 330226e), and the v1.0.1 release matrix covers
+  all five (verdict pending in
+  [evidence-1.0.1.md](evidence-1.0.1.md); see above).
 
 ## Audit boundaries
 
