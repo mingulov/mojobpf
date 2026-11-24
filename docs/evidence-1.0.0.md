@@ -2,7 +2,6 @@
 
 # MojoBPF 1.0.0 evidence summary
 
-> Historical: describes the 1.0.0 (five-lane board) scope only; the current release is documented separately.
 The release regression anchor: the full matrix below ran
 green on the release tree. The 41x5 KVM matrix ran at
 `a7fa1a120e5782851889f8a93a2507c47c589947` with a clean
