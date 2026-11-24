@@ -971,6 +971,24 @@ def test_scorecard_actions_are_pinned():
     assert "schedule" not in text and "branch_protection_rule" not in text
 
 
+def test_release_verify_steps():
+    text = _read_release_workflow()
+    for marker in ("verify the sdist rebuilds the wheel", "write SHA256SUMS"):
+        assert marker in text, "release.yml step: " + marker
+    lines = text.splitlines()
+
+    def _at(marker):
+        return next(i for i, line in enumerate(lines) if marker in line)
+
+    assert _at("verify the sdist rebuilds the wheel") < _at("verify wheel contents"), (
+        "sdist proof runs before the contents check"
+    )
+    assert "sha256sum" in text and "SHA256SUMS" in text
+    assert "docs/checksums-${{ env.MOJOBPF_RELEASE_VERSION }}.md" in text
+    assert "docs/evidence-${{ env.MOJOBPF_RELEASE_VERSION }}.md" in text
+    assert text.count("set -euo pipefail") >= 5, "every new run block fails closed"
+
+
 def test_ci_interpreter_install_is_digest_pinned():
     text = _read_workflow()
     assert "setup-python" not in text, (
